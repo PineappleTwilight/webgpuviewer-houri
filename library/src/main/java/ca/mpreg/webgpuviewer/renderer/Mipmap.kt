@@ -48,12 +48,15 @@ class Mipmap(
         suspend fun create(
             pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int
         ): Mipmap {
+            require(width > 0 && height > 0 && tilesize > 0) { "Mipmap.create: invalid dims ${width}x$height tilesize $tilesize" }
+            require(pixels.isDirect) { "Mipmap.create: pixels must be direct" }
+            require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "Mipmap.create: pixels too small" }
             val mipmap = Mipmap(
                 width = width,
                 height = height,
                 scale = scale,
-                tilesCols = ceil(width.toFloat() / tilesize).toInt(),
-                tilesRows = ceil(height.toFloat() / tilesize).toInt(),
+                tilesCols = ceil(width.toFloat() / tilesize).toInt().coerceAtLeast(1),
+                tilesRows = ceil(height.toFloat() / tilesize).toInt().coerceAtLeast(1),
                 tilesize = tilesize,
             )
             try {

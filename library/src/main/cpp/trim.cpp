@@ -42,11 +42,16 @@ struct ColorTest {
 };
 
 ColorTest makeColorTest(float r, float g, float b, float threshold) {
+  const float clamped = std::clamp(threshold, 0.0f, 1.0f);
+  if (!std::isfinite(clamped)) {
+    // Caller validates, but be defensive if threshold is NaN.
+    return makeColorTest(r, g, b, 0.05f);
+  }
   ColorTest test{};
-  test.bg255[0] = r * 255.0f;
-  test.bg255[1] = g * 255.0f;
-  test.bg255[2] = b * 255.0f;
-  test.thresholdScaled = threshold * 255.0f * 255.0f;
+  test.bg255[0] = std::clamp(r, 0.0f, 1.0f) * 255.0f;
+  test.bg255[1] = std::clamp(g, 0.0f, 1.0f) * 255.0f;
+  test.bg255[2] = std::clamp(b, 0.0f, 1.0f) * 255.0f;
+  test.thresholdScaled = clamped * 255.0f * 255.0f;
 
   const float opaqueThreshold = threshold * 255.0f;
   for (int ch = 0; ch < 3; ++ch) {
@@ -276,8 +281,12 @@ Java_ca_mpreg_webgpuviewer_TrimNative_findTrim(JNIEnv *env, jobject thiz,
                                                jint height, jfloatArray colors,
                                                jfloat threshold,
                                                jintArray outBounds) {
-  if (width <= 0 || height <= 0) {
+  if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
     return JNI_FALSE;
+  }
+  if (!std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+    threshold = std::clamp(threshold, 0.0f, 1.0f);
+    if (!std::isfinite(threshold)) return JNI_FALSE;
   }
 
   const uint8_t *pixels =
@@ -292,7 +301,8 @@ Java_ca_mpreg_webgpuviewer_TrimNative_findTrim(JNIEnv *env, jobject thiz,
 
   const jsize colorFloats = env->GetArrayLength(colors);
   const int colorCount = colorFloats / 3;
-  if (colorCount <= 0 || env->GetArrayLength(outBounds) < colorCount * 4) {
+  if (colorCount <= 0 || colorCount > 16 ||
+      env->GetArrayLength(outBounds) < colorCount * 4) {
     return JNI_FALSE;
   }
 
@@ -378,10 +388,11 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
                                                        jobject pixelBuffer,
                                                        jint width, jint height,
                                                        jfloat threshold) {
-  (void)threshold;
+  if (!std::isfinite(threshold)) threshold = 0.05f;
+  threshold = std::clamp(threshold, 0.0f, 1.0f);
   const jint kWhite = static_cast<jint>(0xFFFFFFFFu);
 
-  if (width <= 0 || height <= 0) {
+  if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
     return kWhite;
   }
 

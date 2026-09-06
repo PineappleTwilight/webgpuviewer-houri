@@ -1,26 +1,25 @@
 #include <algorithm>
 #include <cmath>
 #include <jni.h>
+#include <mutex>
+#include <vector>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
 
 float srgbToLinearLUT[256];
-bool lutsInitialized = false;
+std::once_flag lutsOnceFlag;
 
 void initLUTs() {
-  if (lutsInitialized)
-    return;
-
-  for (int i = 0; i < 256; i++) {
-    float val01 = i / 255.0f;
-    srgbToLinearLUT[i] = (val01 <= 0.04045f)
-                             ? (val01 / 12.92f)
-                             : std::pow((val01 + 0.055f) / 1.055f, 2.4f);
-  }
-
-  lutsInitialized = true;
+  std::call_once(lutsOnceFlag, [] {
+    for (int i = 0; i < 256; i++) {
+      float val01 = i / 255.0f;
+      srgbToLinearLUT[i] = (val01 <= 0.04045f)
+                               ? (val01 / 12.92f)
+                               : std::pow((val01 + 0.055f) / 1.055f, 2.4f);
+    }
+  });
 }
 
 inline uint8_t linearToSRGBExact(float linearVal) {
@@ -50,14 +49,30 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
     jint srcWidth, jint srcHeight) {
   initLUTs();
 
+  if (srcWidth <= 0 || srcHeight <= 0)
+    return;
+  // Guard against absurd sizes that would overflow capacity checks.
+  if (srcWidth > 16384 || srcHeight > 16384)
+    return;
+
   uint32_t *src = (uint32_t *)env->GetDirectBufferAddress(src_buffer);
   uint32_t *dst = (uint32_t *)env->GetDirectBufferAddress(dst_buffer);
   if (!src || !dst)
     return;
 
+  const jlong srcCapacity = env->GetDirectBufferCapacity(src_buffer);
+  const jlong dstCapacity = env->GetDirectBufferCapacity(dst_buffer);
+  const jlong srcNeeded = static_cast<jlong>(srcWidth) * srcHeight * 4LL;
+  if (srcCapacity < srcNeeded)
+    return;
+
   int dstWidth = srcWidth / 2;
   int dstHeight = srcHeight / 2;
   if (dstWidth <= 0 || dstHeight <= 0)
+    return;
+
+  const jlong dstNeeded = static_cast<jlong>(dstWidth) * dstHeight * 4LL;
+  if (dstCapacity < dstNeeded)
     return;
 
   double scaleX = (double)srcWidth / dstWidth;
@@ -191,11 +206,10 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
       float totalWeight = 0.0f;
 
       int numXPixels = xMax - xMin + 1;
-
-      float xWeights[256];
-      int maxSafeX = (numXPixels > 256) ? 256 : numXPixels;
-
-      for (int i = 0; i < maxSafeX; ++i) {
+      // Dynamic scratch avoids the old 256-entry truncation for very wide tiles
+      // (theoretically >256 src pixels per dst pixel, e.g. extreme downscale).
+      std::vector<float> xWeights(numXPixels);
+      for (int i = 0; i < numXPixels; ++i) {
         int sx = xMin + i;
         double xWeight = std::min((double)sx + 1.0, srcXEnd) -
                          std::max((double)sx, srcXStart);
@@ -213,8 +227,6 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
 
         for (int sx = xMin; sx <= xMax; ++sx) {
           int cacheIdx = sx - xMin;
-          if (cacheIdx >= 256)
-            break;
 
           float pWeight = xWeights[cacheIdx] * yWeightF;
           if (pWeight <= 0.0f)

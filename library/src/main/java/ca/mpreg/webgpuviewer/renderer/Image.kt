@@ -43,9 +43,13 @@ class Image private constructor(
             backgroundColor: Int? = null,
         ): Image {
             require(width > 0 && height > 0) { "Image dimensions must be positive" }
+            require(width <= 16384 && height <= 16384) { "Image dimensions too large ${width}x$height" }
             require(trimColors == null || trimColors.all { it.size >= 3 }) {
                 "each trimColor must have at least 3 elements [r, g, b]"
             }
+            require(trimThreshold.isFinite() && trimThreshold in 0f..1f) { "trimThreshold must be finite 0..1" }
+            require(pixels.isDirect) { "pixels must be direct ByteBuffer" }
+            require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "pixels too small for ${width}x$height" }
 
             val image = Image(width, height)
 
@@ -98,15 +102,26 @@ class Image private constructor(
                 var textureWidth = width
                 var textureHeight = height
                 var scale = 1f
+                var guard = 0
 
-                while (width * scale > tilesize || height * scale > tilesize) {
+                while ((width * scale > tilesize || height * scale > tilesize) && guard++ < 8) {
                     scale /= 2
-                    val newWidth = floor(width * scale).toInt()
-                    val newHeight = floor(height * scale).toInt()
+                    val newWidth = floor(width * scale).toInt().coerceAtLeast(1)
+                    val newHeight = floor(height * scale).toInt().coerceAtLeast(1)
+                    if (newWidth <= 0 || newHeight <= 0) break
                     Log.d("Renderer", "Create mipmap using CPU ${scale} ${newWidth} ${newHeight}")
 
-                    currentPixels = withContext(Dispatchers.Default) {
-                        ImageUtil.resize(currentPixels, textureWidth, textureHeight)
+                    currentPixels = try {
+                        withContext(Dispatchers.Default) {
+                            ImageUtil.resize(currentPixels, textureWidth, textureHeight)
+                        }
+                    } catch (e: Exception) {
+                        Log.w("Renderer", "mipmap resize failed at $textureWidth x $textureHeight -> $newWidth x $newHeight", e)
+                        break
+                    } catch (e: OutOfMemoryError) {
+                        Log.w("Renderer", "mipmap resize OOM at $textureWidth x $textureHeight", e)
+                        System.gc()
+                        break
                     }
                     mipmapDataList.add(MipmapData(currentPixels, newWidth, newHeight, scale))
                     textureWidth = newWidth

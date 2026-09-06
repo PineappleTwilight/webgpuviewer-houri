@@ -46,7 +46,9 @@ class WebGpuRenderer {
         var device: GPUDevice
         private val mutex = Mutex()
 
+        @Volatile
         var offsetX: Float = 0f
+        @Volatile
         var offsetY: Float = 0f
 
         val dispatcher = Executors.newSingleThreadExecutor { runnable ->
@@ -54,6 +56,7 @@ class WebGpuRenderer {
         }.asCoroutineDispatcher()
 
         // Frame time profiling
+        @Volatile
         var profilingEnabled = false
         private var frameCount = 0L
         private var totalFrameTimeNs = 0L
@@ -100,31 +103,40 @@ class WebGpuRenderer {
             recentFrameIndex = (recentFrameIndex + 1) % 60
         }
 
+        @Volatile
+        private var initialized = false
+
         init {
             runBlocking {
-                initLibrary()
+                try {
+                    initLibrary()
 
-                instance = createInstance(GPUInstanceDescriptor())
+                    instance = createInstance(GPUInstanceDescriptor())
 
-                adapter =
-                    instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
+                    adapter =
+                        instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
 
-                val requiredFeatures =
-                    if (adapter.hasFeature(FeatureName.TimestampQuery)) {
-                        intArrayOf(FeatureName.TimestampQuery)
-                    } else {
-                        intArrayOf()
-                    }
+                    val requiredFeatures =
+                        if (adapter.hasFeature(FeatureName.TimestampQuery)) {
+                            intArrayOf(FeatureName.TimestampQuery)
+                        } else {
+                            intArrayOf()
+                        }
 
-                device = adapter.requestDevice(
-                    GPUDeviceDescriptor(
-                        deviceLostCallback = defaultDeviceLostCallback,
-                        deviceLostCallbackExecutor = Executor(Runnable::run),
-                        uncapturedErrorCallback = defaultUncapturedErrorCallback,
-                        uncapturedErrorCallbackExecutor = Executor(Runnable::run),
-                        requiredFeatures = requiredFeatures,
+                    device = adapter.requestDevice(
+                        GPUDeviceDescriptor(
+                            deviceLostCallback = defaultDeviceLostCallback,
+                            deviceLostCallbackExecutor = Executor(Runnable::run),
+                            uncapturedErrorCallback = defaultUncapturedErrorCallback,
+                            uncapturedErrorCallbackExecutor = Executor(Runnable::run),
+                            requiredFeatures = requiredFeatures,
+                        )
                     )
-                )
+                    initialized = true
+                } catch (e: Exception) {
+                    Log.e("WebGpuRenderer", "Failed to initialize WebGPU", e)
+                    throw e
+                }
             }
         }
 
@@ -315,13 +327,13 @@ private fun Int.isSurfaceSuccess(): Boolean =
 private val defaultUncapturedErrorCallback
     get(): UncapturedErrorCallback {
         return UncapturedErrorCallback { _, type, message ->
-            throw WebGpuRuntimeException.create(type, message)
+            Log.e("WebGpuRenderer", "Uncaptured WebGPU error type=$type: $message")
         }
     }
 
 private val defaultDeviceLostCallback
     get(): DeviceLostCallback {
         return DeviceLostCallback { device, reason, message ->
-            throw DeviceLostException(device, reason, message)
+            Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$device")
         }
     }
