@@ -153,6 +153,18 @@ class FilterChain {
         }
     }
 
+    fun onLowMemory() {
+        destroyPool()
+        poolWidth = 0
+        poolHeight = 0
+    }
+
+    fun poolBytes(): Long {
+        var total = 0L
+        for (slots in pool.values) for (slot in slots) total += slot.texture.width.toLong() * slot.texture.height * 4L
+        return total
+    }
+
     fun cleanup() {
         filters.forEach { it.cleanup() }
         destroyPool()

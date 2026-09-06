@@ -571,13 +571,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private val atlas: TileAtlas
         get() = atlasOrNull ?: TileAtlas(atlasSide()).also { atlasOrNull = it }
 
-    /** Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. */
+    /** Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. Capped at 4096. */
     private fun atlasSide(): Int {
         val budget = budgetTiles()
         atlasBudgetTiles = budget
         val perSlab = (SLAB_SIZE / TILE_SIZE) * (SLAB_SIZE / TILE_SIZE)
         val slabs = (budget + perSlab - 1) / perSlab
-        return ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1) * SLAB_SIZE
+        return ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1).coerceAtMost(8) * SLAB_SIZE
     }
 
     private fun newGrid(page: ImagePage.ImageSingle, pageScale: Float) = PageTiles(

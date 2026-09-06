@@ -51,9 +51,11 @@ class WebGpuRenderer {
         @Volatile
         var offsetY: Float = 0f
 
+        private var renderThread: Thread? = null
         val dispatcher = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "WebGPU-Render-Thread")
+            Thread(runnable, "WebGPU-Render-Thread").also { renderThread = it }
         }.asCoroutineDispatcher()
+        internal fun isOnRenderThread(): Boolean = Thread.currentThread() === renderThread
 
         // Frame time profiling
         @Volatile
@@ -189,8 +191,7 @@ class WebGpuRenderer {
         this.width = width
         this.height = height
 
-        // Check if already on dispatcher thread to avoid deadlock
-        val isOnDispatcherThread = Thread.currentThread().name == "WebGPU-Render-Thread"
+        val isOnDispatcherThread = isOnRenderThread()
 
         val initSurface = {
             this@WebGpuRenderer.surface = surface.let {
@@ -295,8 +296,7 @@ class WebGpuRenderer {
     }
 
     fun cleanup() {
-        // Check if already on dispatcher thread to avoid deadlock
-        val isOnDispatcherThread = Thread.currentThread().name == "WebGPU-Render-Thread"
+        val isOnDispatcherThread = isOnRenderThread()
 
         val doCleanup: suspend () -> Unit = {
             mutex.withLock {
