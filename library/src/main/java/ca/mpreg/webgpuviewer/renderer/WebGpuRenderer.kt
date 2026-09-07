@@ -295,6 +295,12 @@ class WebGpuRenderer {
         }
     }
 
+    fun onLowMemory() {
+        try { filters.onLowMemory() } catch (_: Exception) {}
+        // TileRenderer owns its atlas; clear when host signals trim
+        // WebGpuRenderer is the owner that can reach it via viewers; viewers call tiles.onLowMemory() themselves
+    }
+
     fun cleanup() {
         val isOnDispatcherThread = isOnRenderThread()
 

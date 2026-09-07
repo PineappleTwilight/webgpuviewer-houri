@@ -214,6 +214,21 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * 1.5 is what a flat 192 came to at 1440p.
      */
     var cacheScreens = 1.5f
+        set(value) { field = value.coerceIn(0.5f, 3f) }
+
+    fun onLowMemory() {
+        cacheScreens = 0.8f
+        // Best-effort evict now; next generateTile will also call evict()
+        try { evict() } catch (_: Exception) {}
+        // Rebuild atlas smaller on next acquire if we still overshoot
+        if (atlasOrNull != null && (atlasOrNull!!.side * atlasOrNull!!.side * 4L) > (48L * 1024 * 1024)) {
+            try {
+                val atlas = atlasOrNull
+                atlas?.destroy()
+                atlasOrNull = null
+            } catch (_: Exception) {}
+        }
+    }
 
     // The viewport the last draw saw - what the cache is sized against.
     private var viewportWidth = 0
