@@ -40,7 +40,7 @@ android {
 }
 
 dependencies {
-    implementation(project(":library"))
+    implementation(project(":webgpuviewer"))
 
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.compose.animation.core)

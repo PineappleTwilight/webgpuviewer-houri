@@ -10,6 +10,9 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
+group = "ca.mpreg"
+version = "0.0.0"
+
 val tag: String = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
     System.getenv("GITHUB_REF_NAME")
 } else {

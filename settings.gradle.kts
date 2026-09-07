@@ -27,6 +27,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "webgpuviewer"
+rootProject.name = "webgpuviewer-root"
 include(":sample")
-include(":library")
+include(":webgpuviewer")
+project(":webgpuviewer").projectDir = file("library")
