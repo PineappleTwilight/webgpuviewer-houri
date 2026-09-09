@@ -73,7 +73,7 @@ dependencies {
 }
 
 androidComponents {
-    onVariants(selector().withBuildType("release")) { variant ->
+    onVariants { variant ->
         val mergeTask =
             project.tasks.register<MergeEmbeddedAarsTask>(
                 "merge${variant.name.replaceFirstChar { it.uppercase() }}EmbeddedAars"
