@@ -11,20 +11,19 @@ import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUFragmentState
 import androidx.webgpu.GPUPrimitiveState
 import androidx.webgpu.GPURenderPassEncoder
-import androidx.webgpu.GPURenderPipeline
 import androidx.webgpu.GPURenderPipelineDescriptor
 import androidx.webgpu.GPUShaderModuleDescriptor
 import androidx.webgpu.GPUShaderSourceWGSL
 import androidx.webgpu.GPUVertexState
 import androidx.webgpu.PrimitiveTopology
-import androidx.webgpu.TextureFormat
+import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 private val device get() = WebGpuRenderer.device
 
-private val pipeline: GPURenderPipeline by lazy {
+private val pipelines = FormatKeyed { format ->
     val shaderModule = device.createShaderModule(
         GPUShaderModuleDescriptor(
             shaderSourceWGSL = GPUShaderSourceWGSL(CIRCLE_SHADER)
@@ -36,7 +35,7 @@ private val pipeline: GPURenderPipeline by lazy {
             fragment = GPUFragmentState(
                 module = shaderModule, entryPoint = "fs_main", targets = arrayOf(
                     GPUColorTargetState(
-                        format = TextureFormat.RGBA8Unorm, blend = GPUBlendState(
+                        format = format, blend = GPUBlendState(
                             color = GPUBlendComponent(
                                 srcFactor = BlendFactor.SrcAlpha,
                                 dstFactor = BlendFactor.OneMinusSrcAlpha,
@@ -112,7 +111,15 @@ private val byteBufferLocal = ThreadLocal.withInitial {
  * `queue.writeBuffer` is ordered against `submit` rather than against other writes, so a reused
  * buffer would give every circle in the batch the last colour written.
  */
-fun Draw.circle(pass: GPURenderPassEncoder, cx: Float, cy: Float, radius: Float, color: Int) {
+fun Draw.circle(
+    pass: GPURenderPassEncoder,
+    /** Format of [pass]'s colour attachment - see [FormatKeyed]. */
+    format: Int,
+    cx: Float,
+    cy: Float,
+    radius: Float,
+    color: Int
+) {
     val r = ((color shr 16) and 0xFF) / 255f
     val g = ((color shr 8) and 0xFF) / 255f
     val b = (color and 0xFF) / 255f
@@ -133,6 +140,7 @@ fun Draw.circle(pass: GPURenderPassEncoder, cx: Float, cy: Float, radius: Float,
     val uniformBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
+    val pipeline = pipelines[format]
     pass.setPipeline(pipeline)
     val bindGroup = device.createBindGroup(
         GPUBindGroupDescriptor(

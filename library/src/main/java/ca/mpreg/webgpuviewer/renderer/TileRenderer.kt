@@ -491,12 +491,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * Every tile in one texture, carved into [SLAB_SIZE] slabs. A slab holds slots of a single
      * tile size and returns to the pool once fully free, so sizes mix within one bind group.
      */
-    private inner class TileAtlas(val side: Int) {
+    private inner class TileAtlas(val side: Int, val format: Int) {
         val texture: GPUTexture = device.createTexture(
             GPUTextureDescriptor(
                 size = GPUExtent3D(side, side),
                 usage = TextureUsage.CopyDst or TextureUsage.TextureBinding,
-                format = TextureFormat.RGBA8Unorm
+                format = format
             )
         )
 
@@ -512,7 +512,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 GPUTextureDescriptor(
                     size = GPUExtent3D(tileSize, tileSize),
                     usage = TextureUsage.RenderAttachment or TextureUsage.CopySrc,
-                    format = TextureFormat.RGBA8Unorm
+                    format = format
                 )
             )
         }
@@ -606,8 +606,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     // is sized against is known by then.
     private var atlasOrNull: TileAtlas? = null
 
+    // Torn down in [newFrame], never here: a getter runs wherever it is first touched, which
+    // can be mid-draw, holding one of the page grids the teardown destroys.
     private val atlas: TileAtlas
-        get() = atlasOrNull ?: TileAtlas(atlasSide()).also { atlasOrNull = it }
+        get() = atlasOrNull
+            ?: TileAtlas(atlasSide(), Hdr.frameFormat).also { atlasOrNull = it }
 
     /** Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. Capped at 4096. */
     private fun atlasSide(): Int {
@@ -917,7 +920,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         )
     }
 
-    private fun buildBlitPipeline(depthStencil: GPUDepthStencilState?): GPURenderPipeline {
+    private fun buildBlitPipeline(
+        format: Int,
+        depthStencil: GPUDepthStencilState?
+    ): GPURenderPipeline {
         val shaderModule = device.createShaderModule(
             GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(BLIT_SHADER))
         )
@@ -944,7 +950,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                         GPUColorTargetState(
                             // Tiles hold RenderPage's output, which is premultiplied, so One
                             // rather than SrcAlpha.
-                            format = TextureFormat.RGBA8Unorm, blend = GPUBlendState(
+                            format = format, blend = GPUBlendState(
                                 color = GPUBlendComponent(
                                     srcFactor = BlendFactor.One,
                                     dstFactor = BlendFactor.OneMinusSrcAlpha,
@@ -965,7 +971,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     }
 
     /** Plain blit, no stencil attachment - [blitAvailableTiles]/[renderFullyTiled]'s own pass. */
-    private val blitPipeline: GPURenderPipeline by lazy { buildBlitPipeline(null) }
+    private val blitPipelines = FormatKeyed { format -> buildBlitPipeline(format, null) }
 
     /**
      * As [blitPipeline], but always writes 1 into the stencil attachment wherever it draws - for
@@ -974,9 +980,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * so a pixel [RenderPage] would otherwise redraw stays skipped once this stencil value marks
      * it done. See [stencilViewFor].
      */
-    private val blitPipelineStencilWrite: GPURenderPipeline by lazy {
+    private val blitPipelinesStencilWrite = FormatKeyed { format ->
         buildBlitPipeline(
-            GPUDepthStencilState(
+            format, GPUDepthStencilState(
                 format = TextureFormat.Stencil8,
                 depthWriteEnabled = OptionalBool.False,
                 depthCompare = CompareFunction.Always,
@@ -1049,6 +1055,19 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      */
     fun newFrame() {
         frame++
+
+        // Every cached tile is at the old format, so an HDR change takes the whole atlas. Here
+        // only: this is the one point in a frame where no caller holds a grid, and tearing one
+        // down mid-draw leaves the caller writing a destroyed uniform buffer - a segfault.
+        atlasOrNull?.let { existing ->
+            if (existing.format != Hdr.frameFormat) {
+                pages.values.forEach { it.destroyAll(existing) }
+                pages.clear()
+                existing.destroy()
+                atlasOrNull = null
+            }
+        }
+
         if (pages.isEmpty()) return
         val it = pages.iterator()
         while (it.hasNext()) {
@@ -1600,7 +1619,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         st.lastDrawn = frame
-        drawInstanced(pass, st, useStencilMask)
+        drawInstanced(pass, dst.format, st, useStencilMask)
 
         // Drop what fell outside the wanted range, else a page scrolling past keeps accumulating
         // tiles. Only when the range moved - a scroll crosses a tile boundary every tile-size
@@ -1629,7 +1648,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * nothing - that lives in the uniform.
      */
     private fun drawInstanced(
-        pass: GPURenderPassEncoder, st: PageTiles, useStencilMask: Boolean
+        pass: GPURenderPassEncoder, format: Int, st: PageTiles, useStencilMask: Boolean
     ) {
         if (st.instancesDirty) uploadInstances(st)
         val instances = st.instances ?: return
@@ -1640,10 +1659,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         if (useStencilMask) {
-            pass.setPipeline(blitPipelineStencilWrite)
+            pass.setPipeline(blitPipelinesStencilWrite[format])
             pass.setStencilReference(1)
         } else {
-            pass.setPipeline(blitPipeline)
+            pass.setPipeline(blitPipelines[format])
         }
         pass.setBindGroup(0, st.bindGroup ?: gridBindGroup(st).also { st.bindGroup = it })
         pass.setVertexBuffer(0, instances)
@@ -1654,7 +1673,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * Blit exactly [keys] - for a caller that just generated tiles into a pass that already drew
      * the rest. Its own buffer: Dawn keeps a destroyed one alive until its commands retire.
      */
-    private fun drawTiles(pass: GPURenderPassEncoder, st: PageTiles, keys: List<Long>) {
+    private fun drawTiles(
+        pass: GPURenderPassEncoder,
+        format: Int,
+        st: PageTiles,
+        keys: List<Long>
+    ) {
         val present = keys.mapNotNull { tkey -> st.tiles[tkey]?.let { tkey to it } }
         if (present.isEmpty()) return
 
@@ -1677,7 +1701,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         )
         device.queue.writeBuffer(instances, 0, bytes)
 
-        pass.setPipeline(blitPipeline)
+        pass.setPipeline(blitPipelines[format])
         pass.setBindGroup(0, st.bindGroup ?: gridBindGroup(st).also { st.bindGroup = it })
         pass.setVertexBuffer(0, instances)
         pass.draw(6, present.size)
@@ -1904,7 +1928,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val inner = rescaler.firstStepSpan(st.tileSize)
         val size = inner + 2 * rescaler.halo
         // A null here means the rescaler just gave up - fall through rather than lose the tile.
-        val source = if (use) rescaler.input(size) else null
+        val source = if (use) rescaler.input(size, atlas.format) else null
         val sourceView = rescaler.inputView
 
         if (source == null || sourceView == null) {
@@ -1931,7 +1955,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 rescaler.encode(encoder, size)
             },
         ) { pass, _ ->
-            rescaler.resolve(pass)
+            rescaler.resolve(pass, atlas.format)
         }
     }
 
@@ -1990,6 +2014,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pass: GPURenderPassEncoder, page: ImagePage.ImageSingle, dst: GPUTexture
     ): PageTiles? {
         if (page.destroyed || !page.highQuality || page.isAnimated) return null
+        // This path draws cached tiles without touching the image, so it has to report for itself.
+        if (page.currentImage?.isHdr == true) Hdr.noteHdrDrawn()
         if (!page.hasUploadedImage) return null
 
         val a = pagedAnchor(page, dst, 0f, 0f, 1f)
@@ -2049,7 +2075,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         toGenerate.forEach { tkey -> generateTileNow(st, (tkey shr 32).toInt(), tkey.toInt()) }
 
         // Only what just landed: premultiplied-over, so drawing a tile twice differs from once.
-        drawTiles(pass, st, toGenerate)
+        drawTiles(pass, dst.format, st, toGenerate)
         return true
     }
 

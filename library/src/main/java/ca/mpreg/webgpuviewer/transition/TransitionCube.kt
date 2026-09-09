@@ -343,6 +343,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             )
         )
 
+        val pipeline = pipelines[dst.format]
         pass.setPipeline(pipeline)
         pass.setBindGroup(
             0, device.createBindGroup(

@@ -36,7 +36,12 @@ class MainActivity : AppCompatActivity() {
                 dec.decodeNext()
             }.let {
                 withContext(WebGpuRenderer.dispatcher) {
-                    ImagePage.Images(Image(it.image, it.width, it.height)).apply {
+                    ImagePage.Images(
+                        Image(
+                            it.image, it.width, it.height,
+                            hdr = it.isHdr, hdrHeadroom = it.hdrHeadroom,
+                        )
+                    ).apply {
                         parent = binding.composeView2.state
                         x = homeX
                         y = homeY
@@ -51,7 +56,12 @@ class MainActivity : AppCompatActivity() {
                 dec.decodeNext()
             }.let {
                 withContext(WebGpuRenderer.dispatcher) {
-                    ImagePage.Images(Image(it.image, it.width, it.height)).apply {
+                    ImagePage.Images(
+                        Image(
+                            it.image, it.width, it.height,
+                            hdr = it.isHdr, hdrHeadroom = it.hdrHeadroom,
+                        )
+                    ).apply {
                         parent = binding.composeView2.state
                         x = homeX
                         y = homeY
@@ -65,7 +75,12 @@ class MainActivity : AppCompatActivity() {
                 dec.decodeNext()
             }.let {
                 withContext(WebGpuRenderer.dispatcher) {
-                    ImagePage.Images(Image(it.image, it.width, it.height)).apply {
+                    ImagePage.Images(
+                        Image(
+                            it.image, it.width, it.height,
+                            hdr = it.isHdr, hdrHeadroom = it.hdrHeadroom,
+                        )
+                    ).apply {
                         parent = binding.composeView2.state
                         x = homeX
                         y = homeY
@@ -79,7 +94,12 @@ class MainActivity : AppCompatActivity() {
                 dec.decodeNext()
             }.let {
                 withContext(WebGpuRenderer.dispatcher) {
-                    ImagePage.Images(Image(it.image, it.width, it.height)).apply {
+                    ImagePage.Images(
+                        Image(
+                            it.image, it.width, it.height,
+                            hdr = it.isHdr, hdrHeadroom = it.hdrHeadroom,
+                        )
+                    ).apply {
                         parent = binding.composeView2.state
                         x = homeX
                         y = homeY

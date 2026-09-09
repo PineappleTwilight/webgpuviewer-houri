@@ -13,7 +13,6 @@ import androidx.webgpu.GPUComputePipelineDescriptor
 import androidx.webgpu.GPUComputeState
 import androidx.webgpu.GPUExtent3D
 import androidx.webgpu.GPURenderPassEncoder
-import androidx.webgpu.GPURenderPipeline
 import androidx.webgpu.GPUSampler
 import androidx.webgpu.GPUSamplerDescriptor
 import androidx.webgpu.GPUShaderModuleDescriptor
@@ -72,7 +71,7 @@ class UpscalerArtCnn : Upscaler() {
 
     override val inputView: GPUTextureView? get() = textures?.inputView
 
-    override fun input(size: Int): GPUTexture? {
+    override fun input(size: Int, format: Int): GPUTexture? {
         // Inside the backoff window this answers null, so the tile path falls back to
         // Catmull-Rom for this tile; once the window lapses the pipelines are re-attempted.
         if (!supported) return null
@@ -81,9 +80,11 @@ class UpscalerArtCnn : Upscaler() {
             // so a device that cannot build them falls back instead of committing a blank tile.
             val built = pipelines()
             val current = textures
-            if (current == null || current.size != size) {
+            // Format as well as size: the first step renders into [Textures.input], which is a
+            // colour target and so has to match whatever the tile is being drawn into.
+            if (current == null || current.size != size || current.format != format) {
                 current?.destroy()
-                textures = Textures(size, built)
+                textures = Textures(size, format, built)
             }
             textures?.input
         } catch (e: Exception) {
@@ -112,10 +113,10 @@ class UpscalerArtCnn : Upscaler() {
         }
     }
 
-    override fun resolve(pass: GPURenderPassEncoder) {
+    override fun resolve(pass: GPURenderPassEncoder, format: Int) {
         val t = textures ?: return
         try {
-            pass.setPipeline(resolvePipeline)
+            pass.setPipeline(resolvePipelines[format])
             pass.setBindGroup(0, t.resolveGroup)
             pass.draw(3)
         } catch (e: Exception) {
@@ -171,9 +172,10 @@ class UpscalerArtCnn : Upscaler() {
 
     /**
      * Cuts the halo back off - [factor] * [halo] output pixels. A render pass, not a copy: the
-     * network works in [TextureFormat.RGBA16Float] and the tile atlas is 8-bit.
+     * network always works in [TextureFormat.RGBA16Float], while the tile atlas is 8-bit
+     * unless HDR is on screen - so this is keyed by the atlas's format like every other pipeline.
      */
-    private val resolvePipeline: GPURenderPipeline by lazy {
+    private val resolvePipelines = FormatKeyed { format ->
         Fullscreen.buildPipeline(
             """
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -182,7 +184,7 @@ class UpscalerArtCnn : Upscaler() {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return textureLoad(src, vec2<i32>(in.position.xy) + ${factor * halo}, 0);
 }
-""", TextureFormat.RGBA8Unorm, "$LABEL resolve"
+""", format, "$LABEL resolve"
         )
     }
 
@@ -199,9 +201,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      * The intermediates for one tile size and the bind groups over them. Rebuilt only when the
      * tile size changes, which [TileRenderer] holds still while a staged rescaler runs.
      */
-    private inner class Textures(val size: Int, built: List<GPUComputePipeline>) {
-        /** What the first step draws into: 8-bit, since that is what it reads from. */
-        val input = colour(size)
+    private inner class Textures(
+        val size: Int, val format: Int, built: List<GPUComputePipeline>
+    ) {
+        /** What the first step draws into - the tile's own format, since it is a colour target. */
+        val input = colour(size, format)
         val inputView: GPUTextureView = input.createView()
 
         // Feature maps pack four texels per input pixel, so they are double-sized; every pass
@@ -241,7 +245,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             )
             resolveGroup = device.createBindGroup(
                 GPUBindGroupDescriptor(
-                    layout = resolvePipeline.getBindGroupLayout(0), label = LABEL,
+                    layout = resolvePipelines[format].getBindGroupLayout(0), label = LABEL,
                     entries = arrayOf(GPUBindGroupEntry(0, textureView = f1))
                 )
             )
@@ -266,10 +270,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             )
         }
 
-        private fun colour(side: Int) = device.createTexture(
+        private fun colour(side: Int, format: Int) = device.createTexture(
             GPUTextureDescriptor(
                 label = "$LABEL input", size = GPUExtent3D(side, side),
-                format = TextureFormat.RGBA8Unorm,
+                format = format,
                 usage = TextureUsage.RenderAttachment or TextureUsage.TextureBinding,
             )
         )

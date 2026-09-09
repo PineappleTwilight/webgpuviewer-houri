@@ -8,6 +8,7 @@ import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureView
+import androidx.webgpu.TextureFormat
 import ca.mpreg.webgpuviewer.ImageUtil
 import ca.mpreg.webgpuviewer.Trim
 import kotlinx.coroutines.CancellationException
@@ -20,9 +21,47 @@ import kotlin.math.round
 
 const val BUFFER_SIZE = 96L
 
+/**
+ * An unapplied gain map, as [Image] wants it - fill from `ImageDecoder.DecodeResult.gainmap`.
+ *
+ * Its own type rather than the decoder's so this module keeps no dependency on it. See
+ * [ImageUtil.applyGainmap] for what the fields mean and how they combine with the base.
+ */
+class GainmapInput(
+    val pixels: ByteBuffer,
+    val width: Int,
+    val height: Int,
+    val channels: Int,
+    val gamma: FloatArray,
+    val minContentBoost: FloatArray,
+    val maxContentBoost: FloatArray,
+    val offsetSdr: FloatArray,
+    val offsetHdr: FloatArray,
+) {
+    /** Stops of headroom the map adds, from the largest [maxContentBoost]. */
+    val headroomStops: Float
+        get() = maxContentBoost.maxOrNull()?.takeIf { it > 1f }?.let { log2(it) } ?: 0f
+}
+
 class Image private constructor(
     val width: Int,
     val height: Int,
+    /**
+     * True when this image's tiles hold extended-sRGB half-float rather than 8-bit sRGB, i.e.
+     * when HDR source pixels met a device that can present them. An image decoded on a device
+     * that cannot is tone mapped at upload and reports false, having become an ordinary SDR one.
+     *
+     * Independent of whether HDR is on screen right now: tone mapping is irreversible, and this
+     * image outlives any one frame. Presentation follows the count of these - see
+     * [Hdr.retainHdrImage].
+     */
+    val isHdr: Boolean = false,
+    /**
+     * Stops of headroom above SDR white this image's pixels reach. Drives what the display is
+     * asked for while it is loaded - see [Hdr.desiredHeadroomRatio] - so it is kept rather than
+     * being only a decode-time argument.
+     */
+    val hdrHeadroom: Float = 0f,
 ) {
 
     var x: Float = 0f
@@ -43,6 +82,9 @@ class Image private constructor(
             trimColors: List<FloatArray>? = null,
             trimThreshold: Float = 0.05f,
             backgroundColor: Int? = null,
+            hdr: Boolean = false,
+            hdrHeadroom: Float = 0f,
+            gainmap: GainmapInput? = null,
         ): Image {
             // Harden: reject tiny textures that trigger Adreno qdgralloc 0x3b (4x4 format 59) and
             // guard against OOM/overflow from malicious dimensions. Clamp tiny to error rather
@@ -62,7 +104,85 @@ class Image private constructor(
             require(pixels.isDirect) { "pixels must be direct ByteBuffer" }
             require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "pixels too small for ${width}x$height" }
 
-            val image = Image(width, height)
+            // Everything HDR resolves to plain pixels here, so nothing downstream has to know
+            // which kind arrived. An app can hand over HDR without checking whether the device
+            // can show it.
+            @Suppress("NAME_SHADOWING") var pixels = pixels
+            var keepHdr = false
+            var headroom = hdrHeadroom
+
+            val canHdr = (hdr || gainmap != null) && Hdr.awaitSupportedByDevice()
+
+            when {
+                // A gain map is applied here rather than by the decoder: how much of it to use
+                // is a display question, and the base has to survive intact for the SDR case.
+                gainmap != null && canHdr -> {
+                    pixels = withContext(Dispatchers.Default) {
+                        ImageUtil.applyGainmap(
+                            base = pixels,
+                            width = width,
+                            height = height,
+                            gain = gainmap.pixels,
+                            gainWidth = gainmap.width,
+                            gainHeight = gainmap.height,
+                            gainChannels = gainmap.channels,
+                            gamma = gainmap.gamma,
+                            minContentBoost = gainmap.minContentBoost,
+                            maxContentBoost = gainmap.maxContentBoost,
+                            offsetSdr = gainmap.offsetSdr,
+                            offsetHdr = gainmap.offsetHdr,
+                            // Scaled so the map's full boost lands on what is actually being
+                            // presented, instead of wherever the file aimed.
+                            weight = Hdr.peakWeight(gainmap.headroomStops),
+                        )
+                    }
+                    keepHdr = true
+                    // What the pixels reach, not what was asked for: a map that fits inside the
+                    // ceiling is applied in full and never reaches it.
+                    headroom = minOf(gainmap.headroomStops, log2(Hdr.presentPeak))
+                }
+
+                // No HDR to present, so the base is simply left alone - it already *is* the
+                // file's SDR rendition, which is exact and free where tone mapping would be
+                // neither. This is the payoff for the map arriving unapplied.
+                gainmap != null -> headroom = 0f
+
+                // PQ and HLG arrive normalised against SDR white and can reach far past any
+                // panel. No map to weight, so the pixels themselves are scaled - against the
+                // image's *measured* peak, not the format's, which is the difference between a
+                // frame that fills the headroom and one five stops too dim.
+                hdr && canHdr -> {
+                    keepHdr = true
+                    val peak = withContext(Dispatchers.Default) {
+                        ImageUtil.scaleHdrPeakNative(pixels, width, height, Hdr.presentPeak)
+                    }
+                    headroom = log2(peak.coerceAtLeast(1f))
+                }
+
+                // Float pixels with nowhere to put them: tone map once, at upload.
+                hdr -> {
+                    pixels = withContext(Dispatchers.Default) {
+                        ImageUtil.toneMapToSdr(pixels, width, height)
+                    }
+                    headroom = 0f
+                }
+            }
+
+            // Which branch ran: a wrong-looking picture can't say whether HDR was applied,
+            // refused, or never detected.
+            if (hdr || gainmap != null) {
+                Log.i(
+                    "Renderer",
+                    "HDR ${width}x$height hdr=$hdr gainmap=${gainmap != null} " +
+                            "canHdr=$canHdr declared=${hdrHeadroom} stops " +
+                            "-> keepHdr=$keepHdr headroom=$headroom stops target=${Hdr.presentPeak}"
+                )
+            }
+
+            val image = Image(width, height, isHdr = keepHdr, hdrHeadroom = headroom)
+
+            val tileFormat =
+                if (keepHdr) TextureFormat.RGBA16Float else TextureFormat.RGBA8Unorm
 
             // Runs on a background dispatcher rather than as compute shaders - the GPU versions
             // would park on a buffer readback while holding the render thread, stalling every
@@ -71,9 +191,21 @@ class Image private constructor(
                 var backgroundFromTrim = false
 
                 val trimWith = trimColors?.takeIf { it.isNotEmpty() }
-                if (trimWith != null) {
+                val wantsBackgroundProbe = backgroundColor == null
+
+                // Both passes read 8-bit sRGB, so an HDR image being kept as float needs an SDR
+                // rendition to measure. Only worth making when something actually asks.
+                val sdrPixels = when {
+                    !keepHdr -> pixels
+                    trimWith != null || wantsBackgroundProbe ->
+                        ImageUtil.toneMapToSdr(pixels, width, height)
+
+                    else -> null
+                }
+
+                if (trimWith != null && sdrPixels != null) {
                     // Find trim for each color and pick the smallest rect
-                    val rects = Trim.findAllCpu(pixels, width, height, trimWith, trimThreshold)
+                    val rects = Trim.findAllCpu(sdrPixels, width, height, trimWith, trimThreshold)
                     val best =
                         trimWith.zip(rects).minByOrNull { it.second.width() * it.second.height() }
 
@@ -93,9 +225,9 @@ class Image private constructor(
                 // already named a background colour.
                 if (backgroundColor != null) {
                     image.backgroundColor = backgroundColor
-                } else if (!backgroundFromTrim) {
+                } else if (!backgroundFromTrim && sdrPixels != null) {
                     image.backgroundColor =
-                        Trim.detectBackgroundCpu(pixels, width, height, trimThreshold)
+                        Trim.detectBackgroundCpu(sdrPixels, width, height, trimThreshold)
                 }
             }
 
@@ -124,7 +256,11 @@ class Image private constructor(
 
                     currentPixels = try {
                         withContext(Dispatchers.Default) {
-                            ImageUtil.resize(currentPixels, textureWidth, textureHeight)
+                            if (keepHdr) {
+                                ImageUtil.resizeF16(currentPixels, textureWidth, textureHeight)
+                            } else {
+                                ImageUtil.resize(currentPixels, textureWidth, textureHeight)
+                            }
                         }
                     } catch (e: CancellationException) {
                         // Not a resize failure: the scope is being torn down (a page destroyed
@@ -156,7 +292,9 @@ class Image private constructor(
                     image.ensureBuffer(device)
                     for (data in mipmapDataList) {
                         image.mipmaps.add(
-                            Mipmap.create(data.pixels, data.w, data.h, data.scale, tilesize)
+                            Mipmap.create(
+                                data.pixels, data.w, data.h, data.scale, tilesize, tileFormat
+                            )
                         )
                     }
                 } catch (e: Exception) {
@@ -167,6 +305,8 @@ class Image private constructor(
                     throw e
                 }
             }
+
+            if (keepHdr) Hdr.retainHdrImage(image, headroom)
 
             return image
         }
@@ -212,10 +352,26 @@ class Image private constructor(
 
     val mipmaps: MutableList<Mipmap> = mutableListOf()
 
+    /** Guards the [Hdr] count against a second release on the same image. */
+    @Volatile
+    private var released = false
+
+    /**
+     * Idempotent, and separate from [cleanup] because that runs on the render dispatcher, which
+     * a torn-down renderer never services - stranding the claim.
+     */
+    internal fun releaseHdr() {
+        if (isHdr && !released) {
+            released = true
+            Hdr.releaseHdrImage(this)
+        }
+    }
+
     @Synchronized
     internal fun cleanup() {
         if (cleaned) return
         cleaned = true
+        releaseHdr()
         mipmaps.forEach { try { it.cleanup() } catch (_: Throwable) {} }
         mipmaps.clear()
         destroyBuffer()
@@ -246,6 +402,7 @@ class Image private constructor(
 
     fun prepareForRender(dst: GPUTexture, x: Float, y: Float, scale: Float): MipMapForDraw? {
         if (mipmaps.isEmpty()) return null
+        if (isHdr) Hdr.noteHdrDrawn()
 
         var level = floor(log2(1 / scale)).toInt().coerceIn(0, mipmaps.size - 1)
 
@@ -304,6 +461,7 @@ class Image private constructor(
     fun prepareTilesForRender(
         dst: GPUTexture, x: Float, y: Float, scale: Float
     ): List<TileForDraw> {
+        if (isHdr) Hdr.noteHdrDrawn()
         if (mipmaps.isEmpty()) return emptyList()
 
         val level = floor(log2(1 / scale)).toInt().coerceIn(0, mipmaps.size - 1)

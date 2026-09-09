@@ -4,26 +4,28 @@ import androidx.webgpu.BufferUsage
 import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUCommandEncoder
-import androidx.webgpu.GPUComputePipeline
 import androidx.webgpu.GPUComputePipelineDescriptor
 import androidx.webgpu.GPUComputeState
 import androidx.webgpu.GPUShaderModuleDescriptor
 import androidx.webgpu.GPUShaderSourceWGSL
 import androidx.webgpu.GPUTexture
+import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.wgslStorageFormat
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.ceil
 
 private val device get() = WebGpuRenderer.device
 
-private val pipeline: GPUComputePipeline by lazy {
+// The shader source is per format too: a storage texture's format is part of the text.
+private val pipelines = FormatKeyed { format ->
     device.createComputePipeline(
         GPUComputePipelineDescriptor(
             GPUComputeState(
                 device.createShaderModule(
                     GPUShaderModuleDescriptor(
-                        shaderSourceWGSL = GPUShaderSourceWGSL(LINE_SHADER)
+                        shaderSourceWGSL = GPUShaderSourceWGSL(lineShader(format))
                     )
                 )
             )
@@ -31,7 +33,7 @@ private val pipeline: GPUComputePipeline by lazy {
     )
 }
 
-private const val LINE_SHADER = """
+private fun lineShader(format: Int) = """
 struct Params {
     start: vec2<f32>,
     end: vec2<f32>,
@@ -39,7 +41,7 @@ struct Params {
     width: f32,
 }
 
-@group(0) @binding(0) var output_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var output_tex: texture_storage_2d<${wgslStorageFormat(format)}, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 
 @compute @workgroup_size(8, 8, 1)
@@ -108,6 +110,7 @@ fun Draw.line(
     val dispatchH = ceil(texture.height / 8f).toInt()
 
     val pass = encoder.beginComputePass()
+    val pipeline = pipelines[texture.format]
     pass.setPipeline(pipeline)
     pass.setBindGroup(
         0, device.createBindGroup(

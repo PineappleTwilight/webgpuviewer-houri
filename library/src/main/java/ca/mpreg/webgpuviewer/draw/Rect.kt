@@ -14,7 +14,6 @@ import androidx.webgpu.GPUPrimitiveState
 import androidx.webgpu.GPURenderPassColorAttachment
 import androidx.webgpu.GPURenderPassDescriptor
 import androidx.webgpu.GPURenderPassEncoder
-import androidx.webgpu.GPURenderPipeline
 import androidx.webgpu.GPURenderPipelineDescriptor
 import androidx.webgpu.GPUShaderModuleDescriptor
 import androidx.webgpu.GPUShaderSourceWGSL
@@ -23,14 +22,14 @@ import androidx.webgpu.GPUVertexState
 import androidx.webgpu.LoadOp
 import androidx.webgpu.PrimitiveTopology
 import androidx.webgpu.StoreOp
-import androidx.webgpu.TextureFormat
+import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 private val device get() = WebGpuRenderer.device
 
-private val pipeline: GPURenderPipeline by lazy {
+private val pipelines = FormatKeyed { format ->
     val shaderModule = device.createShaderModule(
         GPUShaderModuleDescriptor(
             shaderSourceWGSL = GPUShaderSourceWGSL(RECT_SHADER)
@@ -42,7 +41,7 @@ private val pipeline: GPURenderPipeline by lazy {
             fragment = GPUFragmentState(
                 module = shaderModule, entryPoint = "fs_main", targets = arrayOf(
                     GPUColorTargetState(
-                        format = TextureFormat.RGBA8Unorm, blend = GPUBlendState(
+                        format = format, blend = GPUBlendState(
                             color = GPUBlendComponent(
                                 srcFactor = BlendFactor.SrcAlpha,
                                 dstFactor = BlendFactor.OneMinusSrcAlpha,
@@ -136,7 +135,7 @@ fun Draw.rect(
             )
         )
     )
-    rect(pass, x1, y1, x2, y2, color)
+    rect(pass, texture.format, x1, y1, x2, y2, color)
     pass.end()
 }
 
@@ -152,6 +151,8 @@ fun Draw.rect(
  */
 fun Draw.rect(
     pass: GPURenderPassEncoder,
+    /** Format of [pass]'s colour attachment - see [FormatKeyed]. */
+    format: Int,
     x1: Float,
     y1: Float,
     x2: Float,
@@ -178,6 +179,7 @@ fun Draw.rect(
     val uniformBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
+    val pipeline = pipelines[format]
     pass.setPipeline(pipeline)
     val bindGroup = device.createBindGroup(
         GPUBindGroupDescriptor(

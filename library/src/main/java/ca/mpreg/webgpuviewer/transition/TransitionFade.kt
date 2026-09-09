@@ -21,7 +21,7 @@ import androidx.webgpu.GPUVertexState
 import androidx.webgpu.LoadOp
 import androidx.webgpu.PrimitiveTopology.Companion.TriangleList
 import androidx.webgpu.StoreOp
-import androidx.webgpu.TextureFormat
+import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.TileRenderer
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.viewer.ImagePage
@@ -37,7 +37,7 @@ object TransitionFade : Transition() {
         WebGpuRenderer.device.createSampler()
     }
 
-    private val blendPipeline by lazy {
+    private val blendPipelines = FormatKeyed { format ->
         val device = WebGpuRenderer.device
         val shaderModule = device.createShaderModule(
             GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(BLEND_SHADER))
@@ -47,7 +47,7 @@ object TransitionFade : Transition() {
                 vertex = GPUVertexState(shaderModule, entryPoint = "vs_main"),
                 fragment = GPUFragmentState(
                     shaderModule, entryPoint = "fs_main", targets = arrayOf(
-                        GPUColorTargetState(format = TextureFormat.RGBA8Unorm)
+                        GPUColorTargetState(format = format)
                     )
                 ),
                 primitive = GPUPrimitiveState(topology = TriangleList),
@@ -167,6 +167,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             )
         )
 
+        val blendPipeline = blendPipelines[dst.format]
         pass.setPipeline(blendPipeline)
         pass.setBindGroup(
             0, WebGpuRenderer.device.createBindGroup(

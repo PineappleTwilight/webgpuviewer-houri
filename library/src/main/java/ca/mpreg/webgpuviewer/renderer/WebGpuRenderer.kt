@@ -20,7 +20,6 @@ import androidx.webgpu.GPUSurfaceDescriptor
 import androidx.webgpu.GPUSurfaceSourceAndroidNativeWindow
 import androidx.webgpu.GPUTexture
 import androidx.webgpu.SurfaceGetCurrentTextureStatus
-import androidx.webgpu.TextureFormat
 import androidx.webgpu.TextureUsage
 import androidx.webgpu.UncapturedErrorCallback
 import androidx.webgpu.WebGpuRuntimeException
@@ -363,6 +362,12 @@ class WebGpuRenderer {
     private var surface: GPUSurface? = null
 
     /**
+     * The format the swapchain is currently configured as, so [render] can notice when
+     * [Hdr.frameFormat] has moved and rebuild it.
+     */
+    private var configuredFormat: Int = 0
+
+    /**
      * Post-processing over the finished frame - see [FilterChain]. Empty by default, in which
      * case [render] hands the swapchain texture straight to its caller as it always did.
      */
@@ -440,15 +445,23 @@ class WebGpuRenderer {
                     )
                 )
             ).apply {
+                // Before the first latch, so the swapchain is configured knowing
+                // whether float is even available.
+                Hdr.resolve(this, adapter)
+                // No images exist yet, so a previous session's stranded retains can go
+                // without discarding a live one.
+                Hdr.resetContent()
+                Hdr.latchFrameFormat()
                 configure(
                     GPUSurfaceConfiguration(
                         device,
                         width,
                         height,
-                        TextureFormat.RGBA8Unorm,
+                        Hdr.frameFormat,
                         TextureUsage.RenderAttachment
                     )
                 )
+                configuredFormat = Hdr.frameFormat
             }
             val previous = surface
             surface = replacement
@@ -547,6 +560,19 @@ class WebGpuRenderer {
         mutex.withLock {
             val surface = surface ?: return false
 
+            // An HDR image arriving, or the last one leaving, changes what the swapchain should
+            // be. Here rather than at the decode: the format can only change between frames, and
+            // this is the one place guaranteed to be between them - hence the latch too.
+            Hdr.latchFrameFormat()
+            if (Hdr.frameFormat != configuredFormat) {
+                reconfigure(surface)
+                Hdr.syncPresentation()
+            } else if (Hdr.consumePresentationDirty()) {
+                // Same format, but a brighter image arrived (or the brightest was freed), so the
+                // headroom asked of the display has moved.
+                Hdr.syncPresentation()
+            }
+
             val current = try {
                 surface.getCurrentTexture()
             } catch (e: CancellationException) {
@@ -623,9 +649,10 @@ class WebGpuRenderer {
         try {
             surface.configure(
                 GPUSurfaceConfiguration(
-                    device, width, height, TextureFormat.RGBA8Unorm, TextureUsage.RenderAttachment
+                    device, width, height, Hdr.frameFormat, TextureUsage.RenderAttachment
                 )
             )
+            configuredFormat = Hdr.frameFormat
         } catch (e: Exception) {
             Log.w("WebGpuRenderer", "Failed to reconfigure surface", e)
         }

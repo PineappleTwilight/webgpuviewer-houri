@@ -22,6 +22,7 @@ import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureView
 import androidx.webgpu.LoadOp
 import androidx.webgpu.StoreOp
+import androidx.webgpu.TextureFormat
 import ca.mpreg.webgpuviewer.closeTo
 import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.draw.Font
@@ -133,6 +134,9 @@ open class ImagePage {
         // only ever one pass open per render() call (see the class doc).
         private lateinit var pass: GPURenderPassEncoder
 
+        /** Format of [pass]'s colour attachment - see [FormatKeyed]. */
+        private var passFormat: Int = TextureFormat.RGBA8Unorm
+
         /** Draws this page's content. Use [rect]/[circle]/[text] to draw into the open pass. */
         open fun render(dst: GPUTexture, x: Float, y: Float, scale: Float) {}
 
@@ -154,7 +158,7 @@ open class ImagePage {
         }
 
         protected fun rect(x1: Float, y1: Float, x2: Float, y2: Float, color: Int) =
-            Draw.rect(pass, x1, y1, x2, y2, color)
+            Draw.rect(pass, passFormat, x1, y1, x2, y2, color)
 
         /**
          * Fills this page's own [width] x [height] footprint with [color] - unlike [rect]'s raw
@@ -182,7 +186,7 @@ open class ImagePage {
         }
 
         protected fun circle(cx: Float, cy: Float, radius: Float, color: Int) =
-            Draw.circle(pass, cx, cy, radius, color)
+            Draw.circle(pass, passFormat, cx, cy, radius, color)
 
         /**
          * Draws [texture] as a square sprite of [sizePx] pixels centered on ([cx], [cy]) -
@@ -295,6 +299,7 @@ open class ImagePage {
                 )
             )
             pass = openedPass
+            passFormat = dst.format
             try {
                 // clear=true already painted the whole dst this colour via clearValue above - a
                 // page-scoped fillPage on top would be redundant. clear=false (the shared-texture
@@ -540,7 +545,16 @@ open class ImagePage {
                 if (!covered) {
                     renderPage(pass, dst, 0f, 0f, 1f)
                 }
-                if (fade < 1f) fadeRect(dst)?.let { drawFade(pass, it[0], it[1], it[2], it[3]) }
+                if (fade < 1f) fadeRect(dst)?.let {
+                    drawFade(
+                        pass,
+                        dst.format,
+                        it[0],
+                        it[1],
+                        it[2],
+                        it[3]
+                    )
+                }
                 return covered
             } finally {
                 pass.end()
@@ -560,7 +574,17 @@ open class ImagePage {
                 try {
                     renderPage(pass, tex, 0f, 0f, 1f, masked = false)
                     if (fade < 1f) {
-                        fadeRect(tex)?.let { drawFade(pass, it[0], it[1], it[2], it[3], false) }
+                        fadeRect(tex)?.let {
+                            drawFade(
+                                pass,
+                                tex.format,
+                                it[0],
+                                it[1],
+                                it[2],
+                                it[3],
+                                false
+                            )
+                        }
                     }
                 } finally {
                     pass.end()
@@ -580,7 +604,17 @@ open class ImagePage {
                 // A fade re-seeds the cache every frame (frameVersion), which is what lets a
                 // page fade in mid-turn at all.
                 if (fade < 1f) {
-                    fadeRect(tex)?.let { drawFade(pass, it[0], it[1], it[2], it[3], false) }
+                    fadeRect(tex)?.let {
+                        drawFade(
+                            pass,
+                            tex.format,
+                            it[0],
+                            it[1],
+                            it[2],
+                            it[3],
+                            false
+                        )
+                    }
                 }
             } finally {
                 pass.end()
@@ -634,7 +668,10 @@ open class ImagePage {
             val image = currentImage ?: return
             if (image.mipmaps.isEmpty()) return
             // One image, so its column is the whole width - see [backgroundSpansFullWidth].
-            Draw.rect(pass, offsetX, offsetY, offsetX + 1f, offsetY + 1f, image.backgroundColor)
+            Draw.rect(
+                pass, dst.format, offsetX, offsetY, offsetX + 1f, offsetY + 1f,
+                image.backgroundColor
+            )
         }
 
         /**
@@ -656,7 +693,14 @@ open class ImagePage {
             val variant = RenderPage.variantFor(linear, masked)
             forEachPlacedImage(dst, x, y, scale) { image, rect, placeX, placeY, placeScale ->
                 if (!linear || !masked) {
-                    drawImageBackground(pass, image, rect, scale, maskedBackground = masked)
+                    drawImageBackground(
+                        pass,
+                        dst.format,
+                        image,
+                        rect,
+                        scale,
+                        maskedBackground = masked
+                    )
                 }
                 for (tile in image.prepareTilesForRender(dst, placeX, placeY, placeScale)) {
                     RenderPage.drawTile(pass, dst, tile, variant)
@@ -676,7 +720,7 @@ open class ImagePage {
         fun renderBackground(
             pass: GPURenderPassEncoder, dst: GPUTexture, x: Float, y: Float, scale: Float
         ) = forEachPlacedImage(dst, x, y, scale) { image, rect, _, _, _ ->
-            drawImageBackground(pass, image, rect, scale, maskedBackground = true)
+            drawImageBackground(pass, dst.format, image, rect, scale, maskedBackground = true)
         }
 
         /**
@@ -686,6 +730,7 @@ open class ImagePage {
          */
         private fun drawImageBackground(
             pass: GPURenderPassEncoder,
+            format: Int,
             image: Image,
             rect: FloatArray,
             scale: Float,
@@ -751,9 +796,9 @@ open class ImagePage {
             // second time and took the crossfade through black on its way there.
             val bgColor = (a shl 24) or (image.backgroundColor and 0xFFFFFF)
             if (maskedBackground) {
-                RenderPage.drawMaskedRect(pass, x1, 0f, x2, 1f, bgColor)
+                RenderPage.drawMaskedRect(pass, format, x1, 0f, x2, 1f, bgColor)
             } else {
-                Draw.rect(pass, x1, 0f, x2, 1f, bgColor)
+                Draw.rect(pass, format, x1, 0f, x2, 1f, bgColor)
             }
         }
 
@@ -798,8 +843,10 @@ open class ImagePage {
             animationLoop?.cancel()
             animationLoop = null
 
-            // Only clean the image if we own it
+            // The HDR claim was taken when the image was built, so it goes back either way.
             if (!ownsImage) {
+                frames?.forEach { it.first.releaseHdr() }
+                image?.releaseHdr()
                 frames = null
                 currentFrameImage = null
                 return
@@ -811,6 +858,10 @@ open class ImagePage {
 
             // Frames include the image; otherwise clean it directly
             val imagesToClean = framesToClean?.map { it.first } ?: listOfNotNull(image)
+
+            // Before the launch, not inside it: work needing the render dispatcher is what kept
+            // HDR on after the last HDR page was evicted.
+            imagesToClean.forEach { it.releaseHdr() }
 
             if (imagesToClean.isNotEmpty()) {
                 cleanupScope.launch {
@@ -1046,7 +1097,15 @@ open class ImagePage {
             val color = side.backgroundColor
             if (color != null) {
                 val (x1, x2) = sideColumn(side, srcOffsetX, dst)
-                Draw.rect(pass, offsetX + x1, offsetY, offsetX + x2, offsetY + 1f, color)
+                Draw.rect(
+                    pass,
+                    dst.format,
+                    offsetX + x1,
+                    offsetY,
+                    offsetX + x2,
+                    offsetY + 1f,
+                    color
+                )
             }
         }
 
@@ -1439,6 +1498,7 @@ open class ImagePage {
     /** Veil this page's rect, in fractions of the target, with what is left of the fade. */
     internal fun drawFade(
         pass: GPURenderPassEncoder,
+        format: Int,
         x1: Float,
         y1: Float,
         x2: Float,
@@ -1450,8 +1510,8 @@ open class ImagePage {
         val alpha = (((color ushr 24) and 0xFF) * (1f - fade)).toInt().coerceIn(0, 255)
         val veil = (alpha shl 24) or (color and 0xFFFFFF)
         // Only a live draw's pass has the stencil attachment drawMaskedRect's pipeline declares.
-        if (masked) RenderPage.drawMaskedRect(pass, x1, y1, x2, y2, veil)
-        else Draw.rect(pass, x1, y1, x2, y2, veil)
+        if (masked) RenderPage.drawMaskedRect(pass, format, x1, y1, x2, y2, veil)
+        else Draw.rect(pass, format, x1, y1, x2, y2, veil)
     }
 
     /** True while the viewer is drawing this page, itself or as a side of a spread. */

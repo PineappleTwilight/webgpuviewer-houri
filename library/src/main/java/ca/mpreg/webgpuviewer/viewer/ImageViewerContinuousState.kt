@@ -856,6 +856,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val top = anchorY + s.scale * d.vp.docTop
                         page.drawFade(
                             pass,
+                            texture.format,
                             (anchorX - s.scale * dstW / 2f) / dstW,
                             top / dstH,
                             (anchorX + s.scale * dstW / 2f) / dstW,

@@ -36,15 +36,14 @@ import androidx.webgpu.LoadOp
 import androidx.webgpu.PrimitiveTopology.Companion.TriangleList
 import androidx.webgpu.ShaderStage
 import androidx.webgpu.StoreOp
-import androidx.webgpu.TextureFormat
 import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.draw.rect
+import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.TileRenderer
 import ca.mpreg.webgpuviewer.transition.Transition.Companion.blendBackgroundColor
 import ca.mpreg.webgpuviewer.transition.Transition.Companion.blitCachedRegion
 import ca.mpreg.webgpuviewer.transition.TransitionFlip.LIT_ENDS
 import ca.mpreg.webgpuviewer.transition.TransitionFlip.blankAlpha
-import ca.mpreg.webgpuviewer.transition.TransitionFlip.punchPipeline
 import ca.mpreg.webgpuviewer.viewer.ImagePage
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -173,7 +172,7 @@ object TransitionFlip : Transition() {
      * holds the uniform alone and rejects the leaf's own bind group - which fails the pass, and
      * with it every draw in the frame.
      */
-    private val punchPipeline: GPURenderPipeline by lazy {
+    private val punchPipelines = FormatKeyed { format ->
         val shaderModule = device.createShaderModule(
             GPUShaderModuleDescriptor(shaderSourceWGSL = GPUShaderSourceWGSL(code))
         )
@@ -191,7 +190,7 @@ object TransitionFlip : Transition() {
                 fragment = GPUFragmentState(
                     shaderModule, entryPoint = "fs_punch", targets = arrayOf(
                         GPUColorTargetState(
-                            format = TextureFormat.RGBA8Unorm,
+                            format = format,
                             blend = GPUBlendState(color = zero, alpha = zero)
                         )
                     )
@@ -229,14 +228,14 @@ object TransitionFlip : Transition() {
 
         val pass = beginClearedPass(encoder, dst)
         try {
-            if (surfaceFill(page1, page2)) Draw.rect(pass, 0f, 0f, 1f, 1f, background)
+            if (surfaceFill(page1, page2)) Draw.rect(pass, dst.format, 0f, 0f, 1f, 1f, background)
             // Clipped at each spine: page 1 keeps the side the leaf left, page 2 the one it uncovers.
             if (forward) {
-                spine1?.let { blitCachedRegion(pass, cached1, 0f, 0f, it, 1f) }
-                spine2?.let { blitCachedRegion(pass, cached2, it, 0f, 1f, 1f) }
+                spine1?.let { blitCachedRegion(pass, dst.format, cached1, 0f, 0f, it, 1f) }
+                spine2?.let { blitCachedRegion(pass, dst.format, cached2, it, 0f, 1f, 1f) }
             } else {
-                spine1?.let { blitCachedRegion(pass, cached1, it, 0f, 1f, 1f) }
-                spine2?.let { blitCachedRegion(pass, cached2, 0f, 0f, it, 1f) }
+                spine1?.let { blitCachedRegion(pass, dst.format, cached1, it, 0f, 1f, 1f) }
+                spine2?.let { blitCachedRegion(pass, dst.format, cached2, 0f, 0f, it, 1f) }
             }
         } finally {
             pass.end()
@@ -274,17 +273,17 @@ object TransitionFlip : Transition() {
             val cutLast = !leaf.hasBack
 
             if (!cutting || cutLast) {
-                attach(leafPass, pipeline, uniforms, front, back)
+                attach(leafPass, pipelines[dst.format], uniforms, front, back)
                 leafPass.draw(VERTICES)
                 // After the leaf, so the near face goes with the hole it stands in.
-                if (cutting) cut(leafPass, uniforms)
+                if (cutting) cut(leafPass, dst.format, uniforms)
             } else {
                 // Shadow first, so the cut takes it too - one hanging in the hole is cast by a
                 // sheet nobody can see.
-                attach(leafPass, pipeline, uniforms, front, back)
+                attach(leafPass, pipelines[dst.format], uniforms, front, back)
                 leafPass.draw(SHEET_VERTICES)
-                cut(leafPass, uniforms)
-                attach(leafPass, pipeline, uniforms, front, back)
+                cut(leafPass, dst.format, uniforms)
+                attach(leafPass, pipelines[dst.format], uniforms, front, back)
                 leafPass.draw(SHEET_VERTICES, 1, SHEET_VERTICES)
             }
         } finally {
@@ -418,8 +417,8 @@ object TransitionFlip : Transition() {
     }
 
     /** Cut the blank face out, over the leaf's own half of the grid - see [punchPipeline]. */
-    private fun cut(pass: GPURenderPassEncoder, uniforms: GPUBuffer) {
-        pass.setPipeline(punchPipeline)
+    private fun cut(pass: GPURenderPassEncoder, format: Int, uniforms: GPUBuffer) {
+        pass.setPipeline(punchPipelines[format])
         pass.setBindGroup(
             0, device.createBindGroup(
                 GPUBindGroupDescriptor(

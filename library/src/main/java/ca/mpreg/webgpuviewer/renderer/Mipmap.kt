@@ -25,7 +25,17 @@ class Mipmap(
     val tilesCols: Int,
     val tilesRows: Int,
     val tilesize: Int,
+    /**
+     * Format of the tile textures. Follows the pixels this level was built from, never the
+     * swapchain: an SDR image keeps 8-bit tiles even while HDR is on screen, since sampling one
+     * into a float target needs no help and widening it would only cost bandwidth.
+     */
+    val format: Int,
 ) {
+    /** Bytes one tile texel occupies, for the row strides [upload] and [update] copy at. */
+    private val bytesPerPixel: Int
+        get() = if (format == TextureFormat.RGBA16Float) 8 else 4
+
     companion object {
         private val device get() = WebGpuRenderer.device
 
@@ -46,7 +56,8 @@ class Mipmap(
          * returned once every chunk has landed, so no caller can sample a half-filled texture.
          */
         suspend fun create(
-            pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int
+            pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int,
+            format: Int = TextureFormat.RGBA8Unorm
         ): Mipmap {
             require(width > 0 && height > 0 && tilesize > 0) { "Mipmap.create: invalid dims ${width}x$height tilesize $tilesize" }
             require(!scale.isNaN() && !scale.isInfinite() && scale > 0f && scale <= 1f) { "Mipmap.create: invalid scale $scale" }
@@ -64,6 +75,7 @@ class Mipmap(
                 tilesCols = ceil(width.toFloat() / tilesize).toInt().coerceAtLeast(1),
                 tilesRows = ceil(height.toFloat() / tilesize).toInt().coerceAtLeast(1),
                 tilesize = tilesize,
+                format = format,
             )
             try {
                 mipmap.upload(pixels)
@@ -80,7 +92,7 @@ class Mipmap(
 
     /** Allocate the tile textures and copy [pixels] into them a chunk at a time. */
     private suspend fun upload(pixels: ByteBuffer) {
-        val rowsPerChunk = (UPLOAD_CHUNK_BYTES / (width * Int.SIZE_BYTES)).coerceAtLeast(1)
+        val rowsPerChunk = (UPLOAD_CHUNK_BYTES / (width * bytesPerPixel)).coerceAtLeast(1)
 
         for (r in 0 until tilesRows) {
             val tileHeight = min((r + 1) * tilesize, height) - (r * tilesize)
@@ -106,7 +118,7 @@ class Mipmap(
                     device.createTexture(
                         GPUTextureDescriptor(
                             size = GPUExtent3D(allocW, allocH),
-                            format = TextureFormat.RGBA8Unorm,
+                            format = format,
                             usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
                         )
                     )
@@ -121,7 +133,7 @@ class Mipmap(
                             device.createTexture(
                                 GPUTextureDescriptor(
                                     size = GPUExtent3D(8, 8),
-                                    format = TextureFormat.RGBA8Unorm,
+                                    format = format,
                                     usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
                                 )
                             )
@@ -139,8 +151,8 @@ class Mipmap(
                         dataLayout = GPUTexelCopyBufferLayout(
                             // Long arithmetic: y * width overflows Int well before the byte
                             // offset does on a large page.
-                            offset = ((y + row).toLong() * width + x) * Int.SIZE_BYTES,
-                            bytesPerRow = width * Int.SIZE_BYTES,
+                            offset = ((y + row).toLong() * width + x) * bytesPerPixel,
+                            bytesPerRow = width * bytesPerPixel,
                             rowsPerImage = height,
                         ),
                         data = pixels,
@@ -181,7 +193,7 @@ class Mipmap(
     private var cachedQuad: Quad? = null
 
     constructor(texture: GPUTexture, scale: Float, tilesize: Int) : this(
-        texture.width, texture.height, scale, 1, 1, tilesize
+        texture.width, texture.height, scale, 1, 1, tilesize, texture.format
     ) {
         textures.add(texture)
         val view = texture.createView()
@@ -193,11 +205,15 @@ class Mipmap(
         cachedQuad = Quad(tiles, tileViews, 0, 0)
     }
 
-    constructor(width: Int, height: Int) : this(width, height, 1f, 1, 1, 4096) {
+    // A drawable image is painted by the app from ARGB ints, so it is SDR by nature - the draw
+    // pipelines read their format off the texture, so 8-bit here needs nothing else.
+    constructor(width: Int, height: Int) : this(
+        width, height, 1f, 1, 1, 4096, TextureFormat.RGBA8Unorm
+    ) {
         val texture = device.createTexture(
             GPUTextureDescriptor(
                 size = GPUExtent3D(width, height),
-                format = TextureFormat.RGBA8Unorm,
+                format = format,
                 usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment or TextureUsage.StorageBinding,
             )
         )
@@ -246,8 +262,8 @@ class Mipmap(
 
                 device.queue.writeTexture(
                     dataLayout = GPUTexelCopyBufferLayout(
-                        offset = (y * width + x) * 4L,
-                        bytesPerRow = width * Int.SIZE_BYTES,
+                        offset = (y.toLong() * width + x) * bytesPerPixel,
+                        bytesPerRow = width * bytesPerPixel,
                         rowsPerImage = height,
                     ),
                     data = pixels,
