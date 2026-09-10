@@ -139,7 +139,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     ) {
         if (cachedView1 == null || cachedView2 == null) return
 
-        val byteBuffer = blendByteBuffer.get()
+        val byteBuffer = blendByteBuffer.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(blend)
         byteBuffer.putFloat(0f)

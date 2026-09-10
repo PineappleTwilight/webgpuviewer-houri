@@ -136,7 +136,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     ) {
         if (cachedView == null) return
 
-        val byteBuffer = fadeWhiteByteBuffer.get()
+        val byteBuffer = fadeWhiteByteBuffer.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(fade)
         byteBuffer.putFloat(0f)

@@ -24,8 +24,8 @@ import androidx.webgpu.TextureFormat
 import androidx.webgpu.TextureUsage
 import androidx.webgpu.UncapturedErrorCallback
 import androidx.webgpu.WebGpuRuntimeException
-import androidx.webgpu.helper.Util.windowFromSurface
-import androidx.webgpu.helper.initLibrary
+import androidx.webgpu.helper.Util as WebGpuUtilHelper
+import androidx.webgpu.helper.initLibrary as webgpuInitLibrary
 import ca.mpreg.webgpuviewer.filter.FilterChain
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.mutex
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.withContext
@@ -41,9 +41,9 @@ import java.util.concurrent.Executors
 
 class WebGpuRenderer {
     companion object {
-        var instance: GPUInstance
-        var adapter: GPUAdapter
-        var device: GPUDevice
+        lateinit var instance: GPUInstance
+        lateinit var adapter: GPUAdapter
+        lateinit var device: GPUDevice
         private val mutex = Mutex()
 
         @Volatile
@@ -108,10 +108,49 @@ class WebGpuRenderer {
         @Volatile
         private var initialized = false
 
+        @Volatile
+        var initError: Throwable? = null
+            private set
+
+        val isAvailable: Boolean get() = initialized && initError == null && ::instance.isInitialized && ::adapter.isInitialized && ::device.isInitialized
+
+        private fun safeInitLibrary() {
+            try {
+                webgpuInitLibrary()
+                return
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.initLibrary failed, trying WebGpuUtils fallback", e)
+            }
+            try {
+                val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                val m = cls.getMethod("initLibrary")
+                m.invoke(null)
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "Fallback WebGpuUtils.initLibrary also failed", e)
+                throw e
+            }
+        }
+
+        private fun safeWindowFromSurface(surface: Surface): Long {
+            try {
+                return WebGpuUtilHelper.windowFromSurface(surface)
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.windowFromSurface failed, trying WebGpuUtils", e)
+                try {
+                    val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                    val m = cls.getMethod("windowFromSurface", Surface::class.java)
+                    return m.invoke(null, surface) as Long
+                } catch (e2: Throwable) {
+                    Log.e("WebGpuRenderer", "Fallback windowFromSurface also failed", e2)
+                    throw e2
+                }
+            }
+        }
+
         init {
             runBlocking {
                 try {
-                    initLibrary()
+                    safeInitLibrary()
 
                     instance = createInstance(GPUInstanceDescriptor())
 
@@ -135,15 +174,18 @@ class WebGpuRenderer {
                         )
                     )
                     initialized = true
-                } catch (e: Exception) {
+                    initError = null
+                } catch (e: Throwable) {
                     Log.e("WebGpuRenderer", "Failed to initialize WebGPU", e)
-                    throw e
+                    initialized = false
+                    initError = e
                 }
             }
         }
 
         @JvmStatic
         suspend fun <R> withContext(block: suspend CoroutineScope.(GPUDevice) -> R): R {
+            check(isAvailable) { "WebGPU not available: $initError" }
             return withContext(dispatcher) {
                 mutex.withLock {
                     block(this, device)
@@ -165,6 +207,7 @@ class WebGpuRenderer {
          */
         @JvmStatic
         suspend fun <R> onDispatcher(block: suspend CoroutineScope.(GPUDevice) -> R): R {
+            check(isAvailable) { "WebGPU not available: $initError" }
             return withContext(dispatcher) {
                 block(this, device)
             }
@@ -187,6 +230,10 @@ class WebGpuRenderer {
 
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
+        if (!isAvailable) {
+            Log.w("WebGpuRenderer", "init called but WebGPU not available: $initError")
+            return
+        }
         this.scope = scope
         this.width = width
         this.height = height
@@ -194,24 +241,29 @@ class WebGpuRenderer {
         val isOnDispatcherThread = isOnRenderThread()
 
         val initSurface = {
-            this@WebGpuRenderer.surface = surface.let {
-                instance.createSurface(
-                    GPUSurfaceDescriptor(
-                        surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
-                            windowFromSurface(it)
+            try {
+                this@WebGpuRenderer.surface = surface.let {
+                    instance.createSurface(
+                        GPUSurfaceDescriptor(
+                            surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
+                                safeWindowFromSurface(it)
+                            )
                         )
-                    )
-                ).apply {
-                    configure(
-                        GPUSurfaceConfiguration(
-                            device,
-                            width,
-                            height,
-                            TextureFormat.RGBA8Unorm,
-                            TextureUsage.RenderAttachment
+                    ).apply {
+                        configure(
+                            GPUSurfaceConfiguration(
+                                device,
+                                width,
+                                height,
+                                TextureFormat.RGBA8Unorm,
+                                TextureUsage.RenderAttachment
+                            )
                         )
-                    )
+                    }
                 }
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "Failed to create surface", e)
+                this@WebGpuRenderer.surface = null
             }
         }
 

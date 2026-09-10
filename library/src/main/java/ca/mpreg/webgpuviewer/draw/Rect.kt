@@ -162,7 +162,7 @@ fun Draw.rect(
     val b = (color and 0xFF) / 255f
     val a = ((color ushr 24) and 0xFF) / 255f
 
-    val byteBuffer = byteBufferLocal.get()
+    val byteBuffer = byteBufferLocal.get()!!
     byteBuffer.clear()
     byteBuffer.putFloat(x1)
     byteBuffer.putFloat(y1)

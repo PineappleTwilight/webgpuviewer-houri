@@ -341,7 +341,7 @@ class Trim {
                 )
             )
 
-            val byteBuffer = edgeUniformByteBuffer.get()
+            val byteBuffer = edgeUniformByteBuffer.get()!!
             byteBuffer.clear()
             byteBuffer.putFloat(threshold)
             byteBuffer.putInt(texture.width)
@@ -351,7 +351,7 @@ class Trim {
             device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
             // Initialize result buffer to zeros
-            val initBuffer = edgeInitByteBuffer.get()
+            val initBuffer = edgeInitByteBuffer.get()!!
             initBuffer.clear()
             repeat(8) { initBuffer.putInt(0) }
             initBuffer.flip()
@@ -936,7 +936,7 @@ fn find_bottom(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 )
             )
 
-            val byteBuffer = trimUniformByteBuffer.get()
+            val byteBuffer = trimUniformByteBuffer.get()!!
             byteBuffer.clear()
             byteBuffer.putFloat(r)
             byteBuffer.putFloat(g)
@@ -945,7 +945,7 @@ fn find_bottom(@builtin(global_invocation_id) global_id: vec3<u32>) {
             byteBuffer.flip()
             device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
-            val initBuffer = trimInitByteBuffer.get()
+            val initBuffer = trimInitByteBuffer.get()!!
             initBuffer.clear()
             initBuffer.putInt(texture.width)
             initBuffer.putInt(texture.height)

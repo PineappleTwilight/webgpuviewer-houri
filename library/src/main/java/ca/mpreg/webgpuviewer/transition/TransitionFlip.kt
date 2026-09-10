@@ -362,7 +362,7 @@ object TransitionFlip : Transition() {
      * This frame's uniforms. [blank] paints a face with no page, at [blankAlpha] - see [blankAlpha].
      */
     private fun uniforms(leaf: Leaf, blank: Int, blankAlpha: Float): GPUBuffer {
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         for (v in leaf.frontRect) byteBuffer.putFloat(v)
         for (v in leaf.backRect) byteBuffer.putFloat(v)

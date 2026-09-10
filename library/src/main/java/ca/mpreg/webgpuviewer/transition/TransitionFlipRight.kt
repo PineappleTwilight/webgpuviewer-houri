@@ -209,7 +209,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (cachedView == null) return
         val rect = page.wholeRect(dst) ?: return
 
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         for (v in rect) byteBuffer.putFloat(v)
         byteBuffer.putFloat(frac)

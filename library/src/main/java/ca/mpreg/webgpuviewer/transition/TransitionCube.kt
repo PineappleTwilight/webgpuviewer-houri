@@ -318,7 +318,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             Draw.rect(encoder, dst, (leftX + 1f) / 2f, 0f, (rightX + 1f) / 2f, 1f, it)
         }
 
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         for (i in matrix.indices) {
             byteBuffer.putFloat(matrix[i])

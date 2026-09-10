@@ -258,7 +258,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         val b = (color and 0xFF) / 255f
         val a = ((color ushr 24) and 0xFF) / 255f
 
-        val byteBuffer = maskedRectByteBuffer.get()
+        val byteBuffer = maskedRectByteBuffer.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(x1)
         byteBuffer.putFloat(y1)
@@ -606,7 +606,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         res: Image.MipMapForDraw,
         variant: Variant
     ) {
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(res.x)
         byteBuffer.putFloat(res.y)
@@ -644,7 +644,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     internal fun drawTile(
         pass: GPURenderPassEncoder, dst: GPUTexture, tile: Image.TileForDraw, variant: Variant
     ) {
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(tile.x)
         byteBuffer.putFloat(tile.y)

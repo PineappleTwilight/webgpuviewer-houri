@@ -1953,7 +1953,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val ts = st.tileSize.toFloat()
         if (st.writtenSnapX == snapX && st.writtenSnapY == snapY && st.writtenDstW == dstW && st.writtenDstH == dstH && st.writtenClipL == clipL && st.writtenClipT == clipT && st.writtenClipR == clipR && st.writtenClipB == clipB && st.writtenTs == ts) return
 
-        val byteBuffer = byteBufferLocal.get()
+        val byteBuffer = byteBufferLocal.get()!!
         byteBuffer.clear()
         byteBuffer.putFloat(snapX)
         byteBuffer.putFloat(snapY)

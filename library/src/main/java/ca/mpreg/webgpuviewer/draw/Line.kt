@@ -89,7 +89,7 @@ fun Draw.line(
     val px2 = x2 * texture.width
     val py2 = y2 * texture.height
 
-    val byteBuffer = byteBufferLocal.get()
+    val byteBuffer = byteBufferLocal.get()!!
     byteBuffer.clear()
     byteBuffer.putFloat(0, px1)
     byteBuffer.putFloat(4, py1)

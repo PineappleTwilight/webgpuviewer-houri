@@ -11,7 +11,7 @@ object Draw {
     private val tempBuffers = ThreadLocal.withInitial { mutableListOf<GPUBuffer>() }
 
     fun submit(block: Draw.(GPUCommandEncoder) -> Unit) {
-        val buffers = tempBuffers.get()
+        val buffers = tempBuffers.get()!!
         val encoder = device.createCommandEncoder()
         block.invoke(this, encoder)
         device.queue.submit(arrayOf(encoder.finish()))
@@ -21,7 +21,7 @@ object Draw {
 
     internal fun createBuffer(size: Long, usage: Int): GPUBuffer {
         return device.createBuffer(GPUBufferDescriptor(size = size, usage = usage)).also {
-            tempBuffers.get().add(it)
+            tempBuffers.get()!!.add(it)
         }
     }
 }

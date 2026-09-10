@@ -269,7 +269,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         ) {
             if (cachedView == null || x2 <= x1 || y2 <= y1) return
 
-            val byteBuffer = regionByteBuffer.get()
+            val byteBuffer = regionByteBuffer.get()!!
             byteBuffer.clear()
             byteBuffer.putFloat(x1)
             byteBuffer.putFloat(y1)
@@ -587,7 +587,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         ) {
             if (cachedView == null) return
 
-            val byteBuffer = blitByteBuffer.get()
+            val byteBuffer = blitByteBuffer.get()!!
             byteBuffer.clear()
             byteBuffer.putFloat(offsetX)
             byteBuffer.putFloat(offsetY)
