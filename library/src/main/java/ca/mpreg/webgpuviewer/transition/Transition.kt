@@ -219,6 +219,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         private const val REGION_SHADER = """
 struct Uniforms {
     rect: vec4<f32>,
+    // Fade in x, the rest padding.
+    fade: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -252,18 +254,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(src_tex, src_sampler, in.uv);
+    // Premultiplied, so the whole sample scales.
+    return textureSample(src_tex, src_sampler, in.uv) * uniforms.fade.x;
 }
 """
 
         private val regionByteBuffer = ThreadLocal.withInitial {
-            ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder())
+            ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder())
         }
 
         /**
          * Blit one region of a cached texture into [pass] at those same coordinates - one side of
          * a cached spread without the other, which [blitCached] cannot do. Null [cachedView] draws
-         * nothing.
+         * nothing, as does [alpha] 0.
          */
         internal fun blitCachedRegion(
             pass: GPURenderPassEncoder,
@@ -274,8 +277,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             y1: Float,
             x2: Float,
             y2: Float,
+            alpha: Float = 1f,
         ) {
-            if (cachedView == null || x2 <= x1 || y2 <= y1) return
+            if (cachedView == null || x2 <= x1 || y2 <= y1 || alpha <= 0f) return
 
             val byteBuffer = regionByteBuffer.get()!!
             byteBuffer.clear()
@@ -283,10 +287,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             byteBuffer.putFloat(y1)
             byteBuffer.putFloat(x2)
             byteBuffer.putFloat(y2)
+            byteBuffer.putFloat(alpha)
+            byteBuffer.putFloat(0f)
+            byteBuffer.putFloat(0f)
+            byteBuffer.putFloat(0f)
             byteBuffer.flip()
 
             val uniformBuffer = WebGpuRenderer.device.createBuffer(
-                GPUBufferDescriptor(size = 16, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
+                GPUBufferDescriptor(size = 32, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
             )
             WebGpuRenderer.device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
@@ -482,8 +490,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             val cachedY = if (isPage1) cachedY1 else cachedY2
             val cachedScale = if (isPage1) cachedScale1 else cachedScale2
             val cachedFrame = if (isPage1) cachedFrameVersion1 else cachedFrameVersion2
-            return cachedPage === page && cachedX == page.x && cachedY == page.y &&
-                    cachedScale == page.scale && cachedFrame == page.frameVersion
+            return cachedPage === page && cachedX == page.x && cachedY == page.y && cachedScale == page.scale && cachedFrame == page.frameVersion
         }
 
         /**
@@ -604,10 +611,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         internal fun blitCached(
             pass: GPURenderPassEncoder,
             /** Format of [pass]'s colour attachment - see [FormatKeyed]. */
-            format: Int,
-            cachedView: GPUTextureView?,
-            offsetX: Float,
-            offsetY: Float
+            format: Int, cachedView: GPUTextureView?, offsetX: Float, offsetY: Float
         ) {
             if (cachedView == null) return
 
