@@ -49,31 +49,34 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
     jint srcWidth, jint srcHeight) {
   initLUTs();
 
-  if (srcWidth <= 0 || srcHeight <= 0)
-    return;
-  // Guard against absurd sizes that would overflow capacity checks.
-  if (srcWidth > 16384 || srcHeight > 16384)
-    return;
+  if (env == nullptr || src_buffer == nullptr || dst_buffer == nullptr) return;
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (srcWidth <= 0 || srcHeight <= 0) return;
+  if (srcWidth > 16384 || srcHeight > 16384) return;
 
-  uint32_t *src = (uint32_t *)env->GetDirectBufferAddress(src_buffer);
-  uint32_t *dst = (uint32_t *)env->GetDirectBufferAddress(dst_buffer);
-  if (!src || !dst)
+  const uint8_t* srcBytes = static_cast<const uint8_t*>(env->GetDirectBufferAddress(src_buffer));
+  uint8_t* dstBytes = static_cast<uint8_t*>(env->GetDirectBufferAddress(dst_buffer));
+  if (srcBytes == nullptr || dstBytes == nullptr || env->ExceptionCheck()) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
     return;
+  }
 
   const jlong srcCapacity = env->GetDirectBufferCapacity(src_buffer);
   const jlong dstCapacity = env->GetDirectBufferCapacity(dst_buffer);
-  const jlong srcNeeded = static_cast<jlong>(srcWidth) * srcHeight * 4LL;
-  if (srcCapacity < srcNeeded)
-    return;
+  if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+  const jlong srcNeeded = static_cast<jlong>(srcWidth) * static_cast<jlong>(srcHeight) * 4LL;
+  if (srcCapacity < srcNeeded || srcCapacity < 0) return;
 
   int dstWidth = srcWidth / 2;
   int dstHeight = srcHeight / 2;
-  if (dstWidth <= 0 || dstHeight <= 0)
-    return;
+  if (dstWidth <= 0 || dstHeight <= 0) return;
 
-  const jlong dstNeeded = static_cast<jlong>(dstWidth) * dstHeight * 4LL;
-  if (dstCapacity < dstNeeded)
-    return;
+  const jlong dstNeeded = static_cast<jlong>(dstWidth) * static_cast<jlong>(dstHeight) * 4LL;
+  if (dstCapacity < dstNeeded || dstCapacity < 0) return;
+
+  // Keep uint32_t view for vectorized path, but validate alignment: direct buffers are naturally aligned.
+  uint32_t *src = (uint32_t *)srcBytes;
+  uint32_t *dst = (uint32_t *)dstBytes;
 
   double scaleX = (double)srcWidth / dstWidth;
   double scaleY = (double)srcHeight / dstHeight;
@@ -126,9 +129,9 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
             float aVal = ((pixel >> 24) & 0xFF) / 255.0f;
 
             linearA[i] = aVal;
-            linearR[i] = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
+            linearR[i] = srgbToLinearLUT[pixel & 0xFF] * aVal;
             linearG[i] = srgbToLinearLUT[(pixel >> 8) & 0xFF] * aVal;
-            linearB[i] = srgbToLinearLUT[pixel & 0xFF] * aVal;
+            linearB[i] = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
           }
 
           float32x4_t v_w = vld1q_f32(weights);
@@ -154,9 +157,9 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
 
           uint32_t pixel = src[sy * srcWidth + sx];
           float aVal = ((pixel >> 24) & 0xFF) / 255.0f;
-          float rVal = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
+          float rVal = srgbToLinearLUT[pixel & 0xFF] * aVal;
           float gVal = srgbToLinearLUT[(pixel >> 8) & 0xFF] * aVal;
-          float bVal = srgbToLinearLUT[pixel & 0xFF] * aVal;
+          float bVal = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
 
           sumA_scalar += aVal * pWeight;
           sumR_scalar += rVal * pWeight;
@@ -235,9 +238,9 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
           uint32_t pixel = src[srcRowOffset + sx];
 
           uint8_t a = (pixel >> 24) & 0xFF;
-          uint8_t r = (pixel >> 16) & 0xFF;
+          uint8_t r = pixel & 0xFF;
           uint8_t g = (pixel >> 8) & 0xFF;
-          uint8_t b = pixel & 0xFF;
+          uint8_t b = (pixel >> 16) & 0xFF;
 
           float aVal = a / 255.0f;
 
@@ -276,7 +279,7 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
 #endif
 
       dst[y * dstWidth + x] =
-          (finalA << 24) | (finalR << 16) | (finalG << 8) | finalB;
+          (finalA << 24) | (finalB << 16) | (finalG << 8) | finalR;
     }
   }
 }

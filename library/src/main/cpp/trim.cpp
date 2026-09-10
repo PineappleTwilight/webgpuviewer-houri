@@ -281,6 +281,10 @@ Java_ca_mpreg_webgpuviewer_TrimNative_findTrim(JNIEnv *env, jobject thiz,
                                                jint height, jfloatArray colors,
                                                jfloat threshold,
                                                jintArray outBounds) {
+  if (env == nullptr || pixelBuffer == nullptr || colors == nullptr || outBounds == nullptr) {
+    return JNI_FALSE;
+  }
+  if (env->ExceptionCheck()) env->ExceptionClear();
   if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
     return JNI_FALSE;
   }
@@ -291,18 +295,26 @@ Java_ca_mpreg_webgpuviewer_TrimNative_findTrim(JNIEnv *env, jobject thiz,
 
   const uint8_t *pixels =
       static_cast<const uint8_t *>(env->GetDirectBufferAddress(pixelBuffer));
-  if (pixels == nullptr) {
+  if (pixels == nullptr || env->ExceptionCheck()) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
     return JNI_FALSE;
   }
   const jlong capacity = env->GetDirectBufferCapacity(pixelBuffer);
+  if (env->ExceptionCheck()) { env->ExceptionClear(); return JNI_FALSE; }
   if (capacity < static_cast<jlong>(width) * height * kChannels) {
     return JNI_FALSE;
   }
 
+  if (env->ExceptionCheck()) env->ExceptionClear();
   const jsize colorFloats = env->GetArrayLength(colors);
+  if (env->ExceptionCheck()) { env->ExceptionClear(); return JNI_FALSE; }
   const int colorCount = colorFloats / 3;
-  if (colorCount <= 0 || colorCount > 16 ||
-      env->GetArrayLength(outBounds) < colorCount * 4) {
+  if (colorCount <= 0 || colorCount > 16) {
+    return JNI_FALSE;
+  }
+  const jsize outLen = env->GetArrayLength(outBounds);
+  if (env->ExceptionCheck()) { env->ExceptionClear(); return JNI_FALSE; }
+  if (outLen < colorCount * 4) {
     return JNI_FALSE;
   }
 
@@ -388,9 +400,12 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
                                                        jobject pixelBuffer,
                                                        jint width, jint height,
                                                        jfloat threshold) {
+  const jint kWhite = static_cast<jint>(0xFFFFFFFFu);
+  if (env == nullptr || pixelBuffer == nullptr) return kWhite;
+  if (env->ExceptionCheck()) env->ExceptionClear();
   if (!std::isfinite(threshold)) threshold = 0.05f;
   threshold = std::clamp(threshold, 0.0f, 1.0f);
-  const jint kWhite = static_cast<jint>(0xFFFFFFFFu);
+  if (!std::isfinite(threshold)) return kWhite;
 
   if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
     return kWhite;
@@ -398,7 +413,8 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
 
   const uint8_t *pixels =
       static_cast<const uint8_t *>(env->GetDirectBufferAddress(pixelBuffer));
-  if (pixels == nullptr) {
+  if (pixels == nullptr || env->ExceptionCheck()) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
     return kWhite;
   }
   const jlong capacity = env->GetDirectBufferCapacity(pixelBuffer);
