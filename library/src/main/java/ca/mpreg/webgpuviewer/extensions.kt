@@ -14,7 +14,11 @@ import androidx.compose.ui.platform.LocalContext
 import kotlin.math.abs
 
 internal object NormalMotionDurationScale : MotionDurationScale {
-    override val scaleFactor: Float = 1f
+    override val scaleFactor: Float
+        get() = try {
+            val v = 1f
+            if (!v.isFinite()) 1f else v.coerceIn(0.1f, 10f)
+        } catch (_: Throwable) { 1f }
 }
 
 suspend fun AwaitPointerEventScope.waitForCleanUp(

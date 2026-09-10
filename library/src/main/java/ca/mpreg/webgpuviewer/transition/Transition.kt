@@ -335,48 +335,55 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         private var cacheWidth = 0
         private var cacheHeight = 0
 
-        // Textures pending destruction (deferred to avoid use-after-free)
-        private var pendingDestroy1: GPUTexture? = null
-        private var pendingDestroy2: GPUTexture? = null
+        private val pendingDestroy = ArrayList<GPUTexture>(4)
 
         private fun ensureTexturesLocked(width: Int, height: Int) {
-            // Destroy old pending textures (safe now - at least one frame has passed)
-            pendingDestroy1?.destroy()
-            pendingDestroy2?.destroy()
-            pendingDestroy1 = null
-            pendingDestroy2 = null
+            if (pendingDestroy.isNotEmpty()) {
+                for (tex in pendingDestroy) try { tex.destroy() } catch (_: Throwable) {}
+                pendingDestroy.clear()
+            }
 
-            // Recreate if size changed
-            if (cacheWidth != width || cacheHeight != height) {
-                // Defer destruction of old textures
-                pendingDestroy1 = texture1
-                pendingDestroy2 = texture2
+            val w = width.coerceIn(8, 8192)
+            val h = height.coerceIn(8, 8192)
+            if (w != width || h != height) {
+                android.util.Log.w("Transition", "ensureTextures clamped ${width}x$height -> ${w}x$h")
+            }
 
-                // Create new textures
-                texture1 = WebGpuRenderer.device.createTexture(
-                    GPUTextureDescriptor(
-                        size = GPUExtent3D(width, height),
-                        format = TextureFormat.RGBA8Unorm,
-                        usage = TextureUsage.RenderAttachment or TextureUsage.TextureBinding
+            if (cacheWidth != w || cacheHeight != h) {
+                texture1?.let { pendingDestroy.add(it) }
+                texture2?.let { pendingDestroy.add(it) }
+
+                try {
+                    texture1 = WebGpuRenderer.device.createTexture(
+                        GPUTextureDescriptor(
+                            size = GPUExtent3D(w, h),
+                            format = TextureFormat.RGBA8Unorm,
+                            usage = TextureUsage.RenderAttachment or TextureUsage.TextureBinding
+                        )
                     )
-                )
-                texture2 = WebGpuRenderer.device.createTexture(
-                    GPUTextureDescriptor(
-                        size = GPUExtent3D(width, height),
-                        format = TextureFormat.RGBA8Unorm,
-                        usage = TextureUsage.RenderAttachment or TextureUsage.TextureBinding
+                    texture2 = WebGpuRenderer.device.createTexture(
+                        GPUTextureDescriptor(
+                            size = GPUExtent3D(w, h),
+                            format = TextureFormat.RGBA8Unorm,
+                            usage = TextureUsage.RenderAttachment or TextureUsage.TextureBinding
+                        )
                     )
-                )
-                view1 = texture1!!.createView()
-                view2 = texture2!!.createView()
+                } catch (e: OutOfMemoryError) {
+                    System.gc()
+                    throw e
+                } catch (e: Throwable) {
+                    android.util.Log.e("Transition", "ensureTextures create failed ${w}x$h", e)
+                    throw e
+                }
+                view1 = try { texture1!!.createView() } catch (e: Throwable) { android.util.Log.e("Transition", "view1 create failed", e); null }
+                view2 = try { texture2!!.createView() } catch (e: Throwable) { android.util.Log.e("Transition", "view2 create failed", e); null }
 
-                // Invalidate cache
                 cachedPage1 = null
                 cachedPage2 = null
                 blittedKeys1 = emptySet()
                 blittedKeys2 = emptySet()
-                cacheWidth = width
-                cacheHeight = height
+                cacheWidth = w
+                cacheHeight = h
             }
         }
 
@@ -394,10 +401,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
          * both stay at the same perceptual pace without either one needing to give up correctness.
          */
         internal fun blendBackgroundColor(bg1: Int, bg2: Int, t: Float): Int {
+            val tt = if (!t.isNaN() && !t.isInfinite()) t.coerceIn(0f, 1f) else 0.5f
             fun channel(shift: Int): Int {
                 val c1 = srgbToLinear(((bg1 shr shift) and 0xFF) / 255f)
                 val c2 = srgbToLinear(((bg2 shr shift) and 0xFF) / 255f)
-                val blended = linearToSrgb(c1 + (c2 - c1) * t)
+                val blended = linearToSrgb(c1 + (c2 - c1) * tt)
                 return (blended * 255f).toInt().coerceIn(0, 255)
             }
             return 0xFF000000.toInt() or (channel(16) shl 16) or (channel(8) shl 8) or channel(0)

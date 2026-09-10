@@ -205,29 +205,38 @@ class FilterChain {
         (width.toLong() shl 44) or (height.toLong() shl 24) or
                 (format.toLong() shl 1) or (if (storage) 1L else 0L)
 
+    @Volatile
+    private var poolTotalBytes: Long = 0L
+    private val maxPoolBytes: Long = 48L * 1024 * 1024
+
     private fun acquire(width: Int, height: Int, format: Int, storage: Boolean): Slot {
         require(width > 0 && height > 0) { "acquire: invalid size ${width}x$height" }
-        // Clamp tiny to avoid Adreno 4x4 format 59 path; clamp huge to avoid OOM.
+        require(width <= 16384 && height <= 16384) { "acquire: size too large ${width}x$height" }
         val w = width.coerceIn(8, 8192)
         val h = height.coerceIn(8, 8192)
         if (w != width || h != height) {
             android.util.Log.w("FilterChain", "acquire clamped ${width}x$height -> ${w}x$h")
         }
-        val slots = pool.getOrPut(key(w, h, format, storage)) { ArrayList() }
+        if (format != TextureFormat.RGBA8Unorm && format != TextureFormat.RGBA16Float) {
+            android.util.Log.w("FilterChain", "acquire unexpected format $format, clamping to RGBA8Unorm")
+        }
+        val safeFormat = if (format == TextureFormat.RGBA16Float) format else TextureFormat.RGBA8Unorm
+        val slots = pool.getOrPut(key(w, h, safeFormat, storage)) { ArrayList() }
 
         var free: Slot? = null
         for (slot in slots) {
             if (!slot.inUse && (free == null || slot.lastFrame < free.lastFrame)) free = slot
         }
 
-        // Rotate rather than reuse: writing the texture the previous frame is still reading from
-        // makes the GPU serialize the two, the same hazard TileRenderer's stencil ring avoids.
-        // Only up to [RING] of them, since a chain that needs several within one frame has to
-        // come back round eventually.
         if (free != null && (free.lastFrame != frame - 1 || slots.size >= RING)) {
             free.inUse = true
             free.lastFrame = frame
             return free
+        }
+
+        if (poolTotalBytes > maxPoolBytes) {
+            android.util.Log.w("FilterChain", "pool over budget ${poolTotalBytes} > $maxPoolBytes, destroying oldest")
+            destroyOldestPoolEntries()
         }
 
         var usage = TextureUsage.TextureBinding or TextureUsage.RenderAttachment
@@ -236,18 +245,46 @@ class FilterChain {
         val texture = try {
             device.createTexture(
                 GPUTextureDescriptor(
-                    size = GPUExtent3D(w, h), format = format, usage = usage
+                    size = GPUExtent3D(w, h), format = safeFormat, usage = usage
                 )
             )
         } catch (e: OutOfMemoryError) {
             System.gc()
+            destroyOldestPoolEntries()
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.e("FilterChain", "acquire createTexture failed ${w}x$h", e)
             throw e
         }
         val slot = Slot(texture, texture.createView())
         slot.inUse = true
         slot.lastFrame = frame
         slots.add(slot)
+        poolTotalBytes += w.toLong() * h * 4L
         return slot
+    }
+
+    private fun destroyOldestPoolEntries() {
+        var oldestKey: Long? = null
+        var oldestFrame = Long.MAX_VALUE
+        for ((k, slots) in pool) {
+            for (s in slots) if (!s.inUse && s.lastFrame < oldestFrame) {
+                oldestFrame = s.lastFrame
+                oldestKey = k
+            }
+        }
+        if (oldestKey != null) {
+            val list = pool[oldestKey]!!
+            val idx = list.indexOfFirst { !it.inUse && it.lastFrame == oldestFrame }
+            if (idx >= 0) {
+                val removed = list.removeAt(idx)
+                try { removed.texture.destroy() } catch (_: Throwable) {}
+                poolTotalBytes = (poolTotalBytes - removed.texture.width.toLong() * removed.texture.height * 4L).coerceAtLeast(0L)
+                if (list.isEmpty()) pool.remove(oldestKey)
+            }
+        } else {
+            destroyPool()
+        }
     }
 
     private fun releaseAll() {
@@ -256,8 +293,11 @@ class FilterChain {
     }
 
     private fun destroyPool() {
-        for (slots in pool.values) for (slot in slots) slot.texture.destroy()
+        for (slots in pool.values) for (slot in slots) {
+            try { slot.texture.destroy() } catch (_: Throwable) {}
+        }
         pool.clear()
+        poolTotalBytes = 0L
         sceneSlot = null
     }
 

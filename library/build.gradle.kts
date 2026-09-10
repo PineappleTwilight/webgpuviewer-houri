@@ -13,14 +13,16 @@ plugins {
 group = "ca.mpreg"
 version = "0.0.0"
 
-val tag: String = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
-    System.getenv("GITHUB_REF_NAME")
-} else {
-    val baseVersion = providers.exec {
-        commandLine("git", "rev-parse", "--short", "HEAD")
-    }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
-    "$baseVersion-SNAPSHOT"
-}
+val tag: String = runCatching {
+    if (System.getenv("GITHUB_REF_TYPE") == "tag") {
+        System.getenv("GITHUB_REF_NAME")?.takeIf { it.isNotBlank() } ?: "0.0.0"
+    } else {
+        val baseVersion = providers.exec {
+            commandLine("git", "rev-parse", "--short", "HEAD")
+        }.standardOutput.asText.map { it.trim().takeIf { s -> s.matches(Regex("[0-9a-f]{4,40}")) } ?: "unknown" }.getOrElse("unknown")
+        "$baseVersion-SNAPSHOT"
+    }
+}.getOrElse { "0.0.0-unknown" }
 
 android {
     namespace = "ca.mpreg.webgpuviewer"
@@ -144,20 +146,26 @@ abstract class MergeEmbeddedAarsTask : DefaultTask() {
     fun merge() {
         val outFile = outputAar.get().asFile
         outFile.parentFile.mkdirs()
-        if (outFile.exists()) outFile.delete()
+        if (outFile.exists() && !outFile.delete()) throw IllegalStateException("Failed to delete $outFile")
 
         val ownAarFile = inputAar.get().asFile
-        val embedAarFiles = embedAars.files
+        require(ownAarFile.exists()) { "inputAar not found: $ownAarFile" }
+        val embedAarFiles = embedAars.files.filter { it.exists() }
 
-        val mergedClassesJarBytes = mergeClassesJars(ownAarFile, embedAarFiles)
+        val mergedClassesJarBytes = mergeClassesJars(ownAarFile, embedAarFiles.toSet())
 
         ZipFile(ownAarFile).use { ownZip ->
-            ZipOutputStream(outFile.outputStream()).use { zos ->
+            ZipOutputStream(outFile.outputStream().buffered()).use { zos ->
                 val writtenPaths = mutableSetOf<String>()
 
                 fun writeEntry(name: String, bytes: ByteArray) {
-                    if (!writtenPaths.add(name)) return
-                    zos.putNextEntry(ZipEntry(name))
+                    if (!writtenPaths.add(name)) {
+                        if (name.startsWith("META-INF/") && name.endsWith(".SF")) return
+                        if (name.startsWith("META-INF/") && name.endsWith(".RSA")) return
+                        return
+                    }
+                    val entry = ZipEntry(name).apply { time = 0L }
+                    zos.putNextEntry(entry)
                     zos.write(bytes)
                     zos.closeEntry()
                 }
@@ -167,7 +175,11 @@ abstract class MergeEmbeddedAarsTask : DefaultTask() {
                     if (entry.name == "classes.jar") {
                         writeEntry("classes.jar", mergedClassesJarBytes)
                     } else {
-                        writeEntry(entry.name, ownZip.getInputStream(entry).readBytes())
+                        try {
+                            writeEntry(entry.name, ownZip.getInputStream(entry).readBytes())
+                        } catch (e: Exception) {
+                            logger.warn("Skipping entry ${entry.name}: ${e.message}")
+                        }
                     }
                 }
 
@@ -177,12 +189,18 @@ abstract class MergeEmbeddedAarsTask : DefaultTask() {
                             if (entry.isDirectory) continue
                             if (entry.name == "classes.jar") continue
                             if (entry.name == "AndroidManifest.xml") continue
-                            writeEntry(entry.name, embedZip.getInputStream(entry).readBytes())
+                            if (entry.name.startsWith("META-INF/")) continue
+                            try {
+                                writeEntry(entry.name, embedZip.getInputStream(entry).readBytes())
+                            } catch (e: Exception) {
+                                logger.warn("Skipping embed entry ${entry.name}: ${e.message}")
+                            }
                         }
                     }
                 }
             }
         }
+        require(outFile.exists() && outFile.length() > 0) { "merge produced empty AAR" }
     }
 
     private fun mergeClassesJars(ownAarFile: File, embedAarFiles: Set<File>): ByteArray {

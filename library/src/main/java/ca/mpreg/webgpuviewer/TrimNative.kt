@@ -13,9 +13,22 @@ import java.nio.ByteBuffer
  * packed RGBA8.
  */
 object TrimNative {
+    @Volatile
+    private var loaded = false
+    @Volatile
+    private var loadError: Throwable? = null
+
     init {
-        System.loadLibrary("resize")
+        try {
+            System.loadLibrary("resize")
+            loaded = true
+        } catch (e: Throwable) {
+            loadError = e
+            android.util.Log.e("TrimNative", "Failed to load resize library", e)
+        }
     }
+
+    fun isAvailable(): Boolean = loaded && loadError == null
 
     /**
      * Bounding box of the non-background pixels for each colour in [colors]

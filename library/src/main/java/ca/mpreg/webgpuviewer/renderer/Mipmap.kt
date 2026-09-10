@@ -49,12 +49,14 @@ class Mipmap(
             pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int
         ): Mipmap {
             require(width > 0 && height > 0 && tilesize > 0) { "Mipmap.create: invalid dims ${width}x$height tilesize $tilesize" }
-            // Harden: Adreno qdgralloc rejects 4x4 format 59 (ASTC/Stencil) - enforce minimum 8.
+            require(!scale.isNaN() && !scale.isInfinite() && scale > 0f && scale <= 1f) { "Mipmap.create: invalid scale $scale" }
             if (width < 8 || height < 8) throw IllegalArgumentException("Mipmap too small ${width}x$height, refusing <8 to avoid gralloc 0x3b")
             if (width > 16384 || height > 16384) throw IllegalArgumentException("Mipmap too large ${width}x$height")
             if (width.toLong() * height > 64L * 1024 * 1024) throw IllegalArgumentException("Mipmap area too large ${width}x$height")
+            require(tilesize in 8..4096) { "Mipmap.create: invalid tilesize $tilesize" }
             require(pixels.isDirect) { "Mipmap.create: pixels must be direct" }
             require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "Mipmap.create: pixels too small" }
+            if (!WebGpuRenderer.isAvailable) throw IllegalStateException("Mipmap.create: WebGPU not available")
             val mipmap = Mipmap(
                 width = width,
                 height = height,
@@ -210,16 +212,21 @@ class Mipmap(
         cachedQuad = Quad(tiles, tileViews, 0, 0)
     }
 
+    @Volatile
+    private var cleaned = false
+
     internal fun cleanup() {
+        if (cleaned) return
+        cleaned = true
         cachedQuad = null
         lastQuad = null
         lastQuadTX = -1
         lastQuadTY = -1
-        tileUniforms?.forEach { it?.destroy() }
+        tileUniforms?.forEach { try { it?.destroy() } catch (_: Throwable) {} }
         tileUniforms = null
         textureViews.clear()
         tileViews.clear()
-        textures.forEach { tex -> tex.destroy() }
+        textures.forEach { tex -> try { tex.destroy() } catch (_: Throwable) {} }
         textures.clear()
         tiles.clear()
     }

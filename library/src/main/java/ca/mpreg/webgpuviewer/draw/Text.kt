@@ -339,11 +339,15 @@ class Font private constructor(
             val style: FontStyle,
         )
 
-        // Building a Font from a FontFamily rasterises + distance-transforms every requested
-        // glyph - expensive enough that it must not repeat every call (e.g. every frame) for the
-        // same (family, weight, style). Never evicted: a font tends to get reused for a whole
-        // app's lifetime, so the memory is worth not stalling on a rebuild.
-        private val familyCache = HashMap<FamilyKey, Font>()
+        private val familyCache = object : LinkedHashMap<FamilyKey, Font>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<FamilyKey, Font>?): Boolean {
+                if (size > 16) {
+                    eldest?.value?.let { try { it.destroy() } catch (_: Throwable) {} }
+                    return true
+                }
+                return false
+            }
+        }
 
         // Baked once, independent of any draw size - an msdf atlas stays crisp scaled well past
         // this in either direction (see TEXT_SHADER's screen_px_range), so there's no reason to

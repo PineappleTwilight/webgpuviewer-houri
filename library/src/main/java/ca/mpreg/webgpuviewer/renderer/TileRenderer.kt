@@ -2033,19 +2033,40 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * permanent shutdown - the surface can be recreated with the same viewer state afterward, and
      * rendering simply refills the cache.
      */
+    @Volatile
+    private var cleaned = false
+
     fun cleanup() {
+        if (cleaned) return
+        cleaned = true
         workerScope.launch {
-            // On the worker with everything else it owns: a rescaler's textures can be mid-tile
-            // when the view is torn down.
-            upscaler.cleanup()
-            downscaler.cleanup()
-            pages.values.forEach { it.destroyAll(atlasOrNull) }
-            pages.clear()
-            atlasOrNull?.destroy()
+            try { upscaler.cleanup() } catch (_: Throwable) {}
+            try { downscaler.cleanup() } catch (_: Throwable) {}
+            try {
+                pages.values.forEach { try { it.destroyAll(atlasOrNull) } catch (_: Throwable) {} }
+                pages.clear()
+            } catch (_: Throwable) {}
+            try { atlasOrNull?.destroy() } catch (_: Throwable) {}
             atlasOrNull = null
-            timestampPool.forEach { it.resolve.destroy(); it.result.destroy() }
-            timestampPool.clear()
+            try {
+                timestampPool.forEach { try { it.resolve.destroy() } catch (_: Throwable) {}; try { it.result.destroy() } catch (_: Throwable) {} }
+                timestampPool.clear()
+            } catch (_: Throwable) {}
+            for (i in 0 until STENCIL_BUFFER_COUNT) {
+                try { stencilTextures[i]?.destroy() } catch (_: Throwable) {}
+                stencilTextures[i] = null
+                stencilViews[i] = null
+            }
+            stencilWidth = 0
+            stencilHeight = 0
+            viewportWidth = 0
+            viewportHeight = 0
+            atlasBudgetTiles = 0
         }
+    }
+
+    fun resetAfterCleanup() {
+        cleaned = false
     }
 }
 

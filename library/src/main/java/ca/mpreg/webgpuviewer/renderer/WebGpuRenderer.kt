@@ -48,8 +48,10 @@ class WebGpuRenderer {
 
         @Volatile
         var offsetX: Float = 0f
+            set(value) { field = if (!value.isNaN() && !value.isInfinite()) value else 0f }
         @Volatile
         var offsetY: Float = 0f
+            set(value) { field = if (!value.isNaN() && !value.isInfinite()) value else 0f }
 
         private var renderThread: Thread? = null
         val dispatcher = Executors.newSingleThreadExecutor { runnable ->
@@ -57,9 +59,10 @@ class WebGpuRenderer {
         }.asCoroutineDispatcher()
         internal fun isOnRenderThread(): Boolean = Thread.currentThread() === renderThread
 
-        // Frame time profiling
+        // Frame time profiling - guarded by synchronized(profilingLock) for cross-thread reads
         @Volatile
         var profilingEnabled = false
+        private val profilingLock = Any()
         private var frameCount = 0L
         private var totalFrameTimeNs = 0L
         private var minFrameTimeNs = Long.MAX_VALUE
@@ -68,12 +71,16 @@ class WebGpuRenderer {
         private val recentFrameTimes = LongArray(60)
         private var recentFrameIndex = 0
 
-        val lastFrameTimeMs: Float get() = lastFrameTimeNs / 1_000_000f
-        val avgFrameTimeMs: Float get() = if (frameCount > 0) totalFrameTimeNs / frameCount / 1_000_000f else 0f
-        val minFrameTimeMs: Float get() = if (minFrameTimeNs == Long.MAX_VALUE) 0f else minFrameTimeNs / 1_000_000f
-        val maxFrameTimeMs: Float get() = maxFrameTimeNs / 1_000_000f
+        val lastFrameTimeMs: Float get() = synchronized(profilingLock) { lastFrameTimeNs / 1_000_000f }
+        val avgFrameTimeMs: Float get() = synchronized(profilingLock) {
+            if (frameCount > 0) totalFrameTimeNs / frameCount / 1_000_000f else 0f
+        }
+        val minFrameTimeMs: Float get() = synchronized(profilingLock) {
+            if (minFrameTimeNs == Long.MAX_VALUE) 0f else minFrameTimeNs / 1_000_000f
+        }
+        val maxFrameTimeMs: Float get() = synchronized(profilingLock) { maxFrameTimeNs / 1_000_000f }
         val recentAvgFrameTimeMs: Float
-            get() {
+            get() = synchronized(profilingLock) {
                 val count = minOf(frameCount.toInt(), 60)
                 if (count == 0) return 0f
                 var sum = 0L
@@ -82,9 +89,11 @@ class WebGpuRenderer {
                 }
                 return sum.toFloat() / count / 1_000_000f
             }
-        val estimatedFps: Float get() = if (lastFrameTimeNs > 0) 1_000_000_000f / lastFrameTimeNs else 0f
+        val estimatedFps: Float get() = synchronized(profilingLock) {
+            if (lastFrameTimeNs > 0) 1_000_000_000f / lastFrameTimeNs else 0f
+        }
 
-        fun resetProfiling() {
+        fun resetProfiling() = synchronized(profilingLock) {
             frameCount = 0
             totalFrameTimeNs = 0
             minFrameTimeNs = Long.MAX_VALUE
@@ -96,13 +105,16 @@ class WebGpuRenderer {
 
         internal fun recordFrameTime(timeNs: Long) {
             if (!profilingEnabled) return
-            frameCount++
-            totalFrameTimeNs += timeNs
-            lastFrameTimeNs = timeNs
-            if (timeNs < minFrameTimeNs) minFrameTimeNs = timeNs
-            if (timeNs > maxFrameTimeNs) maxFrameTimeNs = timeNs
-            recentFrameTimes[recentFrameIndex] = timeNs
-            recentFrameIndex = (recentFrameIndex + 1) % 60
+            if (timeNs < 0) return
+            synchronized(profilingLock) {
+                frameCount++
+                totalFrameTimeNs += timeNs
+                lastFrameTimeNs = timeNs
+                if (timeNs < minFrameTimeNs) minFrameTimeNs = timeNs
+                if (timeNs > maxFrameTimeNs) maxFrameTimeNs = timeNs
+                recentFrameTimes[recentFrameIndex] = timeNs
+                recentFrameIndex = (recentFrameIndex + 1) % 60
+            }
         }
 
         @Volatile
@@ -112,7 +124,18 @@ class WebGpuRenderer {
         var initError: Throwable? = null
             private set
 
-        val isAvailable: Boolean get() = initialized && initError == null && ::instance.isInitialized && ::adapter.isInitialized && ::device.isInitialized
+        @Volatile
+        private var deviceLost = false
+
+        val isAvailable: Boolean get() = initialized && !deviceLost && initError == null &&
+            ::instance.isInitialized && ::adapter.isInitialized && ::device.isInitialized
+
+        fun requireAvailable() {
+            check(isAvailable) {
+                val cause = initError?.let { ": ${it.message}" } ?: if (deviceLost) ": device lost" else ""
+                "WebGPU not available$cause"
+            }
+        }
 
         private fun safeInitLibrary() {
             try {
@@ -154,11 +177,20 @@ class WebGpuRenderer {
 
                     instance = createInstance(GPUInstanceDescriptor())
 
-                    adapter =
+                    val gotAdapter = try {
                         instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
+                    } catch (e: Throwable) {
+                        Log.e("WebGpuRenderer", "requestAdapter failed", e)
+                        throw e
+                    }
+                    @Suppress("SENSELESS_COMPARISON")
+                    if (gotAdapter == null as Any?) {
+                        throw IllegalStateException("requestAdapter returned null")
+                    }
+                    adapter = gotAdapter
 
                     val requiredFeatures =
-                        if (adapter.hasFeature(FeatureName.TimestampQuery)) {
+                        if (runCatching { adapter.hasFeature(FeatureName.TimestampQuery) }.getOrDefault(false)) {
                             intArrayOf(FeatureName.TimestampQuery)
                         } else {
                             intArrayOf()
@@ -166,7 +198,10 @@ class WebGpuRenderer {
 
                     device = adapter.requestDevice(
                         GPUDeviceDescriptor(
-                            deviceLostCallback = defaultDeviceLostCallback,
+                            deviceLostCallback = DeviceLostCallback { lostDevice, reason, message ->
+                                deviceLost = true
+                                Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$lostDevice")
+                            },
                             deviceLostCallbackExecutor = Executor(Runnable::run),
                             uncapturedErrorCallback = defaultUncapturedErrorCallback,
                             uncapturedErrorCallbackExecutor = Executor(Runnable::run),
@@ -174,6 +209,7 @@ class WebGpuRenderer {
                         )
                     )
                     initialized = true
+                    deviceLost = false
                     initError = null
                 } catch (e: Throwable) {
                     Log.e("WebGpuRenderer", "Failed to initialize WebGPU", e)
@@ -185,7 +221,7 @@ class WebGpuRenderer {
 
         @JvmStatic
         suspend fun <R> withContext(block: suspend CoroutineScope.(GPUDevice) -> R): R {
-            check(isAvailable) { "WebGPU not available: $initError" }
+            requireAvailable()
             return withContext(dispatcher) {
                 mutex.withLock {
                     block(this, device)
@@ -207,11 +243,19 @@ class WebGpuRenderer {
          */
         @JvmStatic
         suspend fun <R> onDispatcher(block: suspend CoroutineScope.(GPUDevice) -> R): R {
-            check(isAvailable) { "WebGPU not available: $initError" }
+            requireAvailable()
             return withContext(dispatcher) {
                 block(this, device)
             }
         }
+
+        fun tryRecoverNote(): String =
+            when {
+                !initialized -> "not initialized: $initError"
+                deviceLost -> "device lost"
+                initError != null -> "init error: $initError"
+                else -> "unknown"
+            }
     }
 
     @Volatile
@@ -231,11 +275,20 @@ class WebGpuRenderer {
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         if (!isAvailable) {
-            Log.w("WebGpuRenderer", "init called but WebGPU not available: $initError")
+            Log.w("WebGpuRenderer", "init called but WebGPU not available: ${tryRecoverNote()}")
             return
         }
-        // Guard tiny/zero surfaces that trigger qdgralloc 0x3b (ASTC/Stencil8) failures on Adreno.
-        // A 4x4 swapchain (seen in log: 4x4 format 59) is not drawable and spams gralloc.
+        if (!surface.isValid) {
+            Log.w("WebGpuRenderer", "init skipped for invalid surface")
+            this.scope = scope
+            this.width = width.coerceAtLeast(0)
+            this.height = height.coerceAtLeast(0)
+            return
+        }
+        if (width < 0 || height < 0) {
+            Log.w("WebGpuRenderer", "init skipped for negative surface ${width}x$height")
+            return
+        }
         if (width < 8 || height < 8) {
             Log.w("WebGpuRenderer", "init skipped for tiny surface ${width}x$height (<8), deferring until laid out")
             this.scope = scope
@@ -258,6 +311,9 @@ class WebGpuRenderer {
 
         val initSurface = {
             try {
+                if (!surface.isValid) throw IllegalStateException("Surface became invalid before createSurface")
+                val current = this@WebGpuRenderer.surface
+                try { current?.close() } catch (_: Throwable) {}
                 this@WebGpuRenderer.surface = surface.let {
                     instance.createSurface(
                         GPUSurfaceDescriptor(
@@ -277,8 +333,11 @@ class WebGpuRenderer {
                         )
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 Log.e("WebGpuRenderer", "Failed to create surface ${width}x$height", e)
+                try { this@WebGpuRenderer.surface?.close() } catch (_: Throwable) {}
                 this@WebGpuRenderer.surface = null
             }
         }
@@ -286,15 +345,24 @@ class WebGpuRenderer {
         if (isOnDispatcherThread) {
             initSurface()
         } else {
-            runBlocking(dispatcher) {
-                initSurface()
+            try {
+                runBlocking(dispatcher) {
+                    initSurface()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "init surface dispatch failed", e)
             }
         }
     }
 
+
+
     /** Draws one frame. False when the swapchain had no texture: nothing drawn, retry next frame. */
     suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): Boolean {
-        // Harden: skip tiny surfaces that would trigger 4x4 Stencil8 gralloc 0x3b and spam logcat.
+        if (!isAvailable) return false
+        if (deviceLost) return false
         if (width < 8 || height < 8) {
             Log.w("WebGpuRenderer", "render skipped for tiny surface ${width}x$height")
             return false
@@ -306,13 +374,16 @@ class WebGpuRenderer {
 
             val current = try {
                 surface.getCurrentTexture()
-            } catch (e: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
                 Log.w("WebGpuRenderer", "Failed to get current texture", e)
                 return false
             }
-            // Harden: tiny swapchain texture (4x4) from surface - skip to avoid Stencil8 alloc.
-            if (current.texture.width < 8 || current.texture.height < 8) {
-                Log.w("WebGpuRenderer", "render skipped for tiny swapchain ${current.texture.width}x${current.texture.height}")
+            val texW = try { current.texture.width } catch (_: Throwable) { 0 }
+            val texH = try { current.texture.height } catch (_: Throwable) { 0 }
+            if (texW < 8 || texH < 8) {
+                Log.w("WebGpuRenderer", "render skipped for tiny swapchain ${texW}x$texH")
                 return false
             }
 
@@ -392,21 +463,34 @@ class WebGpuRenderer {
 
         val doCleanup: suspend () -> Unit = {
             mutex.withLock {
-                filters.cleanup()
-                surface?.close()
+                try { filters.cleanup() } catch (e: Throwable) { Log.w("WebGpuRenderer", "filter cleanup failed", e) }
+                val s = surface
                 surface = null
+                if (s != null) {
+                    try { s.close() } catch (e: Throwable) { Log.w("WebGpuRenderer", "surface close failed", e) }
+                }
+                width = 0
+                height = 0
+                scope = null
             }
         }
 
-        if (isOnDispatcherThread) {
-            // Already on dispatcher, run synchronously
-            runBlocking {
-                doCleanup()
+        try {
+            if (isOnDispatcherThread) {
+                runBlocking {
+                    doCleanup()
+                }
+            } else {
+                runBlocking(dispatcher) {
+                    doCleanup()
+                }
             }
-        } else {
-            runBlocking(dispatcher) {
-                doCleanup()
-            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w("WebGpuRenderer", "cleanup dispatch failed", e)
+            try { surface?.close() } catch (_: Throwable) {}
+            surface = null
         }
     }
 }

@@ -104,15 +104,18 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     var pageOffset = 0f
         set(value) {
-            var v = value
+            var v = if (!value.isNaN() && !value.isInfinite()) value else 0f
+            v = v.coerceIn(-10f, 10f)
             var pageDelta = 0
 
             if (!suppressPageChange) {
-                while (v >= 1f && haveNext) {
+                var guard = 0
+                while (v >= 1f && haveNext && guard++ < 20) {
                     pageDelta += 1
                     v -= 1f
                 }
-                while (v <= -1f && havePrev) {
+                guard = 0
+                while (v <= -1f && havePrev && guard++ < 20) {
                     pageDelta -= 1
                     v += 1f
                 }
@@ -120,20 +123,21 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
             if (!haveNext) v = v.fastCoerceAtMost(1f)
             if (!havePrev) v = v.fastCoerceAtLeast(-1f)
+            v = v.coerceIn(-1f, 1f)
 
             val settling = field != 0f && v == 0f
 
             field = v
 
             if (pageDelta != 0) {
-                onPageChange?.invoke(if (isReversed) -pageDelta else pageDelta)
+                try { onPageChange?.invoke(if (isReversed) -pageDelta else pageDelta) } catch (e: Throwable) {
+                    android.util.Log.w("ImageViewerState", "onPageChange failed", e)
+                }
             }
 
-            // Rotate rather than invalidate: onPageChange has already updated whatever backs
-            // getPage, so slot 2 often already holds a valid render of this new current page.
             if (settling) {
-                val current = getPage(0)
-                if (current != null) Transition.rotateCacheOnPageChange(current) else Transition.invalidateCache()
+                val current = try { getPage(0) } catch (_: Throwable) { null }
+                if (current != null) try { Transition.rotateCacheOnPageChange(current) } catch (_: Throwable) {} else try { Transition.invalidateCache() } catch (_: Throwable) {}
             }
         }
 

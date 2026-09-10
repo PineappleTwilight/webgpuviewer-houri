@@ -172,21 +172,34 @@ class Image private constructor(
         }
     }
 
-    private var _buffer: GPUBuffer? = WebGpuRenderer.device.createBuffer(
-        GPUBufferDescriptor(size = BUFFER_SIZE, usage = BufferUsage.CopyDst or BufferUsage.Uniform)
-    )
+    @Volatile
+    private var cleaned = false
+
+    private var _buffer: GPUBuffer? = try {
+        WebGpuRenderer.device.createBuffer(
+            GPUBufferDescriptor(size = BUFFER_SIZE, usage = BufferUsage.CopyDst or BufferUsage.Uniform)
+        )
+    } catch (e: Throwable) {
+        android.util.Log.e("Renderer", "Image buffer create failed", e)
+        null
+    }
 
     val buffer: GPUBuffer
-        get() = _buffer ?: error("Image buffer accessed after cleanup")
+        get() = _buffer ?: error("Image buffer accessed after cleanup (cleaned=$cleaned)")
 
     val mipmaps: MutableList<Mipmap> = mutableListOf()
 
+    @Synchronized
     internal fun cleanup() {
-        mipmaps.forEach { it.cleanup() }
+        if (cleaned) return
+        cleaned = true
+        mipmaps.forEach { try { it.cleanup() } catch (_: Throwable) {} }
         mipmaps.clear()
-        _buffer?.destroy()
+        try { _buffer?.destroy() } catch (_: Throwable) {}
         _buffer = null
     }
+
+    val isCleaned: Boolean get() = cleaned
 
     /**
      * Where this image's full extent lands in [dst], as normalised (x1, y1, x2, y2) surface
