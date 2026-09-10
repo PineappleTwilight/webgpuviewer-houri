@@ -57,6 +57,14 @@ class FilterChain {
      * swapchain texture itself when none is. [endFrame] must follow on either path.
      */
     fun beginFrame(surface: GPUTexture): GPUTexture {
+        // Harden: Adreno gralloc 0x3b - tiny surfaces (4x4) must bypass filtering entirely to avoid
+        // allocating intermediate textures that trigger format 59 failures. Also guard null/zero.
+        if (surface.width < 8 || surface.height < 8) {
+            active.clear()
+            sceneSlot = null
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        }
         // First, and nothing before it: with no filters this is the whole of the chain's work
         // per frame, and it should stay a list scan with no allocation and no GPU work at all.
         active.clear()
@@ -81,7 +89,18 @@ class FilterChain {
             poolHeight = surface.height
         }
 
-        val slot = acquire(surface.width, surface.height, TextureFormat.RGBA8Unorm, false)
+        val slot = try {
+            acquire(surface.width, surface.height, TextureFormat.RGBA8Unorm, false)
+        } catch (e: OutOfMemoryError) {
+            System.gc()
+            active.clear()
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        } catch (e: Exception) {
+            active.clear()
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        }
         sceneSlot = slot
         return slot.texture
     }
@@ -187,7 +206,14 @@ class FilterChain {
                 (format.toLong() shl 1) or (if (storage) 1L else 0L)
 
     private fun acquire(width: Int, height: Int, format: Int, storage: Boolean): Slot {
-        val slots = pool.getOrPut(key(width, height, format, storage)) { ArrayList() }
+        require(width > 0 && height > 0) { "acquire: invalid size ${width}x$height" }
+        // Clamp tiny to avoid Adreno 4x4 format 59 path; clamp huge to avoid OOM.
+        val w = width.coerceIn(8, 8192)
+        val h = height.coerceIn(8, 8192)
+        if (w != width || h != height) {
+            android.util.Log.w("FilterChain", "acquire clamped ${width}x$height -> ${w}x$h")
+        }
+        val slots = pool.getOrPut(key(w, h, format, storage)) { ArrayList() }
 
         var free: Slot? = null
         for (slot in slots) {
@@ -207,11 +233,16 @@ class FilterChain {
         var usage = TextureUsage.TextureBinding or TextureUsage.RenderAttachment
         if (storage) usage = usage or TextureUsage.StorageBinding
 
-        val texture = device.createTexture(
-            GPUTextureDescriptor(
-                size = GPUExtent3D(width, height), format = format, usage = usage
+        val texture = try {
+            device.createTexture(
+                GPUTextureDescriptor(
+                    size = GPUExtent3D(w, h), format = format, usage = usage
+                )
             )
-        )
+        } catch (e: OutOfMemoryError) {
+            System.gc()
+            throw e
+        }
         val slot = Slot(texture, texture.createView())
         slot.inUse = true
         slot.lastFrame = frame

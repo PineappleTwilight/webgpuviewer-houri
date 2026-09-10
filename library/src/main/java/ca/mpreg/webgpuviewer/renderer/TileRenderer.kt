@@ -852,18 +852,34 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * [frame] so a still-in-flight previous frame never shares one with this one.
      */
     fun stencilViewFor(dst: GPUTexture): GPUTextureView {
-        if (stencilWidth != dst.width || stencilHeight != dst.height) {
-            stencilWidth = dst.width
-            stencilHeight = dst.height
+        // Harden: Adreno gralloc fails for 4x4 Stencil8 (format 59) - clamp tiny to 8 to avoid spam.
+        // If dst is tiny, we still need a stencil of at least 8, but mismatch with dst will be
+        // handled by WebGpuRenderer guard that skips frames for <8 surfaces; this clamp is fallback.
+        val w = dst.width.coerceAtLeast(8)
+        val h = dst.height.coerceAtLeast(8)
+        if (w < 8 || h < 8) {
+            android.util.Log.w("TileRenderer", "stencilViewFor tiny ${dst.width}x${dst.height} clamped to ${w}x$h")
+        }
+        if (stencilWidth != w || stencilHeight != h) {
+            stencilWidth = w
+            stencilHeight = h
             for (i in 0 until STENCIL_BUFFER_COUNT) {
                 stencilTextures[i]?.destroy()
-                val texture = device.createTexture(
-                    GPUTextureDescriptor(
-                        usage = TextureUsage.RenderAttachment,
-                        size = GPUExtent3D(dst.width, dst.height),
-                        format = TextureFormat.Stencil8,
+                val texture = try {
+                    device.createTexture(
+                        GPUTextureDescriptor(
+                            usage = TextureUsage.RenderAttachment,
+                            size = GPUExtent3D(w, h),
+                            format = TextureFormat.Stencil8,
+                        )
                     )
-                )
+                } catch (e: OutOfMemoryError) {
+                    System.gc()
+                    throw e
+                } catch (e: Exception) {
+                    android.util.Log.e("TileRenderer", "Stencil create failed ${w}x$h", e)
+                    throw e
+                }
                 stencilTextures[i] = texture
                 stencilViews[i] = texture.createView()
             }

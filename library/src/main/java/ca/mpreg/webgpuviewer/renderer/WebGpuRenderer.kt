@@ -234,6 +234,22 @@ class WebGpuRenderer {
             Log.w("WebGpuRenderer", "init called but WebGPU not available: $initError")
             return
         }
+        // Guard tiny/zero surfaces that trigger qdgralloc 0x3b (ASTC/Stencil8) failures on Adreno.
+        // A 4x4 swapchain (seen in log: 4x4 format 59) is not drawable and spams gralloc.
+        if (width < 8 || height < 8) {
+            Log.w("WebGpuRenderer", "init skipped for tiny surface ${width}x$height (<8), deferring until laid out")
+            this.scope = scope
+            this.width = width.coerceAtLeast(0)
+            this.height = height.coerceAtLeast(0)
+            return
+        }
+        if (width > 8192 || height > 8192) {
+            Log.w("WebGpuRenderer", "init clamped oversized surface ${width}x$height to 8192")
+            this.scope = scope
+            this.width = width.coerceIn(8, 8192)
+            this.height = height.coerceIn(8, 8192)
+            return
+        }
         this.scope = scope
         this.width = width
         this.height = height
@@ -262,7 +278,7 @@ class WebGpuRenderer {
                     }
                 }
             } catch (e: Throwable) {
-                Log.e("WebGpuRenderer", "Failed to create surface", e)
+                Log.e("WebGpuRenderer", "Failed to create surface ${width}x$height", e)
                 this@WebGpuRenderer.surface = null
             }
         }
@@ -278,6 +294,11 @@ class WebGpuRenderer {
 
     /** Draws one frame. False when the swapchain had no texture: nothing drawn, retry next frame. */
     suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): Boolean {
+        // Harden: skip tiny surfaces that would trigger 4x4 Stencil8 gralloc 0x3b and spam logcat.
+        if (width < 8 || height < 8) {
+            Log.w("WebGpuRenderer", "render skipped for tiny surface ${width}x$height")
+            return false
+        }
         val startTime = if (profilingEnabled) System.nanoTime() else 0L
 
         mutex.withLock {
@@ -287,6 +308,11 @@ class WebGpuRenderer {
                 surface.getCurrentTexture()
             } catch (e: Exception) {
                 Log.w("WebGpuRenderer", "Failed to get current texture", e)
+                return false
+            }
+            // Harden: tiny swapchain texture (4x4) from surface - skip to avoid Stencil8 alloc.
+            if (current.texture.width < 8 || current.texture.height < 8) {
+                Log.w("WebGpuRenderer", "render skipped for tiny swapchain ${current.texture.width}x${current.texture.height}")
                 return false
             }
 
@@ -335,7 +361,15 @@ class WebGpuRenderer {
 
     /** Rebuild the swapchain at the size [init] was last given. Must hold [mutex]. */
     private fun reconfigure(surface: GPUSurface) {
-        if (width <= 0 || height <= 0) return
+        if (width < 8 || height < 8) {
+            Log.w("WebGpuRenderer", "reconfigure skipped for tiny ${width}x$height")
+            return
+        }
+        if (width > 8192 || height > 8192) {
+            Log.w("WebGpuRenderer", "reconfigure clamped oversized ${width}x$height")
+            width = width.coerceIn(8, 8192)
+            height = height.coerceIn(8, 8192)
+        }
         try {
             surface.configure(
                 GPUSurfaceConfiguration(

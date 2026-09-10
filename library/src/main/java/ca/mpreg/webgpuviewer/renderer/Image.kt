@@ -42,8 +42,17 @@ class Image private constructor(
             trimThreshold: Float = 0.05f,
             backgroundColor: Int? = null,
         ): Image {
+            // Harden: reject tiny textures that trigger Adreno qdgralloc 0x3b (4x4 format 59) and
+            // guard against OOM/overflow from malicious dimensions. Clamp tiny to error rather
+            // than attempting a GPU alloc that will spam logcat.
             require(width > 0 && height > 0) { "Image dimensions must be positive" }
+            if (width < 8 || height < 8) {
+                throw IllegalArgumentException("Image too small ${width}x$height (<8), refusing GPU upload to avoid gralloc 0x3b")
+            }
             require(width <= 16384 && height <= 16384) { "Image dimensions too large ${width}x$height" }
+            if (width.toLong() * height > 64L * 1024 * 1024) {
+                throw IllegalArgumentException("Image area too large ${width}x$height")
+            }
             require(trimColors == null || trimColors.all { it.size >= 3 }) {
                 "each trimColor must have at least 3 elements [r, g, b]"
             }

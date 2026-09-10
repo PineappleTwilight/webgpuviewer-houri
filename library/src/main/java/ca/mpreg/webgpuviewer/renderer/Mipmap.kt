@@ -49,6 +49,10 @@ class Mipmap(
             pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int
         ): Mipmap {
             require(width > 0 && height > 0 && tilesize > 0) { "Mipmap.create: invalid dims ${width}x$height tilesize $tilesize" }
+            // Harden: Adreno qdgralloc rejects 4x4 format 59 (ASTC/Stencil) - enforce minimum 8.
+            if (width < 8 || height < 8) throw IllegalArgumentException("Mipmap too small ${width}x$height, refusing <8 to avoid gralloc 0x3b")
+            if (width > 16384 || height > 16384) throw IllegalArgumentException("Mipmap too large ${width}x$height")
+            if (width.toLong() * height > 64L * 1024 * 1024) throw IllegalArgumentException("Mipmap area too large ${width}x$height")
             require(pixels.isDirect) { "Mipmap.create: pixels must be direct" }
             require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "Mipmap.create: pixels too small" }
             val mipmap = Mipmap(
@@ -83,17 +87,47 @@ class Mipmap(
                 val x = c * tilesize
                 val tileWidth = min((c + 1) * tilesize, width) - (c * tilesize)
 
-                Log.i("Renderer", "Create tile $c $r $tileWidth $tileHeight $x $y")
+                if (tileWidth <= 0 || tileHeight <= 0) {
+                    Log.w("Renderer", "Skipping zero-sized tile $c $r $tileWidth x $tileHeight")
+                    continue
+                }
+                // Harden: Adreno gralloc fails for 4x4 format 59 (ASTC/Stencil) - pad tiny tiles to 8 to avoid driver bug.
+                // Edge tiles from large images can be 1-7px in one dimension; pad alloc to 8 but keep logical size.
+                val allocW = tileWidth.coerceAtLeast(8)
+                val allocH = tileHeight.coerceAtLeast(8)
+                val isPadded = allocW != tileWidth || allocH != tileHeight
+                Log.i("Renderer", "Create tile $c $r $tileWidth $tileHeight (alloc ${allocW}x$allocH) $x $y")
 
                 // Unyielded driver work - not on the back of the chunk just uploaded.
                 yield()
-                val texture = device.createTexture(
-                    GPUTextureDescriptor(
-                        size = GPUExtent3D(tileWidth, tileHeight),
-                        format = TextureFormat.RGBA8Unorm,
-                        usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
+                val texture = try {
+                    device.createTexture(
+                        GPUTextureDescriptor(
+                            size = GPUExtent3D(allocW, allocH),
+                            format = TextureFormat.RGBA8Unorm,
+                            usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
+                        )
                     )
-                )
+                } catch (e: OutOfMemoryError) {
+                    System.gc()
+                    throw e
+                } catch (e: Exception) {
+                    Log.e("Renderer", "Tile create failed ${tileWidth}x$tileHeight, trying fallback 8x8", e)
+                    // Fallback: try 8x8 to see if driver tolerates padded size, else propagate
+                    if (!isPadded) {
+                        try {
+                            device.createTexture(
+                                GPUTextureDescriptor(
+                                    size = GPUExtent3D(8, 8),
+                                    format = TextureFormat.RGBA8Unorm,
+                                    usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
+                                )
+                            )
+                        } catch (e2: Exception) {
+                            throw e
+                        }
+                    } else throw e
+                }
 
                 var row = 0
                 while (row < tileHeight) {
