@@ -13,29 +13,43 @@ import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.max
 
 class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     companion object {
         const val MAX_VISIBLE_PAGES = 4
+        const val MAX_PAGE_WALK = 64
     }
 
+    data class ContinuousPosition(
+        val documentY: Float,
+        val scale: Float = 1f,
+        val offsetX: Float = 0f,
+        val pageIndexHint: Int = -1,
+        val fractionWithinPage: Float = 0f,
+        val timestamp: Long = System.currentTimeMillis(),
+    )
+
     var scale = 1f
+        set(value) {
+            val v = if (!value.isNaN() && !value.isInfinite()) value else 1f
+            val clamped = v.fastCoerceIn(minScale, maxScale)
+            if (clamped == field) return
+            field = clamped
+            invalidate()
+        }
 
     var offsetX = 0f
+        set(value) {
+            val v = if (!value.isNaN() && !value.isInfinite()) value else 0f
+            val maxOffsetX = max(0f, (scale - 1f) / (2f * scale))
+            val clamped = v.fastCoerceIn(-maxOffsetX, maxOffsetX)
+            if (clamped == field) return
+            field = clamped
+            invalidate()
+        }
 
-    /**
-     * How much of the viewport width a page fills when fully zoomed out, from 0 to 1. The
-     * default 1 zooms out to exactly the full width; 0.6 stops with the page at 60% of it and
-     * margin either side.
-     *
-     * Only the zoom-out floor moves. A page is still laid out and measured against the full
-     * width - [getPageHeight] and the whole document coordinate space are unchanged - so this
-     * decides how far out a pinch may go, not how tall anything is.
-     *
-     * Clamped away from 0, which is not a scale anything can be drawn at. Setting it lifts a
-     * [scale] that is now below the floor, so it takes effect without waiting for a gesture.
-     */
     var minZoomWidthFraction: Float = 1f
         set(value) {
             val clamped = value.fastCoerceIn(0.01f, 1f)
@@ -45,80 +59,47 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             invalidate()
         }
 
-    /** Lowest [scale] a gesture may settle at - see [minZoomWidthFraction]. */
     val minScale: Float get() = minZoomWidthFraction
-
-    /** Follows [minScale], so a double tap off the zoom-out floor still doubles what is on screen. */
     val doubleTapScale: Float get() = minScale * 2f
-
     val maxScale: Float get() = max(doubleTapScale * 2f, 4f)
 
-    /**
-     * True while [ImageViewerContinuous]'s gestures are actively driving zoom (pinch, drag, fling,
-     * snap-back). Gates every visible page's tile grid here the same way [ImagePage.isScaleAnimating]
-     * gates the paged viewer's.
-     */
     @Volatile
     var isScaleAnimating: Boolean = false
 
-    /**
-     * True while a plain (non-zoom) fling is actively scrolling. Generating a filtered tile is
-     * real GPU work sharing the render thread with the frame itself, so doing it while the camera
-     * is moving fast under its own momentum both wastes the work (the content is about to scroll
-     * back out of view) and is a real source of visible frame lag. Combined with
-     * [isScaleAnimating] wherever a caller needs "don't generate right now" - kept separate here
-     * since the two are driven by different gestures and one may be true without the other.
-     */
     @Volatile
     var isFlinging: Boolean = false
 
+    @Volatile
+    private var isRestoring: Boolean = false
+
     private val scrollLock = Any()
 
-    var scrollY = 0f
-        private set
+    private var scrollYInternal: Double = 0.0
+    private var anchorDocYInternal: Double = 0.0
+    private var lastWidth: Int = -1
 
-    /**
-     * Visual-only slide, animated to 0 by [animateSlideIn]. Kept out of [scrollY], which would
-     * walk into the page before it and report a page change of its own.
-     */
+    var scrollY: Float
+        get() = synchronized(scrollLock) { scrollYInternal.toFloat() }
+        private set(value) {
+            synchronized(scrollLock) { scrollYInternal = value.toDouble() }
+        }
+
     private var slideOffset = 0f
 
-    /**
-     * Layout height of [page] in screen pixels.
-     *
-     * Measured the same way decoded or not: a placeholder carrying the real aspect ratio has to
-     * occupy exactly the space its decoded self will, or the pages below jump when it decodes.
-     * The guard is only for pages with no width to fit against, which have no ratio to scale by.
-     *
-     * Only an [ImagePage.ImageSingle] (which [ImagePage.ImageSpread] also is) fits the viewer's
-     * full width - this mode's reading convention for raster content. A [ImagePage.Render] page's
-     * width/height are the author's deliberate choice, not something to stretch, so it is
-     * reserved and drawn at its native size - see the matching pageScale in [renderSnapshot].
-     */
     fun getPageHeight(page: ImagePage): Float {
         if (page !is ImagePage.ImageSingle) return page.height.toFloat()
         val pageWidth = page.width
         if (pageWidth <= 0) return page.height.toFloat()
+        if (width <= 0) return page.height.toFloat()
         return page.height * (width.toFloat() / pageWidth)
     }
 
-    /** Height page 0 was last measured at, to carry the position across a decode correcting it. */
     private var currentPageHeight: Float? = null
+    private var pendingRestore: ContinuousPosition? = null
 
-    /**
-     * The page read through, reported when it changes: the deepest one whose bottom has reached
-     * the viewport's, or that covers its top. Where [onPageChange] means "reached this page's
-     * top", this means "read past it". Observation only - nothing here moves the scroll.
-     */
     var onPageScrolledThrough: ((ImagePage) -> Unit)? = null
-
     private var lastScrolledThrough: ImagePage? = null
 
-    /**
-     * Pages the last frame reached below and above the current one. What the viewport actually
-     * shows depends on the zoom, so a caller's decode window has to follow this rather than a
-     * fixed count - a page on screen has to be decoded, not merely reserved.
-     */
     @Volatile
     var pagesBelow: Int = 0
         private set
@@ -127,147 +108,276 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     var pagesAbove: Int = 0
         private set
 
-    /**
-     * Document-space top of whatever page currently sits at [scrollY] == 0, in screen pixels at
-     * zoom 1. The only state the continuous coordinate space needs to persist across
-     * frames: every other visible page's position is re-derived fresh each frame from this one
-     * value (see [captureRenderState]'s walk), rather than stored per page - a page's identity
-     * isn't stable across a decode (the app hands over a new object), so anything kept on the
-     * page itself would be silently lost exactly when a placeholder corrects to its real height.
-     * Updated only here, in [scrollBy], using the height of whichever page is actually being
-     * crossed.
-     */
-    private var anchorDocY = 0f
+    private var anchorDocY: Float
+        get() = synchronized(scrollLock) { anchorDocYInternal.toFloat() }
+        set(value) { synchronized(scrollLock) { anchorDocYInternal = value.toDouble() } }
 
-    /**
-     * Scroll by [deltaPixels], moving the current page as many times as the delta covers.
-     *
-     * A single fling frame can cross more than one page when pages are short, so both walks
-     * loop. Each also stops on a zero-height page, which would otherwise never advance the
-     * position and spin here forever.
-     */
     fun scrollBy(deltaPixels: Float) {
+        if (!deltaPixels.isFinite()) return
+        val delta = deltaPixels.toDouble()
+        if (abs(delta) < 0.001) return
         synchronized(scrollLock) {
             getPage(0) ?: return
             slideOffset = 0f
 
-            scrollY += deltaPixels
+            scrollYInternal += delta
 
-            // Backwards, while the position sits above the top of the current page.
-            while (scrollY < 0) {
+            var guard = 0
+            while (scrollYInternal < 0 && guard++ < MAX_PAGE_WALK) {
                 if (getPage(-1) == null) {
-                    scrollY = 0f
+                    scrollYInternal = 0.0
                     break
                 }
-                onPageChange?.invoke(-1)
+                if (!isRestoring) {
+                    try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
+                }
                 val newPage = getPage(0) ?: return
-                val newHeight = getPageHeight(newPage)
-                anchorDocY -= newHeight
-                currentPageHeight = newHeight
-                // No height to hold a position inside, so rest at its top rather than leave the
-                // position above it, which the next scroll would read as another step back.
-                if (newHeight <= 0f) {
-                    scrollY = 0f
+                val newHeight = getPageHeight(newPage).toDouble()
+                anchorDocYInternal -= newHeight
+                currentPageHeight = newHeight.toFloat()
+                if (newHeight <= 0.0) {
+                    scrollYInternal = 0.0
                     break
                 }
-                scrollY += newHeight
+                scrollYInternal += newHeight
             }
 
-            // Forwards, while it sits past the bottom of it. Stops at the last page rather than
-            // stepping off the end, which would leave the position short instead of clamping.
-            while (true) {
+            guard = 0
+            while (guard++ < MAX_PAGE_WALK) {
                 val page = getPage(0) ?: return
-                val pageHeight = getPageHeight(page)
-                if (scrollY <= pageHeight || pageHeight <= 0f) break
+                val pageHeight = getPageHeight(page).toDouble()
+                if (scrollYInternal <= pageHeight || pageHeight <= 0.0) break
                 if (getPage(1) == null) {
-                    scrollY = pageHeight
+                    scrollYInternal = pageHeight
                     break
                 }
-                onPageChange?.invoke(1)
-                anchorDocY += pageHeight
+                if (!isRestoring) {
+                    try { onPageChange?.invoke(1) } catch (_: Throwable) {}
+                }
+                anchorDocYInternal += pageHeight
                 val newPage = getPage(0) ?: return
-                currentPageHeight = getPageHeight(newPage)
-                scrollY -= pageHeight
+                currentPageHeight = getPageHeight(newPage).toFloat()
+                scrollYInternal -= pageHeight
             }
 
-            clampToDocumentEnd()
+            clampToDocumentEndLocked()
+            if (scrollYInternal.isNaN() || scrollYInternal.isInfinite()) scrollYInternal = 0.0
+            if (anchorDocYInternal.isNaN() || anchorDocYInternal.isInfinite()) anchorDocYInternal = 0.0
         }
     }
 
-    /**
-     * Furthest [scrollY] may go: the last page's bottom stops at the viewport's, never above it.
-     * Null when the document doesn't end within the pages this mode draws, so nothing to clamp.
-     * Negative when the end falls above page 0's own top - see [clampToDocumentEnd].
-     */
-    private fun maxScrollY(): Float? {
-        val viewportHeight = height / scale
-        var bottom = 0f
+    private fun maxScrollYLocked(): Double? {
+        val viewportHeight = if (scale.isFinite() && scale > 0f) height / scale.toDouble() else height.toDouble()
+        var bottom = 0.0
         for (i in 0..MAX_VISIBLE_PAGES) {
             val page = getPage(i) ?: return bottom - viewportHeight
-            val pageHeight = getPageHeight(page)
-            if (pageHeight <= 0f) break
+            val pageHeight = getPageHeight(page).toDouble()
+            if (pageHeight <= 0.0) break
             bottom += pageHeight
-            // Enough content below to fill the viewport, whatever follows it.
-            if (bottom - viewportHeight > scrollY) break
+            if (bottom - viewportHeight > scrollYInternal) break
         }
         return null
     }
 
-    /**
-     * Hold [scrollY] at the end of the document, which the walks above can overshoot. A last page
-     * shorter than the viewport ends above page 0's own top, and [scrollY] can't hold a negative -
-     * the backward walk reads that as "step to the page above" - so step back to a page that can.
-     */
-    private fun clampToDocumentEnd() {
-        while (true) {
-            val max = maxScrollY() ?: return
-            if (scrollY <= max) return
-            if (max >= 0f) {
-                scrollY = max
+    private fun clampToDocumentEndLocked() {
+        var guard = 0
+        while (guard++ < MAX_PAGE_WALK) {
+            val max = maxScrollYLocked() ?: return
+            if (scrollYInternal <= max) return
+            if (max >= 0.0) {
+                scrollYInternal = max
                 return
             }
-            // Nothing above to measure from, so the document's top is as far as this goes.
             if (getPage(-1) == null) {
-                scrollY = 0f
+                scrollYInternal = 0.0
                 return
             }
-            onPageChange?.invoke(-1)
+            if (!isRestoring) {
+                try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
+            }
             val newPage = getPage(0) ?: return
-            val newHeight = getPageHeight(newPage)
-            anchorDocY -= newHeight
-            currentPageHeight = newHeight
-            // No height yet to hold it either, so rest at its top.
-            if (newHeight <= 0f) {
-                scrollY = 0f
+            val newHeight = getPageHeight(newPage).toDouble()
+            anchorDocYInternal -= newHeight
+            currentPageHeight = newHeight.toFloat()
+            if (newHeight <= 0.0) {
+                scrollYInternal = 0.0
                 return
             }
-            // The same document position, measured off the page now at 0.
-            scrollY = max + newHeight
+            scrollYInternal = max + newHeight
         }
     }
 
-    /**
-     * Document-space position of the viewport's top, in page-space pixels at zoom 1. Where the
-     * reader is in a form that survives a page crossing, which [scrollY] on its own doesn't - so
-     * it is what to remember a position by, and [scrollTo] what to put it back with.
-     */
-    val documentY: Float get() = synchronized(scrollLock) { anchorDocY + scrollY }
+    val documentY: Float get() = synchronized(scrollLock) { (anchorDocYInternal + scrollYInternal).toFloat() }
 
-    /** Put the viewport's top at [docY] - see [documentY]. */
+    val documentYDouble: Double get() = synchronized(scrollLock) { anchorDocYInternal + scrollYInternal }
+
     fun scrollTo(docY: Float) {
-        synchronized(scrollLock) { scrollBy(docY - (anchorDocY + scrollY)) }
+        if (!docY.isFinite()) return
+        synchronized(scrollLock) { scrollBy((docY.toDouble() - (anchorDocYInternal + scrollYInternal)).toFloat()) }
     }
 
-    /** Move to the top of the page [getPage] now answers 0 with, after the app jumps pages. */
+    fun scrollToDouble(docY: Double) {
+        if (!docY.isFinite()) return
+        synchronized(scrollLock) { scrollBy((docY - (anchorDocYInternal + scrollYInternal)).toFloat()) }
+    }
+
+    fun savePosition(): ContinuousPosition = synchronized(scrollLock) {
+        val docY = (anchorDocYInternal + scrollYInternal).toFloat()
+        val page = getPage(0)
+        val pageHeight = page?.let { getPageHeight(it) } ?: 0f
+        val fraction = if (pageHeight > 0f) (scrollYInternal / pageHeight).toFloat().coerceIn(0f, 1f) else 0f
+        val hint = try { getPageIndexForDocumentYLocked(docY) } catch (_: Throwable) { -1 }
+        ContinuousPosition(
+            documentY = docY,
+            scale = scale,
+            offsetX = offsetX,
+            pageIndexHint = hint,
+            fractionWithinPage = fraction,
+        )
+    }
+
+    fun restorePosition(pos: ContinuousPosition, animate: Boolean = false) {
+        if (!pos.documentY.isFinite() || !pos.scale.isFinite() || !pos.offsetX.isFinite()) return
+        synchronized(scrollLock) {
+            if (getPage(0) == null) {
+                pendingRestore = pos
+                return
+            }
+            applyRestoreLocked(pos, animate)
+        }
+    }
+
+    private fun applyRestoreLocked(pos: ContinuousPosition, animate: Boolean) {
+        isRestoring = true
+        try {
+            val targetDocY = resolveDocumentYForRestore(pos)
+            if (animate) {
+                val delta = (targetDocY - (anchorDocYInternal + scrollYInternal)).toFloat()
+                // launch animation outside lock
+                val jobScale = pos.scale.fastCoerceIn(minScale, maxScale)
+                val jobOffsetX = pos.offsetX
+                synchronized(scrollLock) { pendingRestore = null }
+                animateScroll(delta)
+                scale = jobScale
+                offsetX = jobOffsetX
+            } else {
+                scrollBy((targetDocY - (anchorDocYInternal + scrollYInternal)).toFloat())
+                scale = pos.scale.fastCoerceIn(minScale, maxScale)
+                val maxOffsetX = max(0f, (scale - 1f) / (2f * scale))
+                offsetX = pos.offsetX.coerceIn(-maxOffsetX, maxOffsetX)
+                pendingRestore = null
+            }
+        } finally {
+            isRestoring = false
+        }
+        invalidate()
+    }
+
+    private fun resolveDocumentYForRestore(pos: ContinuousPosition): Double {
+        if (pos.pageIndexHint >= 0) {
+            val byPage = documentYForPageIndex(pos.pageIndexHint, pos.fractionWithinPage)
+            if (byPage != null && byPage.isFinite()) return byPage
+        }
+        return pos.documentY.toDouble().coerceIn(-1e9, 1e9)
+    }
+
+    private fun getPageIndexForDocumentYLocked(docY: Float): Int {
+        var y = anchorDocYInternal
+        var idx = 0
+        var guard = 0
+        while (guard++ < MAX_PAGE_WALK) {
+            val page = getPage(idx) ?: break
+            val h = getPageHeight(page).toDouble()
+            if (h <= 0.0) break
+            if (docY < y + h) return idx
+            y += h
+            idx++
+        }
+        // search backward
+        y = anchorDocYInternal
+        idx = 0
+        guard = 0
+        while (guard++ < MAX_PAGE_WALK) {
+            if (docY >= y) return idx
+            val prev = getPage(idx - 1) ?: break
+            val h = getPageHeight(prev).toDouble()
+            if (h <= 0.0) break
+            y -= h
+            idx--
+        }
+        return 0
+    }
+
+    fun documentYForPageIndex(pageIndex: Int, fraction: Float = 0f): Double? {
+        val clampedFraction = fraction.coerceIn(0f, 1f)
+        synchronized(scrollLock) {
+            val currentIdx = getCurrentPageIndexLocked() ?: return null
+            val deltaPages = pageIndex - currentIdx
+            if (deltaPages == 0) {
+                val h = getPage(0)?.let { getPageHeight(it).toDouble() } ?: return null
+                return anchorDocYInternal + h * clampedFraction
+            }
+            var docY = anchorDocYInternal
+            if (deltaPages > 0) {
+                for (i in 0 until deltaPages) {
+                    val p = getPage(i) ?: return null
+                    docY += getPageHeight(p).toDouble()
+                }
+                val targetPage = getPage(deltaPages) ?: return null
+                docY += getPageHeight(targetPage).toDouble() * clampedFraction
+            } else {
+                for (i in deltaPages until 0) {
+                    val p = getPage(i) ?: return null
+                    docY += getPageHeight(p).toDouble()
+                }
+                val targetPage = getPage(deltaPages) ?: return null
+                val h = getPageHeight(targetPage).toDouble()
+                docY += h * clampedFraction
+                // Adjust because anchor is top of page 0, not target
+                // We already summed heights from anchor, so docY is correct
+            }
+            return docY
+        }
+    }
+
+    fun getCurrentPageIndexLocked(): Int? {
+        var y = anchorDocYInternal
+        val docY = anchorDocYInternal + scrollYInternal
+        var idx = 0
+        var guard = 0
+        while (guard++ < MAX_PAGE_WALK) {
+            val page = getPage(idx) ?: break
+            val h = getPageHeight(page).toDouble()
+            if (h <= 0.0) break
+            if (docY < y + h) return idx
+            y += h
+            idx++
+        }
+        return 0
+    }
+
+    fun getCurrentPageIndex(): Int = synchronized(scrollLock) { getCurrentPageIndexLocked() ?: 0 }
+
+    fun getFractionWithinPage(): Float = synchronized(scrollLock) {
+        val page = getPage(0) ?: return 0f
+        val h = getPageHeight(page)
+        if (h <= 0f) return 0f
+        return (scrollYInternal / h).toFloat().coerceIn(0f, 1f)
+    }
+
+    fun scrollToPage(pageIndex: Int, fraction: Float = 0f) {
+        val target = documentYForPageIndex(pageIndex, fraction) ?: return
+        scrollToDouble(target)
+    }
+
     fun resetScroll() {
         synchronized(scrollLock) {
-            scrollY = 0f
-            // A different page now: its own height is the baseline, not the page left behind.
+            scrollYInternal = 0.0
             currentPageHeight = null
+            pendingRestore = null
         }
     }
 
-    /** Slide the current page into place after a jump - [direction] 1 when it came from below. */
     fun animateSlideIn(direction: Int) {
         animationJob?.cancel()
         animationJob = scope?.launch {
@@ -281,7 +391,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     invalidate()
                 }
             } finally {
-                // Not if cancelled: this resumes after whatever replaced it set its own.
                 if (animationJob === coroutineContext[Job]) {
                     slideOffset = 0f
                     invalidate()
@@ -291,6 +400,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     }
 
     fun animateScroll(deltaPixels: Float) {
+        if (!deltaPixels.isFinite()) return
         animationJob?.cancel()
         animationJob = scope?.launch {
             var lastValue = 0f
@@ -306,114 +416,97 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
     }
 
-    /** One page visible this frame, with the document-space top [captureRenderState] found it at. */
+    private fun Float.isFinite(): Boolean = !isNaN() && !isInfinite()
+    private fun Double.isFinite(): Boolean = !isNaN() && !isInfinite()
+
     private class VisiblePage(val page: ImagePage, val docTop: Float, val pageHeight: Float)
 
     private class ContinuousRenderSnapshot(
         val pages: List<VisiblePage>,
         val scale: Float,
         val offsetX: Float,
-        /** Document position (see [anchorDocY]) currently at the viewport's vertical centre. */
         val cameraDocY: Float,
-        /** [isScaleAnimating] or [isFlinging] - either means "don't generate tiles right now". */
         val suppressGeneration: Boolean,
     )
 
     override fun captureRenderState(): Any = synchronized(scrollLock) {
         val screenH = height.toFloat()
-
         val page0 = getPage(0)
-        if (page0 != null) {
-            val pageHeight = getPageHeight(page0)
-            // A decode correcting a placeholder's height holds the same fraction of the page: at
-            // its top nothing moves, near its bottom the pages below stay put. Both heights have
-            // to be measured, and an unmeasured one is not a baseline to correct against later.
-            currentPageHeight?.let { h -> if (h > 0f && pageHeight > 0f) scrollY *= pageHeight / h }
-            if (pageHeight > 0f) currentPageHeight = pageHeight
-            // A decode shortening the document under a position already at its end: only
-            // [scrollBy] used to notice, on the next scroll, as a jump.
-            clampToDocumentEnd()
+
+        if (lastWidth != width) {
+            if (lastWidth > 0 && page0 != null && currentPageHeight != null && currentPageHeight!! > 0f) {
+                val oldH = currentPageHeight!!
+                val newH = getPageHeight(page0)
+                if (newH > 0f && oldH > 0f) {
+                    val fraction = (scrollYInternal / oldH).coerceIn(0.0, 1.0)
+                    scrollYInternal = fraction * newH
+                }
+            }
+            lastWidth = width
         }
 
-        // After the clamp, which can step the page at 0 back.
-        val y0 = if (page0 != null) -scrollY + slideOffset else 0f
+        pendingRestore?.let { pending ->
+            val canRestore = getPage(0) != null && width > 0 && height > 0
+            if (canRestore) {
+                applyRestoreLocked(pending, animate = false)
+            }
+        }
 
-        // Document position at the viewport's centre - the point both the fast path and
-        // TileRenderer's continuous overloads zoom around, so they always agree on where a page
-        // belongs.
-        val cameraDocY = anchorDocY - y0 + 0.5f * screenH
+        if (page0 != null) {
+            val pageHeight = getPageHeight(page0)
+            currentPageHeight?.let { h -> if (h > 0f && pageHeight > 0f) scrollYInternal *= pageHeight / h }
+            if (pageHeight > 0f) currentPageHeight = pageHeight
+            clampToDocumentEndLocked()
+        }
+
+        val y0 = if (page0 != null) (-scrollYInternal + slideOffset).toFloat() else 0f
+        val cameraDocY = (anchorDocYInternal - y0 + 0.5 * screenH).toFloat()
 
         val pages = mutableListOf<VisiblePage>()
-
-        // Visible band in unscaled page space. Zoom is centered on the screen, so the
-        // viewport covers screenH / scale of page space around the screen center.
         val visTop = 0.5f * screenH - screenH / (2f * scale)
         val screenBot = 0.5f * screenH + screenH / (2f * scale)
-        // +1 tile of margin, matching TileRenderer's own prefetch ring, so a boundary tile just
-        // past the viewport has its page already discovered.
         val visBot = screenBot + tiles.preferredTileSize / scale
 
-        // Read past, not merely reached - see [onPageScrolledThrough]. No height, no reading.
         fun isScrolledThrough(top: Float, pageHeight: Float) =
             pageHeight > 0f && (top + pageHeight <= screenBot || top < visTop)
 
         var scrolledThrough: ImagePage? = null
 
-        // Backward: pages above page 0, needed once zoomed out enough that visTop goes negative -
-        // i.e. the visible band reaches above where page 0 itself starts. Mirrors the forward
-        // walk below, just toward negative indices.
         var yTop = y0
         var iBack = -1
-        var docTopBack = anchorDocY
+        var docTopBack = anchorDocYInternal
         var above = 0
         while (yTop > visTop && iBack >= -MAX_VISIBLE_PAGES) {
             val page = getPage(iBack) ?: break
             above = -iBack
             val pageHeight = getPageHeight(page)
-            docTopBack -= pageHeight
+            docTopBack -= pageHeight.toDouble()
             yTop -= pageHeight
-            // Walking up, so the first match is the deepest one above page 0.
-            if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough =
-                page
-            // Walked upward, so each one goes in front of the last - top to bottom, as the
-            // forward walk below appends.
+            if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
             if (page.isDecoded) {
-                pages.add(0, VisiblePage(page, docTopBack, pageHeight))
+                pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight))
             }
             if (pageHeight <= 0f) break
             iBack--
         }
 
-        // Walk forward until the viewport (plus margin) is covered or MAX_VISIBLE_PAGES
-        // is reached, whichever comes first - zoomed out far enough (or with short enough pages),
-        // the document-space bound alone would keep walking past it.
-        // Purely local: nothing is written back to a page, so only [anchorDocY] needs to survive
-        // across frames for this to stay correct.
         var y = y0
         var i = 0
-        var docTop = anchorDocY
+        var docTop = anchorDocYInternal
         var prevHeight = 0f
         var hasPrev = false
         var below = 0
         while (y < visBot && i <= MAX_VISIBLE_PAGES) {
             val page = getPage(i) ?: break
             below = i
-            // Anchor to the previous page in this walk, never frozen: an undecoded page's height
-            // is a guess, so re-deriving this fresh every frame self-corrects once it decodes.
-            if (hasPrev) docTop += prevHeight
+            if (hasPrev) docTop += prevHeight.toDouble()
             hasPrev = true
             val pageHeight = getPageHeight(page)
-
-            // Walking down, so a later match replaces whatever the backward walk found.
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
-
             if (y + pageHeight > visTop && page.isDecoded) {
-                pages.add(VisiblePage(page, docTop, pageHeight))
+                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
             }
-
-            // A zero-height page never advances y, so stop rather than ask for pages forever.
             if (pageHeight <= 0f) break
-
             prevHeight = pageHeight
             y += pageHeight
             i++
@@ -423,10 +516,9 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         pagesBelow = below
         pagesAbove = above
 
-        // By identity: a page that stays the deepest one read through is reported once.
         scrolledThrough?.takeIf { it !== lastScrolledThrough }?.let {
             lastScrolledThrough = it
-            onPageScrolledThrough?.invoke(it)
+            try { onPageScrolledThrough?.invoke(it) } catch (_: Throwable) {}
         }
 
         ContinuousRenderSnapshot(pages, scale, offsetX, cameraDocY, isScaleAnimating || isFlinging)
@@ -439,22 +531,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         tiles.newFrame()
         if (s.pages.isEmpty()) return
 
-        // ImagePage.ImageSingle pages batch into one shared pass (they never overlap vertically, so one
-        // clear plus one draw per image writes each pixel once). A Render page (ImagePage.Render,
-        // e.g. a loading placeholder) can't join that batch - it has no image/tile to draw, only
-        // its own render() - so it draws afterward via its own renderLoaded call instead.
-        // renderLoaded (unlike renderWith) loads rather than clears its pass, since this texture
-        // is shared with every other visible page and clearing it would blank them too - which
-        // relies on something having cleared the texture first. The ImageSingle batch's renderPass
-        // does that whenever there is one; if every visible page turns out to be a Render page,
-        // [ca.mpreg.webgpuviewer.draw.clear] does it instead so a Render page never has to paint
-        // over stale content from prior frames.
         val hasImagePage = s.pages.any { it.page is ImagePage.ImageSingle }
 
         val dstW = texture.width.toFloat()
         val dstH = texture.height.toFloat()
-        // Screen position of document space's origin - mirrors TileRenderer's continuous anchor
-        // exactly, so the fast path, tile cache, and Render pages below all agree on placement.
         val anchorX = dstW / 2f + s.scale * (s.offsetX * dstW + WebGpuRenderer.offsetX * dstW)
         val anchorY = dstH / 2f - s.scale * s.cameraDocY + s.scale * WebGpuRenderer.offsetY * dstH
 
@@ -462,16 +542,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             renderPass(encoder, texture) { pass ->
                 s.pages.forEach { vp ->
                     val page = vp.page as? ImagePage.ImageSingle ?: return@forEach
-                    // The snapshot was captured on the main thread; the page can have been
-                    // evicted since, in which case its images' buffers are gone and drawing one
-                    // throws.
                     if (page.destroyed || !page.isDecoded || page.width <= 0) return@forEach
 
                     val pageScale = dstW / page.width
 
-                    // Tiles first, marking the stencil; the sampler below shades only what is
-                    // left, and nothing at all once the draw reports full coverage. Animated
-                    // pages never get tiles, so they skip the call outright.
                     val covered = !page.isAnimated && tiles.draw(
                         pass,
                         page,
@@ -493,12 +567,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             val (x, y) = solveImagePlacement(
                                 targetX, targetY, imageScale, image, dstW, dstH
                             )
-                            // Content not worth linear-light correctness
-                            // (ImagePage.ImageSingle.highQuality) gets the plain sampler - it never
-                            // reaches the tile cache either. Animated pages are never highQuality
-                            // but always want the fast sampler regardless, since they swap images
-                            // every frame. Both are stencil-tested against the tile draw above,
-                            // skipping pixels it already covered.
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(pass, image, texture, x, y, imageScale)
                             } else {
@@ -509,8 +577,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         }
                     }
 
-                    // After everything that draws the page, and over its own band only: pages
-                    // tile vertically, so veiling anything wider would fade its neighbours too.
                     if (page.fade < 1f) {
                         val top = anchorY + s.scale * vp.docTop
                         page.drawFade(
@@ -529,23 +595,9 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
         s.pages.forEach { vp ->
             if (vp.page is ImagePage.ImageSingle) return@forEach
-            // Only ImagePage.ImageSingle overrides isDecoded to anything other than this fixed
-            // "Render (or a subclass) with drawable content" default - the isDecoded filter in
-            // captureRenderState already excludes anything else (e.g. Dummy).
             val page = vp.page as ImagePage.Render
             if (page.destroyed) return@forEach
 
-            // Render's own render(dst, x, y, scale) convention has no fit-to-width factor to
-            // undo - x/y/scale there are already fractions of dst (screen) size, not of this
-            // page's own declared width/height (see getPageHeight's doc: unlike an Images page,
-            // this page's size is never stretched to the viewer's width). So the only screen
-            // scale in play is the pinch-zoom (s.scale) times whatever this page's own scale is -
-            // folding in a dstW/page.width factor here (as an Images page's placement does) would
-            // scale its content by that ratio for no reason, which is exactly what "overdrawing
-            // its size" looked like. page.x/page.y are left out of the position for the same
-            // reason: they're in that dst-fraction unit, not vp.docTop's doc-space-pixel one, so
-            // they can't be combined with it - harmless since a locked-scale page like
-            // TransitionPage never has them set to anything but 0 anyway.
             val renderScale = s.scale * page.scale
             val targetX = anchorX
             val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.pageHeight)
