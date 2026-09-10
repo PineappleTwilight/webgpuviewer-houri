@@ -41,6 +41,10 @@ class GainmapInput(
     /** Stops of headroom the map adds, from the largest [maxContentBoost]. */
     val headroomStops: Float
         get() = maxContentBoost.maxOrNull()?.takeIf { it > 1f }?.let { log2(it) } ?: 0f
+
+    /** As [headroomStops], from the smallest [minContentBoost] - `Mmin` for [Hdr.peakWeight]. */
+    val minHeadroomStops: Float
+        get() = minContentBoost.minOrNull()?.takeIf { it > 0f }?.let { log2(it) } ?: 0f
 }
 
 class Image private constructor(
@@ -133,7 +137,7 @@ class Image private constructor(
                             offsetHdr = gainmap.offsetHdr,
                             // Scaled so the map's full boost lands on what is actually being
                             // presented, instead of wherever the file aimed.
-                            weight = Hdr.peakWeight(gainmap.headroomStops),
+                            weight = Hdr.peakWeight(gainmap.minHeadroomStops, gainmap.headroomStops),
                         )
                     }
                     keepHdr = true
@@ -402,7 +406,7 @@ class Image private constructor(
 
     fun prepareForRender(dst: GPUTexture, x: Float, y: Float, scale: Float): MipMapForDraw? {
         if (mipmaps.isEmpty()) return null
-        if (isHdr) Hdr.noteHdrDrawn()
+        if (isHdr) Hdr.noteHdrDrawn(this, hdrHeadroom)
 
         var level = floor(log2(1 / scale)).toInt().coerceIn(0, mipmaps.size - 1)
 
@@ -461,7 +465,7 @@ class Image private constructor(
     fun prepareTilesForRender(
         dst: GPUTexture, x: Float, y: Float, scale: Float
     ): List<TileForDraw> {
-        if (isHdr) Hdr.noteHdrDrawn()
+        if (isHdr) Hdr.noteHdrDrawn(this, hdrHeadroom)
         if (mipmaps.isEmpty()) return emptyList()
 
         val level = floor(log2(1 / scale)).toInt().coerceIn(0, mipmaps.size - 1)

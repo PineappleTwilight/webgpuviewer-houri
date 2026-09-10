@@ -37,6 +37,13 @@ open class ImageView(
         Hdr.attachColorModeHost(null)
     }
 
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        // Switching apps and back doesn't detach the view, but the system silently drops the
+        // window's HDR colour mode and the surface's extended range while unfocused.
+        if (hasWindowFocus) Hdr.resyncPresentation()
+    }
+
     @Composable
     override fun Content() {
         ImageViewer(state = state)

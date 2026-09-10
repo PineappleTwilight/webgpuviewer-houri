@@ -1522,6 +1522,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             return false
         }
 
+        // Unlike drawGridForFullPage, nothing else on this path reports the draw to Hdr.
+        page.currentImage?.let { if (it.isHdr) Hdr.noteHdrDrawn(it, it.hdrHeadroom) }
+
         viewportWidth = dst.width
         viewportHeight = dst.height
 
@@ -2015,7 +2018,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     ): PageTiles? {
         if (page.destroyed || !page.highQuality || page.isAnimated) return null
         // This path draws cached tiles without touching the image, so it has to report for itself.
-        if (page.currentImage?.isHdr == true) Hdr.noteHdrDrawn()
+        page.currentImage?.let { if (it.isHdr) Hdr.noteHdrDrawn(it, it.hdrHeadroom) }
         if (!page.hasUploadedImage) return null
 
         val a = pagedAnchor(page, dst, 0f, 0f, 1f)

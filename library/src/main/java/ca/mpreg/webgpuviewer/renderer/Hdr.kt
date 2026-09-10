@@ -35,6 +35,7 @@ import ca.mpreg.webgpuviewer.renderer.Hdr.supportedByDevice
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import java.lang.ref.WeakReference
+import java.util.function.Consumer
 import kotlin.math.log2
 import kotlin.math.pow
 
@@ -80,10 +81,30 @@ object Hdr {
      * wherever [presentPeak] matters, this is known.
      *
      * From `getHighestHdrSdrRatio`, not `getHdrSdrRatio` - the latter tracks current screen
-     * brightness and would mean redoing every decode whenever it changed.
+     * brightness and would mean redoing every decode whenever it changed. See [liveHeadroomRatio].
      */
     @Volatile
     private var displayPeakRatio: Float? = null
+
+    /** Weak - [Hdr] outlives every display it has seen. */
+    @Volatile
+    private var displayRef: WeakReference<Display>? = null
+
+    /** The panel's headroom right now - unlike [displayPeakRatio], shrinks as brightness rises. */
+    @Volatile
+    private var liveHeadroomRatio: Float? = null
+
+    /** Kept to unregister from the previous display when [attachDisplay] gets a new one. */
+    @Volatile
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private var hdrSdrRatioListener: Consumer<Display>? = null
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun readLiveHeadroom(display: Display): Float? = try {
+        display.takeIf { it.isHdrSdrRatioAvailable }?.hdrSdrRatio
+    } catch (e: Exception) {
+        null
+    }?.takeIf { it.isFinite() && it > 0f }
 
     /** Raising it trades highlight compression for brightness on a panel that can take it. */
     @Volatile
@@ -114,6 +135,13 @@ object Hdr {
         return (log2(presentPeak) / contentStops).coerceIn(0f, 1f)
     }
 
+    /** As [peakWeight], general to a `minContentBoost` other than 1.0 (`minStops` other than 0). */
+    fun peakWeight(minStops: Float, maxStops: Float): Float {
+        if (maxStops <= minStops) return 1f
+        val d = log2(presentPeak).coerceIn(minStops, maxStops)
+        return ((d - minStops) / (maxStops - minStops)).coerceIn(0f, 1f)
+    }
+
     /**
      * Called before the renderer initialises, so the decode path has the answer as early as it
      * can. Always false below API 34, where the surface calls that reach the display do not exist.
@@ -134,6 +162,35 @@ object Hdr {
 
         displayPeakRatio = peak?.takeIf { it > 1f }
         displaySupported = displayPeakRatio != null
+
+        displayRef?.get()?.let { old ->
+            hdrSdrRatioListener?.let {
+                try {
+                    old.unregisterHdrSdrRatioChangedListener(it)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not unregister HDR/SDR ratio listener", e)
+                }
+            }
+        }
+        displayRef = display?.let { WeakReference(it) }
+        liveHeadroomRatio = display?.let { readLiveHeadroom(it) }
+
+        hdrSdrRatioListener = if (display != null) {
+            val listener = Consumer<Display> { d ->
+                liveHeadroomRatio = readLiveHeadroom(d)
+                markPresentationDirty()
+            }
+            try {
+                display.registerHdrSdrRatioChangedListener({ it.run() }, listener)
+                listener
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not register HDR/SDR ratio listener - won't track brightness live", e)
+                null
+            }
+        } else {
+            null
+        }
+
         Log.i(TAG, "Display HDR: supported=$displaySupported peak=$displayPeakRatio")
         publishIfResolved()
     }
@@ -226,10 +283,33 @@ object Hdr {
 
     private val hdrRecentlyDrawn: Boolean get() = framesWithoutHdr < HDR_IDLE_FRAMES
 
-    /** Called from the draw path for every HDR image actually drawn. */
-    internal fun noteHdrDrawn() {
+    /**
+     * Called from the draw path for every HDR image actually drawn.
+     *
+     * Also re-establishes [image]'s claim if it went missing without the image itself being
+     * released - [resetContent] does exactly that on a surface recreated in the same process
+     * (switching apps and back), since a cached, already-decoded [Image] is redrawn without ever
+     * going through [retainHdrImage] again.
+     */
+    internal fun noteHdrDrawn(image: Image? = null, headroomStops: Float = 0f) {
         hdrDrawn = true
         framesWithoutHdr = 0
+        if (image != null) reclaimIfMissing(image, headroomStops)
+    }
+
+    private fun reclaimIfMissing(image: Image, headroomStops: Float) {
+        val added = synchronized(hdrLock) {
+            pruneLocked()
+            if (liveHdrClaims.any { it.image === image }) false
+            else {
+                liveHdrClaims.add(Claim(image, headroomStops))
+                true
+            }
+        }
+        if (added) {
+            markPresentationDirty()
+            Log.i(TAG, "HDR claim re-established for image drawn without one")
+        }
     }
 
     private val liveHdrCount: Int get() = synchronized(hdrLock) { pruneLocked(); liveHdrClaims.size }
@@ -427,6 +507,17 @@ object Hdr {
         if (presenting != colorModeApplied) setColorMode(presenting)
     }
 
+    /**
+     * Switching apps and back leaves [colorModeApplied] believing the window is still in whatever
+     * mode it last set, but the system drops `COLOR_MODE_HDR` (and the surface's extended range)
+     * when the window loses focus - so [syncColorMode]'s "unchanged" check would otherwise skip
+     * reapplying it forever. Called when the window regains focus.
+     */
+    internal fun resyncPresentation() {
+        synchronized(colorModeLock) { colorModeApplied = false }
+        syncPresentation()
+    }
+
     private fun setColorMode(wantHdr: Boolean) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val view = colorModeHost?.get() ?: return
@@ -464,15 +555,24 @@ object Hdr {
         val wantHdr = presenting
 
         return try {
-            val ratio = if (wantHdr) desiredHeadroomRatio.coerceAtLeast(1f) else 1f
+            // bufferRatio: what's actually baked into the pixels. desiredRatio: what the panel can
+            // deliver right now - lower at high brightness. Passing the same value for both (as
+            // this used to) left the compositor no room to back off, so it clipped instead of
+            // rolling off once brightness ate into the live headroom.
+            val bufferRatio = if (wantHdr) desiredHeadroomRatio.coerceAtLeast(1f) else 1f
+            val desiredRatio =
+                if (wantHdr) minOf(bufferRatio, liveHeadroomRatio ?: bufferRatio) else 1f
             SurfaceControl.Transaction()
                 .setDataSpace(
                     surfaceControl,
                     if (wantHdr) DataSpace.DATASPACE_SCRGB else DataSpace.DATASPACE_SRGB
                 )
-                .setExtendedRangeBrightness(surfaceControl, ratio, ratio)
+                .setExtendedRangeBrightness(surfaceControl, bufferRatio, desiredRatio)
                 .apply()
-            Log.i(TAG, "Surface range: ${if (wantHdr) "extended sRGB, ratio $ratio" else "sRGB"}")
+            Log.i(
+                TAG,
+                "Surface range: ${if (wantHdr) "extended sRGB, buffer $bufferRatio desired $desiredRatio" else "sRGB"}"
+            )
             true
         } catch (e: Exception) {
             Log.w(TAG, "Could not set surface range - HDR will be clamped", e)
