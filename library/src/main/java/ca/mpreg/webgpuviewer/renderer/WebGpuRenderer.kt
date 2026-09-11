@@ -3,7 +3,6 @@ package ca.mpreg.webgpuviewer.renderer
 import android.util.Log
 import android.view.Surface
 import androidx.webgpu.DeviceLostCallback
-import androidx.webgpu.DeviceLostException
 import androidx.webgpu.FeatureLevel
 import androidx.webgpu.FeatureName
 import androidx.webgpu.GPU.createInstance
@@ -83,12 +82,16 @@ class WebGpuRenderer {
         val recentAvgFrameTimeMs: Float
             get() = synchronized(profilingLock) {
                 val count = minOf(frameCount.toInt(), 60)
-                if (count == 0) return 0f
+                if (count == 0) return@synchronized 0f
                 var sum = 0L
                 for (i in 0 until count) {
                     sum += recentFrameTimes[i]
                 }
-                return sum.toFloat() / count / 1_000_000f
+                sum.toFloat() / count / 1_000_000f
+            }
+        val estimatedFps: Float
+            get() = synchronized(profilingLock) {
+                if (lastFrameTimeNs > 0) 1_000_000_000f / lastFrameTimeNs else 0f
             }
         val estimatedFps: Float get() = synchronized(profilingLock) {
             if (lastFrameTimeNs > 0) 1_000_000_000f / lastFrameTimeNs else 0f
@@ -559,6 +562,9 @@ class WebGpuRenderer {
 
         mutex.withLock {
             val surface = surface ?: return false
+            // A stale surface from before a resize shrunk below this would otherwise still reach
+            // getCurrentTexture - [init]/[reconfigure] already refuse to configure one this small.
+            if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) return false
 
             // An HDR image arriving, or the last one leaving, changes what the swapchain should
             // be. Here rather than at the decode: the format can only change between frames, and

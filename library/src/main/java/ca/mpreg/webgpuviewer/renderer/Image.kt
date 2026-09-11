@@ -137,7 +137,10 @@ class Image private constructor(
                             offsetHdr = gainmap.offsetHdr,
                             // Scaled so the map's full boost lands on what is actually being
                             // presented, instead of wherever the file aimed.
-                            weight = Hdr.peakWeight(gainmap.minHeadroomStops, gainmap.headroomStops),
+                            weight = Hdr.peakWeight(
+                                gainmap.minHeadroomStops,
+                                gainmap.headroomStops
+                            ),
                         )
                     }
                     keepHdr = true

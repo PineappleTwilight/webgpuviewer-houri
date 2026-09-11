@@ -14,6 +14,7 @@ import ca.mpreg.webgpuviewer.renderer.Image
 import ca.mpreg.webgpuviewer.renderer.RenderPage
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
+import ca.mpreg.webgpuviewer.viewer.ImageViewerContinuousState.Companion.MAX_PAGE_WALK
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -876,7 +877,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
             val renderScale = s.scale * page.scale
             val targetX = anchorX
-            val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.pageHeight)
+            val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.contentHeight)
 
             val x = (targetX - dstW / 2f) / (renderScale * dstW)
             val y = (targetY - dstH / 2f) / (renderScale * dstH)

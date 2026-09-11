@@ -12,8 +12,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.unit.Density
-import androidx.compose.ui.util.fastCoerceAtLeast
-import androidx.compose.ui.util.fastCoerceAtMost
 import androidx.webgpu.GPUColor
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPURenderPassColorAttachment
@@ -34,7 +32,6 @@ import ca.mpreg.webgpuviewer.renderer.Rescaler
 import ca.mpreg.webgpuviewer.renderer.TileRenderer
 import ca.mpreg.webgpuviewer.renderer.Upscaler
 import ca.mpreg.webgpuviewer.renderer.UpscalerArtCnn
-import ca.mpreg.webgpuviewer.renderer.UpscalerCatmullRom
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.dispatcher
 import ca.mpreg.webgpuviewer.transition.Transition

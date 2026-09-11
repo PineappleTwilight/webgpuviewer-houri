@@ -23,15 +23,21 @@ import ca.mpreg.webgpuviewer.renderer.Hdr.attachColorModeHost
 import ca.mpreg.webgpuviewer.renderer.Hdr.attachDisplay
 import ca.mpreg.webgpuviewer.renderer.Hdr.colorModeApplied
 import ca.mpreg.webgpuviewer.renderer.Hdr.desiredHeadroomRatio
+import ca.mpreg.webgpuviewer.renderer.Hdr.displayPeakRatio
 import ca.mpreg.webgpuviewer.renderer.Hdr.displaySupported
 import ca.mpreg.webgpuviewer.renderer.Hdr.hdrLock
 import ca.mpreg.webgpuviewer.renderer.Hdr.headroomRatioOverride
 import ca.mpreg.webgpuviewer.renderer.Hdr.latchFrameFormat
 import ca.mpreg.webgpuviewer.renderer.Hdr.liveHdrClaims
+import ca.mpreg.webgpuviewer.renderer.Hdr.liveHeadroomRatio
+import ca.mpreg.webgpuviewer.renderer.Hdr.peakWeight
 import ca.mpreg.webgpuviewer.renderer.Hdr.presentFormat
 import ca.mpreg.webgpuviewer.renderer.Hdr.presentPeak
 import ca.mpreg.webgpuviewer.renderer.Hdr.requestHdrColorMode
+import ca.mpreg.webgpuviewer.renderer.Hdr.resetContent
+import ca.mpreg.webgpuviewer.renderer.Hdr.retainHdrImage
 import ca.mpreg.webgpuviewer.renderer.Hdr.supportedByDevice
+import ca.mpreg.webgpuviewer.renderer.Hdr.syncColorMode
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import java.lang.ref.WeakReference
@@ -184,7 +190,11 @@ object Hdr {
                 display.registerHdrSdrRatioChangedListener({ it.run() }, listener)
                 listener
             } catch (e: Exception) {
-                Log.w(TAG, "Could not register HDR/SDR ratio listener - won't track brightness live", e)
+                Log.w(
+                    TAG,
+                    "Could not register HDR/SDR ratio listener - won't track brightness live",
+                    e
+                )
                 null
             }
         } else {
