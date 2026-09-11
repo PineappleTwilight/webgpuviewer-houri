@@ -56,9 +56,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     internal val tiles = TileRenderer { invalidate() }
 
     /**
-     * How a high-quality tile that magnifies the page is resized - see [Rescaler].
-     * [UpscalerCatmullRom] by default; [UpscalerArtCnn] runs a doubling network first and leaves
-     * whatever zoom is left over to Catmull-Rom. Assigning drops the tiles already generated.
+     * How a high-quality tile that magnifies the page is resized - see [Rescaler]. Assigning
+     * drops the tiles already generated. [UpscalerArtCnn] doubles through a network first.
      */
     var upscaler: Upscaler
         get() = tiles.upscaler
@@ -66,10 +65,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             tiles.upscaler = value
         }
 
-    /**
-     * How a high-quality tile that shrinks the page is resized - see [Rescaler]. [DownscalerBox]
-     * is the only one, and is the default.
-     */
+    /** How a high-quality tile that shrinks the page is resized. [DownscalerBox] is the only one. */
     var downscaler: Downscaler
         get() = tiles.downscaler
         set(value) {
@@ -91,7 +87,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     val width get() = renderer.width
     val height get() = renderer.height
 
-    /** Top padding in pixels to avoid display cutout. Set automatically by ImageViewer when avoidCutout is true. */
+    /** Top padding clearing the display cutout, in pixels. Set by ImageViewer while [avoidCutout]. */
     var cutoutTopPx: Float = 0f
 
     val viewportHeight: Float
@@ -104,7 +100,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     /** When true, images will be positioned/scaled to avoid the display cutout. */
     var avoidCutout: Boolean by mutableStateOf(false)
 
-    /** When true, always shift images below cutout. When false, only shift if image would overlap cutout. */
+    /** Shift below the cutout always, rather than only when the image would overlap it. */
     var alwaysAvoidCutout: Boolean by mutableStateOf(false)
 
     private var suppressPageChange = false
@@ -128,9 +124,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 }
             }
 
-            if (!haveNext) v = v.fastCoerceAtMost(1f)
-            if (!havePrev) v = v.fastCoerceAtLeast(-1f)
-            v = v.coerceIn(-1f, 1f)
+            // Numeric test first: haveNext/havePrev reach fetchPage, which resolves a page and
+            // may trim a cache to do it, and every animation frame sets this with |v| under 1.
+            if (v > 1f && !haveNext) v = 1f
+            if (v < -1f && !havePrev) v = -1f
 
             val settling = field != 0f && v == 0f
 
@@ -140,6 +137,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 notifyPageChange(if (isReversed) -pageDelta else pageDelta)
             }
 
+            // Rotate rather than invalidate: onPageChange already moved what backs getPage, so a
+            // slot often holds a valid render of the new current page.
             if (settling) {
                 val current = try { getPage(0) } catch (_: Throwable) { null }
                 if (current != null) try { Transition.rotateCacheOnPageChange(current) } catch (_: Throwable) {} else try { Transition.invalidateCache() } catch (_: Throwable) {}
@@ -152,6 +151,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         suppressPageChange = false
     }
 
+    private var turn = 0
+
     fun animatePageTurn(direction: Int) {
         animationJob?.cancel()
         if (!transition.isAnimated) {
@@ -161,6 +162,9 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             invalidate()
             return
         }
+        // cancel() doesn't wait: a turn started while the last one unwinds would otherwise have
+        // its own transitionFromPage - set just before this call - cleared by that finally.
+        val id = ++turn
         animationJob = scope?.launch {
             setPageOffsetDirect(direction.toFloat())
             invalidate()
@@ -174,10 +178,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                     invalidate()
                 }
             } finally {
-                // Always clear transitionFromPage - if cancelled, getPage will provide the right page
-                transitionFromPage = null
+                // Cancelled or not: getPage provides the right page from here.
+                if (turn == id) transitionFromPage = null
             }
-            // Only snap to 0 when animation completes normally
+            // Outside the try - a cancelled turn leaves the offset to its successor.
             setPageOffsetDirect(0f)
             invalidate()
         }
@@ -297,7 +301,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     /** Override for the "from" page during far navigation animation */
     var transitionFromPage: ImagePage? = null
 
-    // Pre-allocated invalidate lambda - same for the lifetime of this state
+    // One instance for this state's lifetime, so [cleanup] can tell its own from a successor's.
     private val invalidateCallback: () -> Unit = { invalidate() }
 
     /**
@@ -309,10 +313,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     }
 
     /**
-     * The pages the last [captureRenderState] drew with, which is what [ImagePage.isOnScreen]
-     * answers from - a page can then decide for itself whether a redraw is worth asking for.
-     * Read off the last frame rather than re-fetched, since anything that changes which pages
-     * are on screen draws a frame of its own.
+     * What the last [captureRenderState] drew with, and so what [ImagePage.isOnScreen] answers
+     * from. Off the last frame, not re-fetched: changing which pages show draws its own frame.
      */
     @Volatile
     protected var onScreenPages: List<ImagePage> = emptyList()
@@ -332,9 +334,12 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         this.scope = scope
         Hdr.requestFrame = invalidateCallback
 
-        scope.launch {
-            _postInit.forEach { it() }
-            _postInit.clear()
+        // On [dispatcher] and drained under the lock, as [post] itself would have run them.
+        scope.launch(dispatcher) {
+            val pending = synchronized(this@ImageViewerState) {
+                _postInit.toList().also { _postInit.clear() }
+            }
+            pending.forEach { it() }
         }
     }
 
@@ -343,12 +348,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     var transition: Transition = if (isVertical) TransitionBasic.Vertical else TransitionBasic
 
-    // Anything changed since the last frame drawn - all [collect] needs, however many
-    // invalidates said so.
+    // Anything changed since the last frame, however many invalidates said so.
     private val dirty = AtomicBoolean(true)
 
-    // Wakes [collect] when there is nothing to draw. Buffered, so a send can't be lost against
-    // [dirty]'s check.
+    // Wakes [collect] when there is nothing to draw. Buffered, so no send races [dirty]'s check.
     private val renderWake = Channel<Unit>(Channel.CONFLATED)
 
     fun invalidate() {
@@ -360,9 +363,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
      * Draw at most one frame per display frame, for as long as anything is [dirty].
      *
      * A frame loop, not a pass per invalidate: a fling step, a fade step, a decode and the tile
-     * worker all land in one frame, and drawing each presented the same content several times per
-     * vsync. [renderWake] carries no count, so a draw clearing [dirty] doesn't leave that frame's
-     * remaining invalidates to wait out a frame each - half rate, not coalescing.
+     * worker all land in one frame. [renderWake] carries no count, so a draw clearing [dirty]
+     * doesn't leave that frame's remaining invalidates to wait out a frame each.
      *
      * Nothing may be awaited between the frame wait and the capture, the draw included: this
      * registers as an awaiter mid-draw to land in the next frame's batch, behind the animation,
@@ -372,7 +374,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         val frameClock = currentCoroutineContext()[MonotonicFrameClock]
         var drawing: Job? = null
         while (true) {
-            frameClock?.withFrameNanos { }
+            // Paced either way: called without a clock, the loop would spin on whatever is dirty.
+            if (frameClock != null) frameClock.withFrameNanos { } else delay(8)
             // Still drawing: leave [dirty] set for the next frame.
             if (drawing?.isActive == true) continue
             // Anything invalidating from here belongs to the next frame.
@@ -438,14 +441,11 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     )
 
     /**
-     * Run [block] against a render pass over [texture], ending the pass afterwards either way.
+     * Run [block] against a render pass over [texture], ending it afterwards either way - a draw
+     * that throws still closes the pass, and [WebGpuRenderer.render] makes it a dropped frame.
+     * Owned here because only the whole frame's contents decide where a pass starts and ends.
      *
-     * Pass ownership sits here rather than inside the transitions, since only the code that knows
-     * the whole frame's contents can decide where the pass starts and ends. A draw that throws
-     * still leaves the pass closed, and [WebGpuRenderer.render] turns it into a dropped frame.
-     *
-     * Always clears: `getCurrentTexture` rotates buffers, so loading would show stale content
-     * from several frames ago around the page.
+     * Always clears: `getCurrentTexture` rotates buffers, so loading would show stale content.
      */
     protected fun renderPass(
         encoder: GPUCommandEncoder, texture: GPUTexture, block: (GPURenderPassEncoder) -> Unit
@@ -460,9 +460,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                         clearValue = GPUColor(0.0, 0.0, 0.0, 0.0)
                     )
                 ),
-                // Cleared fresh every frame so TileRenderer's blit can mark which pixels it just
-                // covered and RenderPage's masked draws can skip re-shading them - see
-                // TileRenderer.stencilViewFor. Discarded afterward: nothing reads it across frames.
+                // Fresh each frame: the tile blit marks what it covered so masked draws skip
+                // re-shading it. Discarded afterward - nothing reads it across frames.
                 depthStencilAttachment = GPURenderPassDepthStencilAttachment(
                     view = tiles.stencilViewFor(texture),
                     stencilLoadOp = LoadOp.Clear,
@@ -557,8 +556,9 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     fun cleanup() {
         animationJob?.cancel()
-        // Held by an object that outlives this state, so it has to be dropped by hand.
-        Hdr.requestFrame = null
+        // Held by an object that outlives this state, so it has to be dropped by hand - but only
+        // if it is still ours: a replacement viewer inits before the one it replaces cleans up.
+        if (Hdr.requestFrame === invalidateCallback) Hdr.requestFrame = null
         tiles.cleanup()
         renderer.cleanup()
         try {
