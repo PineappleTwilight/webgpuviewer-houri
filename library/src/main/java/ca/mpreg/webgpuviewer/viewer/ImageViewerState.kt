@@ -445,7 +445,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
      * Always clears: `getCurrentTexture` rotates buffers, so loading would show stale content.
      */
     protected fun renderPass(
-        encoder: GPUCommandEncoder, texture: GPUTexture, block: (GPURenderPassEncoder) -> Unit
+        encoder: GPUCommandEncoder,
+        texture: GPUTexture,
+        clearColor: Int = 0,
+        block: (GPURenderPassEncoder) -> Unit
     ) {
         val pass = encoder.beginRenderPass(
             GPURenderPassDescriptor(
@@ -454,7 +457,12 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                         view = texture.createView(),
                         loadOp = LoadOp.Clear,
                         storeOp = StoreOp.Store,
-                        clearValue = GPUColor(0.0, 0.0, 0.0, 0.0)
+                        clearValue = GPUColor(
+                            ((clearColor shr 16) and 0xFF) / 255.0,
+                            ((clearColor shr 8) and 0xFF) / 255.0,
+                            (clearColor and 0xFF) / 255.0,
+                            ((clearColor ushr 24) and 0xFF) / 255.0,
+                        )
                     )
                 ),
                 // Fresh each frame: the tile blit marks what it covered so masked draws skip

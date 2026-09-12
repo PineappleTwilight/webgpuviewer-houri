@@ -867,7 +867,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 }
             }
         } else {
-            Draw.clear(encoder, texture, 0)
+            Draw.clear(encoder, texture, s.backgroundColor)
         }
 
         s.pages.forEach { vp ->
