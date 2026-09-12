@@ -39,6 +39,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
+enum class FrameResult {
+    Drawn,
+    Retry,
+    Unavailable,
+}
+
 class WebGpuRenderer {
     companion object {
         lateinit var instance: GPUInstance
@@ -385,6 +391,13 @@ class WebGpuRenderer {
     // the app to hand over a new surface (no new surface callback fires on device loss).
     private var platformSurface: Surface? = null
 
+    /** Surface handed to [init] before a size worth configuring arrived - see [init]. */
+    private var pendingSurface: Surface? = null
+
+    /** Set by [resize]; the rebuild it asks for happens in [render], under the render mutex. */
+    @Volatile
+    private var resizePending = false
+
     /**
      * Full per-instance recovery after a device loss: recreates the shared device, drops
      * this instance's device-bound caches (filter pool, stale swapchain) and rebuilds the
@@ -481,6 +494,30 @@ class WebGpuRenderer {
         }
     }
 
+    /**
+     * Rebuild the swapchain at a new size - the surface-changed path, which is not [init]'s to
+     * take: [init] also re-arms the render loop's lifecycle. Never blocks on the render thread,
+     * so it is safe from whichever thread the surface callback arrives on.
+     */
+    fun resize(width: Int, height: Int) {
+        if (!isAvailable) return
+        val w = width.coerceIn(0, 8192)
+        val h = height.coerceIn(0, 8192)
+        if (w == this.width && h == this.height && surface != null) return
+        this.width = w
+        this.height = h
+
+        if (surface == null) {
+            // Nothing built yet: [init]'s deferred path picks the new size up.
+            pendingSurface?.let { replaceSurface(it) }
+        } else {
+            // Not here: [render] holds [mutex] across a suspending draw, so blocking on it from
+            // this thread deadlocks against the frame that owns it. [render] sees this flag
+            // between frames and reconfigures under the lock.
+            resizePending = true
+        }
+    }
+
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         if (!isAvailable) {
@@ -550,21 +587,30 @@ class WebGpuRenderer {
 
 
 
-    /** Draws one frame. False when the swapchain had no texture: nothing drawn, retry next frame. */
-    suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): Boolean {
-        if (!isAvailable) return false
-        if (deviceLost) return false
+    /** Draws one frame, or says why it could not - see [FrameResult]. */
+    suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): FrameResult {
+        if (!isAvailable) return FrameResult.Unavailable
+        if (deviceLost) return FrameResult.Unavailable
         if (width < 8 || height < 8) {
             Log.w("WebGpuRenderer", "render skipped for tiny surface ${width}x$height")
-            return false
+            return FrameResult.Unavailable
         }
         val startTime = if (profilingEnabled) System.nanoTime() else 0L
 
         mutex.withLock {
-            val surface = surface ?: return false
+            // Only [init]/[resize] can build one, so a redraw alone accomplishes nothing.
+            val surface = surface ?: return FrameResult.Unavailable
             // A stale surface from before a resize shrunk below this would otherwise still reach
-            // getCurrentTexture - [init]/[reconfigure] already refuse to configure one this small.
-            if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) return false
+            // getCurrentTexture - [createSurface]/[reconfigure] refuse to configure one this small.
+            if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) {
+                return FrameResult.Unavailable
+            }
+
+            // Between frames and under the lock - the only place a rebuild is safe.
+            if (resizePending) {
+                resizePending = false
+                reconfigure(surface)
+            }
 
             // An HDR image arriving, or the last one leaving, changes what the swapchain should
             // be. Here rather than at the decode: the format can only change between frames, and
@@ -585,13 +631,13 @@ class WebGpuRenderer {
                 throw e
             } catch (e: Throwable) {
                 Log.w("WebGpuRenderer", "Failed to get current texture", e)
-                return false
+                return FrameResult.Retry
             }
             val texW = try { current.texture.width } catch (_: Throwable) { 0 }
             val texH = try { current.texture.height } catch (_: Throwable) { 0 }
             if (texW < 8 || texH < 8) {
                 Log.w("WebGpuRenderer", "render skipped for tiny swapchain ${texW}x$texH")
-                return false
+                return FrameResult.Unavailable
             }
 
             // A non-success status hands back a null texture, and every GPUTexture read goes
@@ -605,7 +651,7 @@ class WebGpuRenderer {
                 )
                 // Lost needs a whole new surface, which only the app can hand over.
                 if (current.status != SurfaceGetCurrentTextureStatus.Lost) reconfigure(surface)
-                return false
+                return FrameResult.Retry
             }
 
             try {
@@ -638,7 +684,7 @@ class WebGpuRenderer {
             )
         }
 
-        return true
+        return FrameResult.Drawn
     }
 
     /** Rebuild the swapchain at the size [init] was last given. Must hold [mutex]. */

@@ -513,6 +513,7 @@ fun ImageViewerContinuous(
             }
         }
 
+<<<<<<< HEAD
         ViewerSurface(surfaceModifier) { surface, width, height ->
             try {
                 // Before init: whether the panel does HDR at all gates the decode path, which can
@@ -532,6 +533,22 @@ fun ImageViewerContinuous(
 
         if (state.showTileHud) {
             TileHud(state, Modifier.align(Alignment.TopStart))
+=======
+    ViewerSurface(surfaceModifier) { surface, width, height ->
+        try {
+            // Before init: the panel's HDR support gates the decode path, which can reach
+            // an image before the first frame.
+            attachHdrDisplay(view)
+            state.init(scope, surface, width, height)
+            surface.onChanged { w, h -> state.resize(w, h) }
+            // After init, so Hdr.resolve has run and the surface's capability is known.
+            attachHdrSurface(view)
+            state.invalidate()
+            state.collect()
+        } finally {
+            attachHdrSurface(null)
+            state.cleanup()
+>>>>>>> 03faa3f (Track frame error)
         }
     }
 }
