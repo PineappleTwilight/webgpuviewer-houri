@@ -838,8 +838,25 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
+<<<<<<< HEAD
                         d.placed.forEach { placed ->
                             val image = placed.image
+=======
+                        page.forEachImage { image, srcOffsetX, sideScale ->
+                            if (image.mipmaps.isEmpty()) return@forEachImage
+                            val imageScale = pageScale * s.scale * sideScale
+                            val docCenterX =
+                                pageScale * (srcOffsetX + sideScale * image.x)
+                            val docCenterY = vp.docTop + 0.5f * vp.contentHeight +
+                                    pageScale * sideScale * image.y
+                            val targetX = anchorX + s.scale * docCenterX
+                            val targetY = anchorY + s.scale * docCenterY
+                            val (x, y) = solveImagePlacement(
+                                targetX, targetY, imageScale, image, dstW, dstH
+                            )
+                            // Non-highQuality content skips linear light; an animated page
+                            // swaps images every frame, so it takes the fast sampler too.
+>>>>>>> 478ecc3 (Scale shorter image up in dual view)
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(
                                     pass, image, texture, placed.x, placed.y, placed.imageScale
