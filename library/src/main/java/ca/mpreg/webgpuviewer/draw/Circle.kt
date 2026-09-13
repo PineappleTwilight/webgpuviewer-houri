@@ -18,6 +18,7 @@ import androidx.webgpu.GPUVertexState
 import androidx.webgpu.PrimitiveTopology
 import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.setTransientBindGroup
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -151,4 +152,5 @@ fun Draw.circle(
     )
     pass.setBindGroup(0, bindGroup)
     pass.draw(6)
+    uniformBuffer.close()
 }

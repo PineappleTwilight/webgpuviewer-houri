@@ -24,6 +24,8 @@ import androidx.webgpu.PrimitiveTopology
 import androidx.webgpu.StoreOp
 import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.endAndRelease
+import ca.mpreg.webgpuviewer.renderer.setTransientBindGroup
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -123,11 +125,12 @@ fun Draw.rect(
     y2: Float,
     color: Int
 ) {
+    val targetView = texture.createView()
     val pass = encoder.beginRenderPass(
         GPURenderPassDescriptor(
             colorAttachments = arrayOf(
                 GPURenderPassColorAttachment(
-                    view = texture.createView(),
+                    view = targetView,
                     loadOp = LoadOp.Load,
                     storeOp = StoreOp.Store,
                     clearValue = androidx.webgpu.GPUColor(0.0, 0.0, 0.0, 0.0)
@@ -136,7 +139,7 @@ fun Draw.rect(
         )
     )
     rect(pass, texture.format, x1, y1, x2, y2, color)
-    pass.end()
+    pass.endAndRelease(targetView)
 }
 
 /**
@@ -190,4 +193,5 @@ fun Draw.rect(
     )
     pass.setBindGroup(0, bindGroup)
     pass.draw(6)
+    uniformBuffer.close()
 }

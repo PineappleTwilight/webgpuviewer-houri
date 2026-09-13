@@ -46,6 +46,7 @@ import ca.mpreg.webgpuviewer.draw.Font.Companion.forFamily
 import ca.mpreg.webgpuviewer.draw.Font.Companion.invoke
 import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.setTransientBindGroup
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -1136,4 +1137,6 @@ private fun drawGlyphInstances(
     )
     pass.setBindGroup(0, bindGroup)
     pass.draw(6, glyphCount)
+    vertexBuffer.close()
+    paramsBuffer.close()
 }

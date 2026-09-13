@@ -671,6 +671,9 @@ class WebGpuRenderer {
             } catch (e: Exception) {
                 Log.e("WebGpuRenderer", "Render error", e)
                 // Don't rethrow - allow the app to continue rendering next frame
+            } finally {
+                // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
+                texture.close()
             }
         }
 
