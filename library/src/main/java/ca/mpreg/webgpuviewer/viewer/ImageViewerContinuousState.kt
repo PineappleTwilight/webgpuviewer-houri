@@ -6,6 +6,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUTexture
+import ca.mpreg.webgpuviewer.closeTo
 import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.draw.clear
 import ca.mpreg.webgpuviewer.renderer.RenderPage
@@ -50,7 +51,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             invalidate()
         }
 
-    var minZoomWidthFraction: Float = 1f
+    /**
+     * How much of the viewport width a page fills when fully zoomed out, from 0 to 1.
+     *
+     * Only the zoom-out floor moves: pages are still laid out against the full width, so
+     * [getPageHeight] and document space are unchanged. Setting it lifts a [scale] already
+     * below the floor, so it applies without waiting for a gesture.
+     */
+    var homeScale: Float = 1f
         set(value) {
             val clamped = value.fastCoerceIn(0.01f, 1f)
             if (clamped == field) return
@@ -59,8 +67,18 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             invalidate()
         }
 
-    val minScale: Float get() = minZoomWidthFraction
-    val doubleTapScale: Float get() = minScale * 2f
+    /** Lowest [scale] a gesture may settle at - see [homeScale]. */
+    var minScale = 0f
+        get() {
+            if (field > 0) return field
+            return homeScale
+        }
+
+    val atHomeScale: Boolean
+        get() = scale.closeTo(homeScale)
+
+    /** Follows [homeScale], so a double tap off the zoom-out floor still doubles what is on screen. */
+    val doubleTapScale: Float get() = homeScale * 2f
     val maxScale: Float get() = max(doubleTapScale * 2f, 4f)
 
     @Volatile
@@ -93,6 +111,32 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (width <= 0) return page.height.toFloat()
         return page.height * (width.toFloat() / pageWidth)
     }
+
+    /**
+     * Empty space between pages, from 0 to 1 viewport heights. Resolved against [height], so it
+     * lands in document space at zoom 1 and zooms with the content.
+     *
+     * Part of the page slot (see [getPageSlotHeight]), not a separate element: a page sits at
+     * the top of its slot with the gap trailing below, so the first page starts flush against
+     * the document's top. Only WEBTOON-adjacent modes set it; long strip keeps 0.
+     */
+    var pageGap: Float = 0f
+        set(value) {
+            val clamped = value.fastCoerceIn(0f, 1f)
+            if (!clamped.isFinite() || clamped == field) return
+            field = clamped
+            currentPageHeight = null
+            invalidate()
+        }
+
+    /** [pageGap] in document-space pixels. 0 until the surface has a height to measure against. */
+    private val pageGapPx: Float get() = pageGap * height
+
+    /**
+     * Height [page] reserves in document space: [getPageHeight] plus [pageGapPx]. Document-space
+     * walks measure slots; drawing still uses the content height, so a 0 gap changes nothing.
+     */
+    fun getPageSlotHeight(page: ImagePage): Float = getPageHeight(page) + pageGapPx
 
     private var currentPageHeight: Float? = null
     private var pendingRestore: ContinuousPosition? = null
@@ -132,7 +176,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
                 }
                 val newPage = getPage(0) ?: return
-                val newHeight = getPageHeight(newPage).toDouble()
+                val newHeight = getPageSlotHeight(newPage).toDouble()
                 anchorDocYInternal -= newHeight
                 currentPageHeight = newHeight.toFloat()
                 if (newHeight <= 0.0) {
@@ -145,7 +189,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             guard = 0
             while (guard++ < MAX_PAGE_WALK) {
                 val page = getPage(0) ?: return
-                val pageHeight = getPageHeight(page).toDouble()
+                val pageHeight = getPageSlotHeight(page).toDouble()
                 if (scrollYInternal <= pageHeight || pageHeight <= 0.0) break
                 if (getPage(1) == null) {
                     scrollYInternal = pageHeight
@@ -156,7 +200,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 }
                 anchorDocYInternal += pageHeight
                 val newPage = getPage(0) ?: return
-                currentPageHeight = getPageHeight(newPage).toFloat()
+                currentPageHeight = getPageSlotHeight(newPage).toFloat()
                 scrollYInternal -= pageHeight
             }
 
@@ -170,11 +214,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val viewportHeight = if (scale.isFinite() && scale > 0f) height / scale.toDouble() else height.toDouble()
         var bottom = 0.0
         for (i in 0..MAX_VISIBLE_PAGES) {
-            val page = getPage(i) ?: return bottom - viewportHeight
+            val page = getPage(i) ?: return bottom - pageGapPx - viewportHeight
             val pageHeight = getPageHeight(page).toDouble()
             if (pageHeight <= 0.0) break
-            bottom += pageHeight
-            if (bottom - viewportHeight > scrollYInternal) break
+            bottom += pageHeight + pageGapPx
+            if (bottom - pageGapPx - viewportHeight > scrollYInternal) break
         }
         return null
     }
@@ -196,7 +240,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
             }
             val newPage = getPage(0) ?: return
-            val newHeight = getPageHeight(newPage).toDouble()
+            val newHeight = getPageSlotHeight(newPage).toDouble()
             anchorDocYInternal -= newHeight
             currentPageHeight = newHeight.toFloat()
             if (newHeight <= 0.0) {
@@ -224,7 +268,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     fun savePosition(): ContinuousPosition = synchronized(scrollLock) {
         val docY = (anchorDocYInternal + scrollYInternal).toFloat()
         val page = getPage(0)
-        val pageHeight = page?.let { getPageHeight(it) } ?: 0f
+        val pageHeight = page?.let { getPageSlotHeight(it) } ?: 0f
         val fraction = if (pageHeight > 0f) (scrollYInternal / pageHeight).toFloat().coerceIn(0f, 1f) else 0f
         val hint = try { getPageIndexForDocumentYLocked(docY) } catch (_: Throwable) { -1 }
         ContinuousPosition(
@@ -287,7 +331,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var guard = 0
         while (guard++ < MAX_PAGE_WALK) {
             val page = getPage(idx) ?: break
-            val h = getPageHeight(page).toDouble()
+            val h = getPageSlotHeight(page).toDouble()
             if (h <= 0.0) break
             if (docY < y + h) return idx
             y += h
@@ -300,7 +344,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         while (guard++ < MAX_PAGE_WALK) {
             if (docY >= y) return idx
             val prev = getPage(idx - 1) ?: break
-            val h = getPageHeight(prev).toDouble()
+            val h = getPageSlotHeight(prev).toDouble()
             if (h <= 0.0) break
             y -= h
             idx--
@@ -314,24 +358,24 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val currentIdx = getCurrentPageIndexLocked() ?: return null
             val deltaPages = pageIndex - currentIdx
             if (deltaPages == 0) {
-                val h = getPage(0)?.let { getPageHeight(it).toDouble() } ?: return null
+                val h = getPage(0)?.let { getPageSlotHeight(it).toDouble() } ?: return null
                 return anchorDocYInternal + h * clampedFraction
             }
             var docY = anchorDocYInternal
             if (deltaPages > 0) {
                 for (i in 0 until deltaPages) {
                     val p = getPage(i) ?: return null
-                    docY += getPageHeight(p).toDouble()
+                    docY += getPageSlotHeight(p).toDouble()
                 }
                 val targetPage = getPage(deltaPages) ?: return null
-                docY += getPageHeight(targetPage).toDouble() * clampedFraction
+                docY += getPageSlotHeight(targetPage).toDouble() * clampedFraction
             } else {
                 for (i in deltaPages until 0) {
                     val p = getPage(i) ?: return null
-                    docY += getPageHeight(p).toDouble()
+                    docY += getPageSlotHeight(p).toDouble()
                 }
                 val targetPage = getPage(deltaPages) ?: return null
-                val h = getPageHeight(targetPage).toDouble()
+                val h = getPageSlotHeight(targetPage).toDouble()
                 docY += h * clampedFraction
                 // Adjust because anchor is top of page 0, not target
                 // We already summed heights from anchor, so docY is correct
@@ -347,7 +391,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var guard = 0
         while (guard++ < MAX_PAGE_WALK) {
             val page = getPage(idx) ?: break
-            val h = getPageHeight(page).toDouble()
+            val h = getPageSlotHeight(page).toDouble()
             if (h <= 0.0) break
             if (docY < y + h) return idx
             y += h
@@ -360,7 +404,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
     fun getFractionWithinPage(): Float = synchronized(scrollLock) {
         val page = getPage(0) ?: return 0f
-        val h = getPageHeight(page)
+        val h = getPageSlotHeight(page)
         if (h <= 0f) return 0f
         return (scrollYInternal / h).toFloat().coerceIn(0f, 1f)
     }
@@ -436,7 +480,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (lastWidth != width) {
             if (lastWidth > 0 && page0 != null && currentPageHeight != null && currentPageHeight!! > 0f) {
                 val oldH = currentPageHeight!!
-                val newH = getPageHeight(page0)
+                val newH = getPageSlotHeight(page0)
                 if (newH > 0f && oldH > 0f) {
                     val fraction = (scrollYInternal / oldH).coerceIn(0.0, 1.0)
                     scrollYInternal = fraction * newH
@@ -453,7 +497,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
 
         if (page0 != null) {
-            val pageHeight = getPageHeight(page0)
+            val pageHeight = getPageSlotHeight(page0)
             currentPageHeight?.let { h -> if (h > 0f && pageHeight > 0f) scrollYInternal *= pageHeight / h }
             if (pageHeight > 0f) currentPageHeight = pageHeight
             clampToDocumentEndLocked()
@@ -480,8 +524,9 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val page = getPage(iBack) ?: break
             above = -iBack
             val pageHeight = getPageHeight(page)
-            docTopBack -= pageHeight.toDouble()
-            yTop -= pageHeight
+            val slotHeight = pageHeight + pageGapPx
+            docTopBack -= slotHeight.toDouble()
+            yTop -= slotHeight
             if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
             if (page.isDecoded) {
                 pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight))
@@ -493,13 +538,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var y = y0
         var i = 0
         var docTop = anchorDocYInternal
-        var prevHeight = 0f
+        var prevSlot = 0f
         var hasPrev = false
         var below = 0
         while (y < visBot && i <= MAX_VISIBLE_PAGES) {
             val page = getPage(i) ?: break
             below = i
-            if (hasPrev) docTop += prevHeight.toDouble()
+            if (hasPrev) docTop += prevSlot.toDouble()
             hasPrev = true
             val pageHeight = getPageHeight(page)
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
@@ -507,8 +552,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
             }
             if (pageHeight <= 0f) break
-            prevHeight = pageHeight
-            y += pageHeight
+            prevSlot = pageHeight + pageGapPx
+            y += prevSlot
             i++
         }
 
