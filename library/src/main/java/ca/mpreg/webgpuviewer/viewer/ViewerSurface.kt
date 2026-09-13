@@ -37,7 +37,6 @@ internal fun ViewerSurface(
 }
 
 internal fun attachHdrDisplay(view: View) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
     Hdr.attachDisplay(view.display)
 }
 

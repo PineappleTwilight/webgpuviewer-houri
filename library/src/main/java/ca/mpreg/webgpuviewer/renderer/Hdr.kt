@@ -30,6 +30,7 @@ import ca.mpreg.webgpuviewer.renderer.Hdr.headroomRatioOverride
 import ca.mpreg.webgpuviewer.renderer.Hdr.latchFrameFormat
 import ca.mpreg.webgpuviewer.renderer.Hdr.liveHdrClaims
 import ca.mpreg.webgpuviewer.renderer.Hdr.liveHeadroomRatio
+import ca.mpreg.webgpuviewer.renderer.Hdr.maxPeakValue
 import ca.mpreg.webgpuviewer.renderer.Hdr.peakWeight
 import ca.mpreg.webgpuviewer.renderer.Hdr.presentFormat
 import ca.mpreg.webgpuviewer.renderer.Hdr.presentPeak
@@ -83,11 +84,10 @@ object Hdr {
         get() = surfaceSupported == true && displaySupported == true
 
     /**
-     * Non-null exactly when [displaySupported] is true, and every HDR path waits on that - so
-     * wherever [presentPeak] matters, this is known.
-     *
      * From `getHighestHdrSdrRatio`, not `getHdrSdrRatio` - the latter tracks current screen
      * brightness and would mean redoing every decode whenever it changed. See [liveHeadroomRatio].
+     *
+     * Below API 36, fall back to [maxPeakValue].
      */
     @Volatile
     private var displayPeakRatio: Float? = null
@@ -159,15 +159,15 @@ object Hdr {
             return
         }
 
-        val peak = try {
-            display?.takeIf { it.isHdrSdrRatioAvailable }?.highestHdrSdrRatio
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not read display HDR capability", e)
+        val available = display?.isHdrSdrRatioAvailable == true
+
+        displayPeakRatio = if (available && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            display?.highestHdrSdrRatio?.takeIf { it.isFinite() && it > 1f }
+        } else {
             null
         }
 
-        displayPeakRatio = peak?.takeIf { it > 1f }
-        displaySupported = displayPeakRatio != null
+        displaySupported = available
 
         displayRef?.get()?.let { old ->
             hdrSdrRatioListener?.let {
