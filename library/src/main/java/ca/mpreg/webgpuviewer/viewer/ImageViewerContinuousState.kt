@@ -15,6 +15,7 @@ import ca.mpreg.webgpuviewer.renderer.RenderPage
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
 import ca.mpreg.webgpuviewer.viewer.ImageViewerContinuousState.Companion.MAX_PAGE_WALK
+import ca.mpreg.webgpuviewer.viewer.ImageViewerContinuousState.Companion.MAX_VISIBLE_PAGES
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -227,6 +228,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         emitReaderState()
     }
 
+    private val safeScale: Float get() = if (scale.isSane() && scale > 0f) scale else 1f
+
+    /** Page-space height of the viewport. Runs from page-space 0 - the camera is top-anchored. */
+    private val bandHeight: Double get() = height / safeScale.toDouble()
+
     /**
      * Smallest slot height the last [captureRenderState] walk saw.
      *
@@ -254,7 +260,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             bottom += pageHeight + pageGapPx
             if (bottom - pageGapPx - viewportHeight > scrollYInternal) break
         }
-        return null
+
+        // Zoomed out past what [MAX_VISIBLE_PAGES] can measure. Bound by the last page it
+        // reaches, not "no bound": past that is only blank, and unbounded scrolls off and snaps
+        // back once the end comes into range.
+        return max(0.0, slotTop - pageGapPx) - bottomEdge
     }
 
     private fun clampToDocumentEndLocked(maxPages: Int = reachForViewport()) {
@@ -584,7 +594,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val prewarmTargets: List<PrewarmTarget>,
     )
 
-    override fun captureRenderState(): Any = synchronized(scrollLock) {
+    override fun captureRenderState(): Any {
+        val snapshot = captureLocked()
+
+        onViewport?.runCatching { invoke(snapshot.readThrough) }
+        return snapshot
+    }
+
+    private fun captureLocked(): ContinuousRenderSnapshot = synchronized(scrollLock) {
         val screenH = height.toFloat()
         val page0 = getPage(0)
 
@@ -838,25 +855,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
-<<<<<<< HEAD
                         d.placed.forEach { placed ->
                             val image = placed.image
-=======
-                        page.forEachImage { image, srcOffsetX, sideScale ->
-                            if (image.mipmaps.isEmpty()) return@forEachImage
-                            val imageScale = pageScale * s.scale * sideScale
-                            val docCenterX =
-                                pageScale * (srcOffsetX + sideScale * image.x)
-                            val docCenterY = vp.docTop + 0.5f * vp.contentHeight +
-                                    pageScale * sideScale * image.y
-                            val targetX = anchorX + s.scale * docCenterX
-                            val targetY = anchorY + s.scale * docCenterY
-                            val (x, y) = solveImagePlacement(
-                                targetX, targetY, imageScale, image, dstW, dstH
-                            )
-                            // Non-highQuality content skips linear light; an animated page
-                            // swaps images every frame, so it takes the fast sampler too.
->>>>>>> 478ecc3 (Scale shorter image up in dual view)
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(
                                     pass, image, texture, placed.x, placed.y, placed.imageScale

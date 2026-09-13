@@ -68,8 +68,10 @@ fun ImageViewerContinuous(
 
             /**
              * Walk a scale that overshot back into bounds about [originX]/[originY] - the
-             * zoom's anchor, as fractions of the viewport from its centre. False if the scale
-             * was already fine. Position interpolates on 1/scale so the anchor holds.
+             * zoom's anchor, as fractions of the viewport: [originX] from its centre, since the
+             * horizontal offset is centred, [originY] from its top, since the camera is. False
+             * if the scale was already fine. Position interpolates on 1/scale so the anchor
+             * holds.
              */
             fun snapScaleIntoBounds(originX: Float, originY: Float): Boolean {
                 val startScale = state.scale
@@ -272,7 +274,7 @@ fun ImageViewerContinuous(
                         }
 
                         val px = secondDown.position.x / state.width - 0.5f
-                        val py = secondDown.position.y / state.height - 0.5f
+                        val py = secondDown.position.y / state.height
                         var totalDeltaY = 0f
 
                         state.isScaleAnimating = true
@@ -417,7 +419,7 @@ fun ImageViewerContinuous(
                                         val newScale = state.scale * zoom
                                         val diff = 1f / newScale - 1f / state.scale
                                         val cx = centroid.x / state.width - 0.5f
-                                        val cy = centroid.y / state.height - 0.5f
+                                        val cy = centroid.y / state.height
                                         // What the snap-back below anchors to.
                                         zoomOriginX = cx
                                         zoomOriginY = cy
@@ -513,7 +515,6 @@ fun ImageViewerContinuous(
             }
         }
 
-<<<<<<< HEAD
         ViewerSurface(surfaceModifier) { surface, width, height ->
             try {
                 // Before init: whether the panel does HDR at all gates the decode path, which can
@@ -533,22 +534,6 @@ fun ImageViewerContinuous(
 
         if (state.showTileHud) {
             TileHud(state, Modifier.align(Alignment.TopStart))
-=======
-    ViewerSurface(surfaceModifier) { surface, width, height ->
-        try {
-            // Before init: the panel's HDR support gates the decode path, which can reach
-            // an image before the first frame.
-            attachHdrDisplay(view)
-            state.init(scope, surface, width, height)
-            surface.onChanged { w, h -> state.resize(w, h) }
-            // After init, so Hdr.resolve has run and the surface's capability is known.
-            attachHdrSurface(view)
-            state.invalidate()
-            state.collect()
-        } finally {
-            attachHdrSurface(null)
-            state.cleanup()
->>>>>>> 03faa3f (Track frame error)
         }
     }
 }
