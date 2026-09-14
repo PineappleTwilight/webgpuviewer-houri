@@ -1704,13 +1704,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val centerY = st.centerYOffset * (scale / st.scale)
         val dst = ts + 2f * inset
         val filtered = filtered()
-        st.page.forEachImage { image, srcOffsetX ->
+        st.page.forEachImage { image, srcOffsetX, imageScale ->
             if (image.mipmaps.isNotEmpty()) {
-                // In raw (unscaled) pixels since solveImagePlacement scales by s itself.
-                val targetX = -tx * ts + inset + s * (srcOffsetX + image.x)
-                val targetY = centerY - ty * ts + inset + s * image.y
-                val (x, y) = solveImagePlacement(targetX, targetY, s, image, dst, dst)
-                RenderPage.render(pass, image, texture, x, y, s, filtered)
+                val si = s * imageScale
+                val targetX = -tx * ts + inset + s * srcOffsetX + si * image.x
+                val targetY = centerY - ty * ts + inset + si * image.y
+                val (x, y) = solveImagePlacement(targetX, targetY, si, image, dst, dst)
+                RenderPage.render(pass, image, texture, x, y, si, filtered)
             }
         }
     }

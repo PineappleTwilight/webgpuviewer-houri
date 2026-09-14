@@ -602,11 +602,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         s.suppressGeneration
                     )
                     if (!covered) {
-                        val imageScale = pageScale * s.scale
-                        page.forEachImage { image, srcOffsetX ->
+                        page.forEachImage { image, srcOffsetX, sideScale ->
                             if (image.mipmaps.isEmpty()) return@forEachImage
-                            val docCenterX = pageScale * (srcOffsetX + image.x)
-                            val docCenterY = vp.docTop + 0.5f * vp.pageHeight + pageScale * image.y
+                            val imageScale = pageScale * s.scale * sideScale
+                            val docCenterX =
+                                pageScale * (srcOffsetX + sideScale * image.x)
+                            val docCenterY = vp.docTop + 0.5f * vp.pageHeight +
+                                    pageScale * sideScale * image.y
                             val targetX = anchorX + s.scale * docCenterX
                             val targetY = anchorY + s.scale * docCenterY
                             val (x, y) = solveImagePlacement(
