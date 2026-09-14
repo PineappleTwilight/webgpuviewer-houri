@@ -372,6 +372,7 @@ fun ImageViewerContinuous(
                     var multiZoomed = false
 
                     var canceled = false
+                    state.isPanning = true
                     try {
                         do {
                             val event = awaitPointerEvent()
@@ -453,6 +454,7 @@ fun ImageViewerContinuous(
                         } while (!canceled && event.changes.any { it.pressed })
                     } finally {
                         state.isScaleAnimating = false
+                        state.isPanning = false
                     }
 
                     longPressJob?.cancel()

@@ -547,14 +547,20 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (!deltaPixels.isFinite()) return
         animationJob?.cancel()
         animationJob = scope?.launch {
-            var lastValue = 0f
-            animate(
-                0f, deltaPixels, animationSpec = spring(
-                    stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
-                )
-            ) { value, _ ->
-                scrollBy(value - lastValue)
-                lastValue = value
+            isFlinging = true
+            try {
+                var lastValue = 0f
+                animate(
+                    0f, deltaPixels, animationSpec = spring(
+                        stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
+                    )
+                ) { value, _ ->
+                    scrollBy(value - lastValue)
+                    lastValue = value
+                    invalidate()
+                }
+            } finally {
+                isFlinging = false
                 invalidate()
             }
         }
@@ -597,7 +603,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     override fun captureRenderState(): Any {
         val snapshot = captureLocked()
 
-        onViewport?.runCatching { invoke(snapshot.readThrough) }
+        if (isFlinging || isPanning) onViewport?.runCatching { invoke(snapshot.readThrough) }
         return snapshot
     }
 
