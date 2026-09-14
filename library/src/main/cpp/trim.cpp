@@ -432,8 +432,6 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
 
   const EdgeLine *edges[4] = {&left, &right, &top, &bottom};
 
-  int solidCount = 0;
-  int whiteCount = 0;
   int nonWhiteCount = 0;
   double linearSum[3] = {0.0, 0.0, 0.0};
   for (auto &edge : edges) {
@@ -441,9 +439,7 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
     if (!result.solid) {
       continue;
     }
-    solidCount++;
     if (result.isWhite) {
-      whiteCount++;
       continue;
     }
     nonWhiteCount++;
@@ -467,9 +463,6 @@ Java_ca_mpreg_webgpuviewer_TrimNative_detectBackground(JNIEnv *env,
     return static_cast<jint>(0xFF000000u | static_cast<uint32_t>(rgb));
   }
 
-  if (whiteCount > 0) {
-    return kWhite;
-  }
-
+  /* No solid edge that isn't white, so white is the answer either way. */
   return kWhite;
 }
