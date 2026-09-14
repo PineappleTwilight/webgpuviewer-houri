@@ -727,8 +727,12 @@ class WebGpuRenderer {
 
         val doCleanup: suspend () -> Unit = {
             mutex.withLock {
-                try { filters.cleanup() } catch (e: Throwable) { Log.w("WebGpuRenderer", "filter cleanup failed", e) }
-                val s = surface
+                // Once the device is lost there is nothing to free, and calling into its objects
+                // crashed in native code.
+                if (!deviceLost) {
+                    filters.cleanup()
+                    surface?.close()
+                }
                 surface = null
                 if (s != null) {
                     try { s.close() } catch (e: Throwable) { Log.w("WebGpuRenderer", "surface close failed", e) }

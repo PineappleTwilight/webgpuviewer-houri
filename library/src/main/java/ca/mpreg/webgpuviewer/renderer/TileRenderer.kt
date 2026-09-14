@@ -74,6 +74,7 @@ import ca.mpreg.webgpuviewer.renderer.TileRenderer.Companion.TILE_SIZE_MARGIN
 import ca.mpreg.webgpuviewer.renderer.TileRenderer.Companion.TILE_SIZE_SAMPLES
 import ca.mpreg.webgpuviewer.viewer.ImagePage
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -349,7 +350,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
     private var frame = 0L
     private var workerActive = false
-    private val workerScope = CoroutineScope(WebGpuRenderer.dispatcher + SupervisorJob())
+    // Tiles are an optimisation over drawing pages directly: a failure in the worker is logged, never
+    // left to reach the thread's uncaught exception handler and end the process.
+    private val workerScope = CoroutineScope(
+        WebGpuRenderer.dispatcher + SupervisorJob() +
+            CoroutineExceptionHandler { _, e -> Log.e(TAG, "Tile worker failed", e) },
+    )
 
     // Timestamp-query based GPU cost measurement for [generateTile]'s batches - null wherever the
     // adapter didn't have the feature (see WebGpuRenderer's requiredFeatures), in which case
@@ -2196,11 +2202,18 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val result = timing.result
         try {
             awaitPumped { result.mapAndAwait(MapMode.Read, 0, result.size) }
-        } catch (e: Throwable) {
+        } catch (e: CancellationException) {
             // Still in flight, possibly - not safe to hand back.
             timing.resolve.destroy()
             result.destroy()
             throw e
+        } catch (e: Exception) {
+            // A lost device fails every pending map. The timing only paces tile batches, and
+            // rethrowing escaped the worker scope as an uncaught exception that killed the app.
+            timing.resolve.destroy()
+            result.destroy()
+            Log.w(TAG, "Tile timing unavailable: ${e.message}")
+            return
         }
         val timestamps = result.getConstMappedRange(0, 16)
         timestamps.order(ByteOrder.nativeOrder())
@@ -2349,6 +2362,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (cleaned) return
         cleaned = true
         cleanupJob = workerScope.launch {
+            // Nothing to free on a lost device, and calling into its objects crashed in
+            // native code - drop the references and leave the old device's objects alone.
+            if (!WebGpuRenderer.isAvailable) {
+                pages.clear()
+                atlasOrNull = null
+                timestampPool.clear()
+                return@launch
+            }
             try { upscaler.cleanup() } catch (_: Throwable) {}
             try { downscaler.cleanup() } catch (_: Throwable) {}
             try {
