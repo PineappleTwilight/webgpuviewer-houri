@@ -383,7 +383,8 @@ class Image private constructor(
     }
 
     private fun destroyBuffer() {
-        try { _buffer?.destroy() } catch (_: Throwable) {}
+        // destroyAndRelease, not destroy: the wrapper holds a Dawn handle nothing else drops.
+        try { _buffer?.destroyAndRelease() } catch (_: Throwable) {}
         _buffer = null
     }
 

@@ -238,11 +238,14 @@ class Mipmap(
         lastQuad = null
         lastQuadTX = -1
         lastQuadTY = -1
-        tileUniforms?.forEach { try { it?.destroy() } catch (_: Throwable) {} }
+        // AutoCloseable over a Dawn handle with no finalizer behind it, so destroy() alone
+        // (frees the memory) leaks the handle: destroyAndRelease drops both.
+        tileUniforms?.forEach { try { it?.destroyAndRelease() } catch (_: Throwable) {} }
         tileUniforms = null
+        textureViews.forEach { view -> view.close() }
         textureViews.clear()
         tileViews.clear()
-        textures.forEach { tex -> try { tex.destroy() } catch (_: Throwable) {} }
+        textures.forEach { tex -> try { tex.destroyAndRelease() } catch (_: Throwable) {} }
         textures.clear()
         tiles.clear()
     }

@@ -386,8 +386,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private fun releaseTimestampBuffers(buffers: TimestampBuffers) {
         // A batch never has more in flight than this.
         if (timestampPool.size >= MAX_TILES_PER_BATCH) {
-            buffers.resolve.destroy()
-            buffers.result.destroy()
+            buffers.resolve.destroyAndRelease()
+            buffers.result.destroyAndRelease()
         } else {
             timestampPool.addLast(buffers)
         }
@@ -603,8 +603,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             )
 
         fun destroy() {
-            scratches.values.forEach { it.destroy() }
-            texture.destroy()
+            scratchViews.values.forEach { it.close() }
+            scratchViews.clear()
+            scratches.values.forEach { it.destroyAndRelease() }
+            scratches.clear()
+            view.close()
+            texture.destroyAndRelease()
         }
     }
 
@@ -766,13 +770,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             tiles.values.forEach { atlas?.release(tileSize, it.atlasOrigin) }
             tiles.clear()
             pending.clear()
-            instances?.destroy()
+            instances?.destroyAndRelease()
             instances = null
             instanceCapacity = 0
             instanceCount = 0
             bindGroup?.close()
             bindGroup = null
-            frameUniform.destroy()
+            frameUniform.destroyAndRelease()
         }
     }
 
@@ -1031,7 +1035,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             stencilWidth = w
             stencilHeight = h
             for (i in 0 until STENCIL_BUFFER_COUNT) {
-                stencilTextures[i]?.destroy()
+                stencilViews[i]?.close()
+                stencilTextures[i]?.destroyAndRelease()
                 val texture = try {
                     device.createTexture(
                         GPUTextureDescriptor(
@@ -1039,6 +1044,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                             size = GPUExtent3D(w, h),
                             format = TextureFormat.Stencil8,
                         )
+
+                    GPUTextureDescriptor(
+                        usage = TextureUsage.RenderAttachment,
+                        size = GPUExtent3D(dst.width, dst.height),
+                        format = TextureFormat.Stencil8,
                     )
                 } catch (e: OutOfMemoryError) {
                     System.gc()
@@ -1716,7 +1726,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pass.setBindGroup(0, st.bindGroup ?: gridBindGroup(st).also { st.bindGroup = it })
         pass.setVertexBuffer(0, instances)
         pass.draw(6, present.size)
-        instances.destroy()
+        instances.destroyAndRelease()
     }
 
     /** One bind group per grid: its own uniform, the shared atlas, the shared sampler. */
@@ -1742,7 +1752,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (st.instanceCapacity < st.instanceCount) {
             // Rounded up so filling in tile by tile doesn't reallocate on every one.
             val capacity = (st.instanceCount + 63) / 64 * 64
-            st.instances?.destroy()
+            st.instances?.destroyAndRelease()
             st.instances = device.createBuffer(
                 GPUBufferDescriptor(
                     size = capacity * INSTANCE_BYTES,
@@ -2204,8 +2214,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             awaitPumped { result.mapAndAwait(MapMode.Read, 0, result.size) }
         } catch (e: CancellationException) {
             // Still in flight, possibly - not safe to hand back.
-            timing.resolve.destroy()
-            result.destroy()
+            timing.resolve.destroyAndRelease()
+            result.destroyAndRelease()
             throw e
         } catch (e: Exception) {
             // A lost device fails every pending map. The timing only paces tile batches, and
@@ -2380,11 +2390,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             try { atlasOrNull?.destroy() } catch (_: Throwable) {}
             atlasOrNull = null
             try {
-                timestampPool.forEach { try { it.resolve.destroy() } catch (_: Throwable) {}; try { it.result.destroy() } catch (_: Throwable) {} }
+                timestampPool.forEach { try { it.resolve.destroyAndRelease() } catch (_: Throwable) {}; try { it.result.destroyAndRelease() } catch (_: Throwable) {} }
                 timestampPool.clear()
             } catch (_: Throwable) {}
             for (i in 0 until STENCIL_BUFFER_COUNT) {
-                try { stencilTextures[i]?.destroy() } catch (_: Throwable) {}
+                try { stencilTextures[i]?.destroyAndRelease() } catch (_: Throwable) {}
                 stencilTextures[i] = null
                 stencilViews[i] = null
             }

@@ -33,6 +33,7 @@ import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.Hdr
 import ca.mpreg.webgpuviewer.renderer.TileRenderer
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.destroyAndRelease
 import ca.mpreg.webgpuviewer.renderer.setTransientBindGroup
 import ca.mpreg.webgpuviewer.transition.Transition.Companion.blitCached
 import ca.mpreg.webgpuviewer.transition.Transition.Companion.blitCachedRegion
@@ -356,12 +357,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         private var cacheHeight = 0
         private var cacheFormat = 0
 
+        // Deferred to avoid use-after-free - safe now that at least one frame has passed.
+        // A view is a Dawn handle of its own and only close() releases it, so the views are
+        // tracked beside the textures they were made from.
         private val pendingDestroy = ArrayList<GPUTexture>(4)
+        private val pendingDestroyViews = ArrayList<GPUTextureView>(4)
 
         private fun ensureTexturesLocked(width: Int, height: Int) {
             if (pendingDestroy.isNotEmpty()) {
-                for (tex in pendingDestroy) try { tex.destroy() } catch (_: Throwable) {}
+                for (tex in pendingDestroy) try { tex.destroyAndRelease() } catch (_: Throwable) {}
                 pendingDestroy.clear()
+            }
+            if (pendingDestroyViews.isNotEmpty()) {
+                for (view in pendingDestroyViews) try { view.close() } catch (_: Throwable) {}
+                pendingDestroyViews.clear()
             }
 
             // Recreate if the size changed, or if HDR came or went under us - these are
@@ -376,6 +385,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             if (cacheWidth != w || cacheHeight != h || cacheFormat != format) {
                 texture1?.let { pendingDestroy.add(it) }
                 texture2?.let { pendingDestroy.add(it) }
+                view1?.let { pendingDestroyViews.add(it) }
+                view2?.let { pendingDestroyViews.add(it) }
 
                 try {
                     texture1 = WebGpuRenderer.device.createTexture(
