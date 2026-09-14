@@ -370,6 +370,9 @@ class WebGpuRenderer {
     @Volatile
     private var surface: GPUSurface? = null
 
+    /** The window reference [windowFromSurface] took for [surface], released in [cleanup]; see [NativeWindow]. */
+    private var window = 0L
+
     /**
      * The format the swapchain is currently configured as, so [render] can notice when
      * [Hdr.frameFormat] has moved and rebuild it.
