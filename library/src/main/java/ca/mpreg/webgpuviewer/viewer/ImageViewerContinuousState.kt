@@ -422,6 +422,22 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
     }
 
+    /**
+     * Snap the viewport to the top of the current page 0 without walking the page
+     * chain: no [onPageChange] callbacks fire, so a programmatic seek cannot shift
+     * the page mapping mid-scroll and land somewhere random. The anchor is stale
+     * once the host swaps in a new current page, so zero it as well.
+     */
+    fun jumpToTop() {
+        synchronized(scrollLock) {
+            anchorDocYInternal = 0.0
+            scrollYInternal = 0.0
+            currentPageHeight = null
+            pendingRestore = null
+        }
+        invalidate()
+    }
+
     fun animateSlideIn(direction: Int) {
         animationJob?.cancel()
         animationJob = scope?.launch {
