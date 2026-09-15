@@ -372,13 +372,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             } else {
                 for (i in deltaPages until 0) {
                     val p = getPage(i) ?: return null
-                    docY += getPageSlotHeight(p).toDouble()
+                    docY -= getPageSlotHeight(p).toDouble()
                 }
                 val targetPage = getPage(deltaPages) ?: return null
                 val h = getPageSlotHeight(targetPage).toDouble()
                 docY += h * clampedFraction
-                // Adjust because anchor is top of page 0, not target
-                // We already summed heights from anchor, so docY is correct
             }
             return docY
         }
