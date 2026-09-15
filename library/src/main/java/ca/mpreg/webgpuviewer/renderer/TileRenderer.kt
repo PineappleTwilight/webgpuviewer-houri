@@ -488,9 +488,27 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         preferredTileSize = TILE_SIZES[best]
     }
 
+    /**
+     * True when the rescaler in force has a whole [Rescaler.factor] of resizing to give a tile of
+     * [st]'s scale and size, and can run at all. Shared by [generateTileNow], which decides how to
+     * cut a tile, and [drawCore], which decides whether one cut plain is owed an upgrade.
+     */
+    private fun rescalerApplies(st: PageTiles): Boolean {
+        val rescaler: Rescaler = if (st.scale >= 1f) upscaler else downscaler
+        return rescaler.factor > 1 && rescaler.supported &&
+            rescaler.appliesAt(st.scale) && rescaler.fits(st.tileSize)
+    }
+
     /** One cached tile: where in the [TileAtlas] it sits (packed), and when it was last drawn. */
     private class Tile(val atlasOrigin: Int) {
         var lastUsed = 0L
+
+        /**
+         * True when this tile was rendered without the staged rescaler that its grid's scale would
+         * otherwise call for, because it was off screen when it was generated. [drawCore] re-cuts
+         * it once it becomes visible - see the upgrade there.
+         */
+        var plain = false
     }
 
     /**
@@ -781,7 +799,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     }
 
     /** One tile of work for the shared worker - see [schedule]/[nextRequest]. */
-    private class Request(val state: PageTiles, val tx: Int, val ty: Int)
+    private class Request(
+        val state: PageTiles, val tx: Int, val ty: Int, val onScreen: Boolean
+    )
 
     // Access-ordered so getOrPut's read-then-maybe-write always moves the touched page to the
     // end (most recently drawn), whether or not it was already present - see RETAIN_MARGIN.
@@ -1633,6 +1653,17 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             val tile = st.tiles[tkey]
             if (tile != null) {
                 tile.lastUsed = frame
+                // Generated off screen, so it skipped the rescaler its grid's scale calls for -
+                // see [generateTileNow]. Now that it is visible, drop it and let the worker cut it
+                // again at full quality. Once only: what replaces it is not plain.
+                if (tile.plain && st.stable && rescalerApplies(st) &&
+                    tileVisible(gp, dst, txi, tyi)
+                ) {
+                    atlasOrNull?.release(st.tileSize, tile.atlasOrigin)
+                    st.tiles.remove(tkey)
+                    st.instancesDirty = true
+                    st.pending.add(tkey)
+                }
             } else {
                 if (st.stable) st.pending.add(tkey)
                 if (covered && tileVisible(gp, dst, txi, tyi)) covered = false
@@ -1916,7 +1947,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         if (bestState == null) return null
         bestState.pending.remove(bestKey)
-        return Request(bestState, (bestKey shr 32).toInt(), bestKey.toInt())
+        // [priorityOf] adds a whole [OFF_SCREEN_SCORE] per tile outside the grid's on-screen
+        // window, so anything at or above it is a tile nobody can currently see - the margin ring
+        // kept against a pan, or a grid [prewarm] filled for a page that is not on screen at all.
+        return Request(
+            bestState, (bestKey shr 32).toInt(), bestKey.toInt(),
+            onScreen = bestPriority < OFF_SCREEN_SCORE,
+        )
     }
 
     /**
@@ -1928,21 +1965,29 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private fun generate(req: Request, measurementScope: CoroutineScope): Job? {
         val st = req.state
         if (st.destroyed || !st.stable) return null
-        return generateTileNow(st, req.tx, req.ty, measurementScope)
+        return generateTileNow(st, req.tx, req.ty, measurementScope, req.onScreen)
     }
 
     /** Generate [st]'s tile at ([tx], [ty]) right now if it isn't already cached. */
     private fun generateTileNow(
-        st: PageTiles, tx: Int, ty: Int, measurementScope: CoroutineScope = workerScope
+        st: PageTiles,
+        tx: Int,
+        ty: Int,
+        measurementScope: CoroutineScope = workerScope,
+        onScreen: Boolean = true,
     ): Job? {
         // Which way this tile resizes decides which rescaler gets a say.
         val rescaler: Rescaler = if (st.scale >= 1f) upscaler else downscaler
-        val factor = rescaler.factor
 
-        // [Rescaler.appliesAt] keeps a rescaler off a tile with less than a whole run of resizing
-        // to give it. What it declines resolves in one step, as always.
-        val use = factor > 1 && rescaler.supported && rescaler.appliesAt(st.scale) &&
-                rescaler.fits(st.tileSize)
+        // [rescalerApplies] keeps a rescaler off a tile with less than a whole run of resizing to
+        // give it. What it declines resolves in one step, as always.
+        //
+        // Off screen gets the same treatment for a different reason. A staged rescaler is not a
+        // filter tweak - [UpscalerArtCnn] adds nine compute dispatches to every tile - and the
+        // margin ring and [prewarm]'s grids are tiles nobody is looking at yet. Spending that on
+        // them buys nothing and competes with the frame being presented, so they render plain and
+        // [drawCore] upgrades them if they ever come on screen.
+        val use = onScreen && rescalerApplies(st)
 
         // The tile as the first step sees it, plus the rescaler's halo. Resized, that is the tile
         // with factor*halo to spare each side, which [Rescaler.resolve] cuts off.
@@ -2153,7 +2198,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             }
             pool.copyScratchInto(encoder, origin, st.tileSize)
             device.queue.submitAndRelease(encoder)
-            st.tiles[key] = Tile(origin).also { it.lastUsed = frame }
+            st.tiles[key] = Tile(origin).also { it.lastUsed = frame; it.plain = !staged }
             st.instancesDirty = true
             return null
         }
@@ -2202,7 +2247,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         encoder.copyBufferToBuffer(timing.resolve, 0, timing.result, 0, 16)
 
         device.queue.submitAndRelease(encoder)
-        st.tiles[key] = Tile(origin).also { it.lastUsed = frame }
+        st.tiles[key] = Tile(origin).also { it.lastUsed = frame; it.plain = !staged }
         st.instancesDirty = true
 
         return measurementScope.launch { measureTileGpuTime(timing, st.tileSize) }
@@ -2220,8 +2265,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         } catch (e: Exception) {
             // A lost device fails every pending map. The timing only paces tile batches, and
             // rethrowing escaped the worker scope as an uncaught exception that killed the app.
-            timing.resolve.destroy()
-            result.destroy()
+            timing.resolve.destroyAndRelease()
+            result.destroyAndRelease()
             Log.w(TAG, "Tile timing unavailable: ${e.message}")
             return
         }
