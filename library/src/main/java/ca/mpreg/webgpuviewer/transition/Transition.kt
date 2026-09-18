@@ -47,6 +47,13 @@ import kotlin.math.pow
 abstract class Transition {
     open val code: String = ""
 
+    /**
+     * False when a turn with this transition plays no animation at all: drags track the
+     * finger as direct manipulation, while release-settle and programmatic turns cut
+     * instantly instead of springing. See [TransitionNone].
+     */
+    open val isAnimated: Boolean = true
+
     protected val device get() = WebGpuRenderer.device
 
     /**

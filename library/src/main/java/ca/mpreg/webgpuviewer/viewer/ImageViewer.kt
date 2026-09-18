@@ -443,19 +443,27 @@ fun ImageViewer(
                                 else -> 0f
                             }
 
-                            state.animationJob = scope.launch {
-                                val anim = Animatable(state.pageOffset)
-                                anim.updateBounds(lowerBound = -1f, upperBound = 1f)
-                                anim.animateTo(
-                                    target,
-                                    initialVelocity = initialVelocity,
-                                    animationSpec = spring(
-                                        stiffness = Spring.StiffnessMediumLow,
-                                        visibilityThreshold = 0.002f
-                                    )
-                                ) {
-                                    state.pageOffset = value
-                                    state.invalidate()
+                            if (!state.transition.isAnimated) {
+                                // No-animation transition: snap to the landing page. Assigning
+                                // through pageOffset still walks whole-page deltas, so a commit
+                                // fires onPageChange exactly like the spring path would.
+                                state.pageOffset = target
+                                state.invalidate()
+                            } else {
+                                state.animationJob = scope.launch {
+                                    val anim = Animatable(state.pageOffset)
+                                    anim.updateBounds(lowerBound = -1f, upperBound = 1f)
+                                    anim.animateTo(
+                                        target,
+                                        initialVelocity = initialVelocity,
+                                        animationSpec = spring(
+                                            stiffness = Spring.StiffnessMediumLow,
+                                            visibilityThreshold = 0.002f
+                                        )
+                                    ) {
+                                        state.pageOffset = value
+                                        state.invalidate()
+                                    }
                                 }
                             }
                         } else {

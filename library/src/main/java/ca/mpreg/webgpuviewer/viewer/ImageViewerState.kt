@@ -149,6 +149,13 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     fun animatePageTurn(direction: Int) {
         animationJob?.cancel()
+        if (!transition.isAnimated) {
+            // No-animation transition: cut straight to the new page - the caller already
+            // swapped it in, so there is nothing to slide from and transitionFromPage is moot.
+            transitionFromPage = null
+            invalidate()
+            return
+        }
         animationJob = scope?.launch {
             setPageOffsetDirect(direction.toFloat())
             invalidate()
