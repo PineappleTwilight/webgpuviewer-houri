@@ -28,6 +28,7 @@ import ca.mpreg.webgpuviewer.draw.TextAlign
 import ca.mpreg.webgpuviewer.draw.circle
 import ca.mpreg.webgpuviewer.draw.clear
 import ca.mpreg.webgpuviewer.draw.rect
+import ca.mpreg.webgpuviewer.draw.sprite
 import ca.mpreg.webgpuviewer.draw.text
 import ca.mpreg.webgpuviewer.orZero
 import ca.mpreg.webgpuviewer.renderer.Image
@@ -181,6 +182,25 @@ open class ImagePage {
 
         protected fun circle(cx: Float, cy: Float, radius: Float, color: Int) =
             Draw.circle(pass, cx, cy, radius, color)
+
+        /**
+         * Draws [texture] as a square sprite of [sizePx] pixels centered on ([cx], [cy]) -
+         * both in [dst] pixels - rotated [angleRadians] clockwise-positive on screen. [tint]
+         * multiplies the sampled texels, so a white source takes any color. Into the open
+         * pass, sharing it with other draws like [rect]/[circle]/[text].
+         */
+        protected fun sprite(
+            texture: GPUTexture,
+            cx: Float,
+            cy: Float,
+            sizePx: Float,
+            dst: GPUTexture,
+            angleRadians: Float,
+            tint: Int,
+        ) = Draw.sprite(
+            pass, texture.createView(), cx, cy, sizePx,
+            dst.width.toFloat(), dst.height.toFloat(), angleRadians, tint
+        )
 
         protected fun text(
             dst: GPUTexture,
