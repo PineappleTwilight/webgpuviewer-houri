@@ -628,6 +628,22 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             val (x, y) = solveImagePlacement(
                                 targetX, targetY, imageScale, image, dstW, dstH
                             )
+                            // The fast path draws only the bitmap, so a sub-pixel
+                            // rasterization gap between abutting pages shows the
+                            // transparent-black clear color as a 1px seam until tiles
+                            // generate. Underlay the image extent, overlapped by 1px
+                            // so pages drawn later cover the overshoot, with the
+                            // image's trim-detected background color.
+                            val halfW = image.width * imageScale / 2f
+                            val halfH = image.height * imageScale / 2f
+                            RenderPage.drawMaskedRect(
+                                pass,
+                                (targetX - halfW - 1f) / dstW,
+                                (targetY - halfH - 1f) / dstH,
+                                (targetX + halfW + 1f) / dstW,
+                                (targetY + halfH + 1f) / dstH,
+                                image.backgroundColor,
+                            )
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(pass, image, texture, x, y, imageScale)
                             } else {

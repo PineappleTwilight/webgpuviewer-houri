@@ -210,9 +210,14 @@ fun ImageViewer(
                                             val px = secondDown.position.x / state.width - 0.5f
                                             val py = secondDown.position.y / state.height - 0.5f
 
-                                            val newScale =
+                                            var newScale =
                                                 originalScale * 10f.pow(2 * totalDeltaY / state.height)
-
+                                            // A restricted maxScale (zoom-in disabled clamps it to
+                                            // homeScale) bounds the gesture; otherwise overshoot
+                                            // settles back on release as before.
+                                            if (page.maxScale <= page.homeScale) {
+                                                newScale = newScale.coerceAtMost(page.maxScale)
+                                            }
                                             page.scale = newScale
                                             val diff = 1 / page.scale - 1 / originalScale
 
@@ -371,7 +376,13 @@ fun ImageViewer(
                                         val zoom = event.calculateZoom()
 
                                         if (zoom != 1f || pan != Offset.Zero) {
-                                            val newScale = page.scale * zoom
+                                            var newScale = page.scale * zoom
+                                            // A restricted maxScale (zoom-in disabled clamps it to
+                                            // homeScale) bounds the gesture; otherwise overshoot
+                                            // settles back on release as before.
+                                            if (page.maxScale <= page.homeScale) {
+                                                newScale = newScale.coerceAtMost(page.maxScale)
+                                            }
                                             val diff = 1 / newScale - 1 / page.scale
 
                                             var x = page.x + (pan.x / state.width) / page.scale
