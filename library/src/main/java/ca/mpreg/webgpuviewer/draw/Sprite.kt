@@ -73,6 +73,7 @@ struct SpriteUniforms {
     size: vec2<f32>,    // sprite size, destination pixels
     dst_size: vec2<f32>,  // destination size, pixels
     angle: f32,         // rotation, radians, clockwise-positive on screen
+    _pad: f32,          // vec4 alignment: tint must start at a 16-byte offset
     tint: vec4<f32>,    // multiplies the sampled texel
 }
 
@@ -183,6 +184,7 @@ fun Draw.sprite(
     byteBuffer.putFloat(dstWidth)
     byteBuffer.putFloat(dstHeight)
     byteBuffer.putFloat(angleRadians)
+    byteBuffer.putFloat(0f) // _pad: keeps tint 16-byte aligned (see Circle)
     byteBuffer.putFloat(r)
     byteBuffer.putFloat(g)
     byteBuffer.putFloat(b)
