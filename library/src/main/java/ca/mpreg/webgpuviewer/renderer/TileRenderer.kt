@@ -1174,6 +1174,76 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     }
 
     /**
+     * [prewarm] for the continuous viewer: same enqueue-without-blit, but placed by the camera
+     * anchor ([cameraDocY], this page's own [docTop]) instead of the page's home position,
+     * which the continuous viewer never sets. The grid this builds is exactly what [draw]'s
+     * continuous overload draws from, so a page scrolled into view blits instead of
+     * generating from scratch.
+     *
+     * Like [prewarm], leaves [PageTiles.txMin]/etc empty so [nextRequest] ranks these tiles
+     * behind whichever page is genuinely being drawn. Sets [PageTiles.centerYOffset] every
+     * call like [drawCore] does: document positions don't move with the scroll, so a grid
+     * prewarmed ahead stays valid as its page slides into view.
+     */
+    fun prewarmContinuous(
+        page: ImagePage.ImageSingle,
+        dst: GPUTexture,
+        cameraDocY: Float,
+        docTop: Float,
+        viewerOffsetX: Float,
+        scale: Float,
+    ) {
+        if (page.destroyed || !page.highQuality || page.isAnimated) return
+        if (!page.hasUploadedImage) return
+
+        viewportWidth = dst.width
+        viewportHeight = dst.height
+
+        val a = continuousAnchor(page, dst, cameraDocY, docTop, viewerOffsetX, scale) ?: return
+        val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
+
+        if (st.scale != a.pageScale || st.centerYOffset != a.centerYOffset ||
+            st.tileSize != preferredTileSize
+        ) {
+            releaseTiles(st)
+            st.pending.clear()
+            st.scale = a.pageScale
+            st.tileSize = preferredTileSize
+            st.stable = false
+            invalidate()
+        } else {
+            st.stable = true
+        }
+        st.centerYOffset = a.centerYOffset
+        if (!st.stable) return
+
+        val gp = gridPlacement(
+            page, dst, a.anchorX, a.anchorY, a.centerYOffset, a.pageScale, st.tileSize
+        ) ?: return
+        if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) return
+
+        // Same never-drawn frame-uniform gotcha as [prewarm] - see its comment.
+        writeFrameUniformIfChanged(
+            st, dst, gp.snapX, gp.snapY, gp.clipL, gp.clipT, gp.clipR, gp.clipB
+        )
+
+        val alreadyPrewarming = st.pending.isNotEmpty()
+
+        var added = false
+        forEachTile(wantedTileRange(gp)) { txi, tyi ->
+            val tkey = key(txi, tyi)
+            if (!st.tiles.containsKey(tkey)) {
+                st.pending.add(tkey)
+                added = true
+            }
+        }
+        if (added) {
+            if (!alreadyPrewarming) Log.d(TAG, "Pre-warming continuous page tiles ${pageId(page)}")
+            schedule()
+        }
+    }
+
+    /**
      * Blit [page]'s cached tiles and enqueue the missing ones - the paged viewer's placement, via
      * its own [page]-relative (x, y).
      *

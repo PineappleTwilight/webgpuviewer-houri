@@ -130,6 +130,68 @@ fun ImageViewerContinuous(
                     }
                 }
 
+                /**
+                 * Toggle between the zoom-out floor and the double-tap scale, anchored at
+                 * ([px], [py]) - fractions of the viewport from its centre. Shared by the
+                 * double-tap path below and the two-finger tap in the drag branch, so the two
+                 * gestures can't disagree on where "zoomed in" is.
+                 */
+                fun toggleZoomAt(px: Float, py: Float) {
+                    if (state.scale > state.minScale + 0.1f) {
+                        // Zoom out: animate offsetX to 0, anchor Y to tap point
+                        state.animationJob = scope.launch {
+                            state.isScaleAnimating = true
+                            try {
+                                val startScale = state.scale
+                                val startOffsetX = state.offsetX
+                                val totalDiff = 1f / state.minScale - 1f / startScale
+                                val anchorX =
+                                    if (totalDiff != 0f) -startOffsetX / totalDiff else 0f
+                                animate(
+                                    0f, 1f, animationSpec = spring(
+                                        stiffness = Spring.StiffnessMediumLow,
+                                        visibilityThreshold = 0.002f
+                                    )
+                                ) { t, _ ->
+                                    val newScale =
+                                        startScale + (state.minScale - startScale) * t
+                                    val diff = 1f / newScale - 1f / state.scale
+                                    state.offsetX += anchorX * diff
+                                    state.scale = newScale
+                                    state.scrollBy(-py * diff * state.height)
+                                    state.invalidate()
+                                }
+                            } finally {
+                                state.isScaleAnimating = false
+                            }
+                        }
+                    } else {
+                        // Zoom in at tap point
+                        state.animationJob = scope.launch {
+                            state.isScaleAnimating = true
+                            try {
+                                val startScale = state.scale
+                                animate(
+                                    0f, 1f, animationSpec = spring(
+                                        stiffness = Spring.StiffnessMediumLow,
+                                        visibilityThreshold = 0.002f
+                                    )
+                                ) { t, _ ->
+                                    val newScale =
+                                        startScale + (state.doubleTapScale - startScale) * t
+                                    val diff = 1f / newScale - 1f / state.scale
+                                    state.offsetX += px * diff
+                                    state.scale = newScale
+                                    state.scrollBy(-py * diff * state.height)
+                                    state.invalidate()
+                                }
+                            } finally {
+                                state.isScaleAnimating = false
+                            }
+                        }
+                    }
+                }
+
                 awaitEachGesture {
                     val firstDown = awaitFirstDown(pass = PointerEventPass.Initial)
                     state.animationJob?.cancel()
@@ -176,63 +238,10 @@ fun ImageViewerContinuous(
 
                         if (waitForCleanUp(secondDown.id, doubleTapTimeout, touchSlop) != null) {
                             // Double tap: toggle zoom
-                            if (state.scale > state.minScale + 0.1f) {
-                                // Zoom out: animate offsetX to 0, anchor Y to tap point
-                                val py = secondDown.position.y / state.height - 0.5f
-                                state.animationJob = scope.launch {
-                                    state.isScaleAnimating = true
-                                    try {
-                                        val startScale = state.scale
-                                        val startOffsetX = state.offsetX
-                                        val totalDiff = 1f / state.minScale - 1f / startScale
-                                        val px =
-                                            if (totalDiff != 0f) -startOffsetX / totalDiff else 0f
-                                        animate(
-                                            0f, 1f, animationSpec = spring(
-                                                stiffness = Spring.StiffnessMediumLow,
-                                                visibilityThreshold = 0.002f
-                                            )
-                                        ) { t, _ ->
-                                            val newScale =
-                                                startScale + (state.minScale - startScale) * t
-                                            val diff = 1f / newScale - 1f / state.scale
-                                            state.offsetX += px * diff
-                                            state.scale = newScale
-                                            state.scrollBy(-py * diff * state.height)
-                                            state.invalidate()
-                                        }
-                                    } finally {
-                                        state.isScaleAnimating = false
-                                    }
-                                }
-                            } else {
-                                // Zoom in at tap point
-                                val px = secondDown.position.x / state.width - 0.5f
-                                val py = secondDown.position.y / state.height - 0.5f
-                                state.animationJob = scope.launch {
-                                    state.isScaleAnimating = true
-                                    try {
-                                        val startScale = state.scale
-                                        val startOffsetX = state.offsetX
-                                        animate(
-                                            0f, 1f, animationSpec = spring(
-                                                stiffness = Spring.StiffnessMediumLow,
-                                                visibilityThreshold = 0.002f
-                                            )
-                                        ) { t, _ ->
-                                            val newScale =
-                                                startScale + (state.doubleTapScale - startScale) * t
-                                            val diff = 1f / newScale - 1f / state.scale
-                                            state.offsetX += px * diff
-                                            state.scale = newScale
-                                            state.scrollBy(-py * diff * state.height)
-                                            state.invalidate()
-                                        }
-                                    } finally {
-                                        state.isScaleAnimating = false
-                                    }
-                                }
-                            }
+                            toggleZoomAt(
+                                secondDown.position.x / state.width - 0.5f,
+                                secondDown.position.y / state.height - 0.5f
+                            )
                         } else {
                             // Double tap drag: zoom by dragging
                             val velocityTracker = VelocityTracker()
@@ -332,6 +341,15 @@ fun ImageViewerContinuous(
                         var zoomOriginY = 0f
                         var lastMoveTime = firstDown.uptimeMillis
                         var lastEventTime = firstDown.uptimeMillis
+                        // Two-finger tap state: a quick, near-stationary two-finger touch
+                        // toggles zoom like a double tap (see toggleZoomAt).
+                        var dragMove = 0f
+                        var multiDownTime = 0L
+                        var multiDownMidX = 0f
+                        var multiDownMidY = 0f
+                        var multiPointers = 0
+                        var multiMove = 0f
+                        var multiZoomed = false
 
                         var canceled = false
                         try {
@@ -345,6 +363,17 @@ fun ImageViewerContinuous(
                                         if (single) {
                                             longPressJob?.cancel()
                                             velocityTracker.resetTracking()
+                                            val pressed = event.changes.filter { it.pressed }
+                                            multiPointers = pressed.size
+                                            multiDownTime = change.uptimeMillis
+                                            multiDownMidX =
+                                                pressed.sumOf { it.position.x.toDouble() }
+                                                    .toFloat() / pressed.size
+                                            multiDownMidY =
+                                                pressed.sumOf { it.position.y.toDouble() }
+                                                    .toFloat() / pressed.size
+                                            multiMove = 0f
+                                            multiZoomed = false
                                         }
                                         single = false
                                     }
@@ -363,6 +392,11 @@ fun ImageViewerContinuous(
 
                                     if (pan != Offset.Zero || zoom != 1f) {
                                         longPressJob?.cancel()
+                                        dragMove += hypot(pan.x, pan.y)
+                                        if (!single) {
+                                            multiMove += hypot(pan.x, pan.y)
+                                            if (zoom != 1f) multiZoomed = true
+                                        }
 
                                         if (zoom != 1f) {
                                             velocityTracker.resetTracking()
@@ -402,6 +436,20 @@ fun ImageViewerContinuous(
 
                         longPressJob?.cancel()
                         if (longPressed || canceled) return@awaitEachGesture
+
+                        if (!single && !multiZoomed && multiPointers >= 2 &&
+                            state.width > 0 && state.height > 0 &&
+                            lastEventTime - multiDownTime < doubleTapTimeout &&
+                            multiMove < touchSlop && dragMove < touchSlop
+                        ) {
+                            // Two-finger tap: toggle zoom like a double tap, anchored at
+                            // the fingers' midpoint from when the second one landed.
+                            toggleZoomAt(
+                                multiDownMidX / state.width - 0.5f,
+                                multiDownMidY / state.height - 0.5f
+                            )
+                            return@awaitEachGesture
+                        }
 
                         if (!snapScaleIntoBounds(zoomOriginX, zoomOriginY)) {
                             // Scale in bounds: fling pan or snap offsetX

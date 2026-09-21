@@ -21,6 +21,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     companion object {
         const val MAX_VISIBLE_PAGES = 4
         const val MAX_PAGE_WALK = 64
+        /** Pages past the visible window whose tiles generate while idle (see prewarmTargets). */
+        const val PREWARM_AHEAD_PAGES = 2
     }
 
     data class ContinuousPosition(
@@ -479,12 +481,20 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
     private class VisiblePage(val page: ImagePage, val docTop: Float, val pageHeight: Float)
 
+    /**
+     * A page past the visible window queued for idle tile generation: [docTop] is the same
+     * document-space top the draw walk would compute for it, so the prewarmed grid matches
+     * what drawing asks for once the page scrolls into view.
+     */
+    private class PrewarmTarget(val page: ImagePage.ImageSingle, val docTop: Float)
+
     private class ContinuousRenderSnapshot(
         val pages: List<VisiblePage>,
         val scale: Float,
         val offsetX: Float,
         val cameraDocY: Float,
         val suppressGeneration: Boolean,
+        val prewarmTargets: List<PrewarmTarget>,
     )
 
     override fun captureRenderState(): Any = synchronized(scrollLock) {
@@ -524,6 +534,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val visTop = 0.5f * screenH - screenH / (2f * scale)
         val screenBot = 0.5f * screenH + screenH / (2f * scale)
         val visBot = screenBot + tiles.preferredTileSize / scale
+        // Same one-tile margin above as visBot carries below: scrolling up had no lookahead,
+        // so tiles only started generating once visible. Page inclusion uses this; the
+        // scrolled-through check below keeps the unextended visTop so read position doesn't
+        // advance for a page that is still half on screen.
+        val visTopTiles = visTop - tiles.preferredTileSize / scale
 
         fun isScrolledThrough(top: Float, pageHeight: Float) =
             pageHeight > 0f && (top + pageHeight <= screenBot || top < visTop)
@@ -534,7 +549,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var iBack = -1
         var docTopBack = anchorDocYInternal
         var above = 0
-        while (yTop > visTop && iBack >= -MAX_VISIBLE_PAGES) {
+        while (yTop > visTopTiles && iBack >= -MAX_VISIBLE_PAGES) {
             val page = getPage(iBack) ?: break
             above = -iBack
             val pageHeight = getPageHeight(page)
@@ -562,13 +577,39 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             hasPrev = true
             val pageHeight = getPageHeight(page)
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
-            if (y + pageHeight > visTop && page.isDecoded) {
+            if (y + pageHeight > visTopTiles && page.isDecoded) {
                 pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
             y += prevSlot
             i++
+        }
+
+        // Idle decode-ahead: the next pages below the visible window, with the same docTop
+        // math as the walk above. Drawn pages never touch these - renderSnapshot prewarms
+        // their tiles while nothing is moving, so scrolling down arrives sharp. Kept out of
+        // pages/pagesBelow/onScreenPages: nothing here is on screen yet.
+        val prewarmTargets = ArrayList<PrewarmTarget>(PREWARM_AHEAD_PAGES)
+        // Gated like renderSnapshot's prewarm call below: no fetches for off-screen pages
+        // while a gesture or fling is driving the camera, when they'd be stale on arrival.
+        if (!isScaleAnimating && !isFlinging) {
+            var extra = 0
+            while (extra < PREWARM_AHEAD_PAGES && i <= MAX_VISIBLE_PAGES) {
+                val page = getPage(i) ?: break
+                if (hasPrev) docTop += prevSlot.toDouble()
+                hasPrev = true
+                val pageHeight = getPageHeight(page)
+                if (pageHeight <= 0f) break
+                val single = page as? ImagePage.ImageSingle
+                if (single != null && single.isDecoded && !single.destroyed) {
+                    prewarmTargets.add(PrewarmTarget(single, docTop.toFloat()))
+                }
+                prevSlot = pageHeight + pageGapPx
+                y += prevSlot
+                i++
+                extra++
+            }
         }
 
         onScreenPages = pages.map { it.page }
@@ -580,7 +621,9 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             try { onPageScrolledThrough?.invoke(it) } catch (_: Throwable) {}
         }
 
-        ContinuousRenderSnapshot(pages, scale, offsetX, cameraDocY, isScaleAnimating || isFlinging)
+        ContinuousRenderSnapshot(
+            pages, scale, offsetX, cameraDocY, isScaleAnimating || isFlinging, prewarmTargets
+        )
     }
 
     override suspend fun renderSnapshot(
@@ -597,6 +640,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val anchorX = dstW / 2f + s.scale * (s.offsetX * dstW + WebGpuRenderer.offsetX * dstW)
         val anchorY = dstH / 2f - s.scale * s.cameraDocY + s.scale * WebGpuRenderer.offsetY * dstH
 
+        var allCovered = true
         if (hasImagePage) {
             renderPass(encoder, texture) { pass ->
                 s.pages.forEach { vp ->
@@ -615,6 +659,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         s.scale,
                         s.suppressGeneration
                     )
+                    if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
                         page.forEachImage { image, srcOffsetX, sideScale ->
                             if (image.mipmaps.isEmpty()) return@forEachImage
@@ -682,6 +727,17 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val x = (targetX - dstW / 2f) / (renderScale * dstW)
             val y = (targetY - dstH / 2f) / (renderScale * dstH)
             page.renderLoaded(encoder, x, y, renderScale, texture)
+        }
+
+        // Idle decode-ahead: only once everything on screen is sharp, so this never steals
+        // generation bandwidth from visible tiles - and never while a gesture or fling is
+        // driving the camera, when the targets would be stale by the time they generate.
+        if (!s.suppressGeneration && allCovered) {
+            s.prewarmTargets.forEach { target ->
+                tiles.prewarmContinuous(
+                    target.page, texture, s.cameraDocY, target.docTop, s.offsetX, s.scale
+                )
+            }
         }
     }
 }
