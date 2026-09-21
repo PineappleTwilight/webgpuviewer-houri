@@ -293,11 +293,13 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             else -> getPage(if (isReversed) 1 else -1)
         }
         // Only used to pre-warm the transition cache while at rest (see renderSnapshot), so
-        // there's no need to look it up while a turn is already in progress.
+        // there's no need to look it up while a turn is already in progress. Both neighbors:
+        // turning back shows the previous page's tiles just as live as turning forward.
         val nextPage = if (offset == 0f) getPage(1) else null
+        val prevPage = if (offset == 0f) getPage(-1) else null
         onScreenPages = listOfNotNull(currentPage, adjacentPage)
         return RenderSnapshot(
-            currentPage, adjacentPage, nextPage, offset, transition, firstPos, currentPos
+            currentPage, adjacentPage, nextPage, prevPage, offset, transition, firstPos, currentPos
         )
     }
 
@@ -305,6 +307,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         val currentPage: ImagePage,
         val adjacentPage: ImagePage?,
         val nextPage: ImagePage?,
+        val prevPage: ImagePage?,
         val offset: Float,
         val transition: Transition,
         val firstPos: Offset,
@@ -368,14 +371,18 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
         val covered = page.drawLive(encoder, texture, tiles)
 
-        // Opportunistic: once the current page's tiles settle, prewarm the next page's too,
-        // so a transition into it starts already mostly sharp (Transition.getCachedTexture
-        // seeds itself and layers tiles in live, so this no longer needs to be complete
-        // first). Gated on atHome since the cache is keyed by (x, y, scale).
+        // Opportunistic: once the current page's tiles settle, prewarm both neighbors'
+        // too, so a transition into either starts already mostly sharp
+        // (Transition.getCachedTexture seeds itself and layers tiles in live, so this no
+        // longer needs to be complete first). Warming the previous page as well is what
+        // keeps scrolling back from flashing half-generated tiles. Gated on atHome since
+        // the cache is keyed by (x, y, scale).
         if (covered && page is ImagePage.ImageSingle && page.atHome) {
-            val next = s.nextPage as? ImagePage.ImageSingle
-            if (next != null && next.highQuality && !next.isAnimated && next.atHome) {
-                tiles.prewarm(next, texture)
+            listOfNotNull(s.nextPage, s.prevPage).forEach { neighbor ->
+                val single = neighbor as? ImagePage.ImageSingle
+                if (single != null && single.highQuality && !single.isAnimated && single.atHome) {
+                    tiles.prewarm(single, texture)
+                }
             }
         }
     }
