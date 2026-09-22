@@ -36,6 +36,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
@@ -127,6 +128,123 @@ class WebGpuRenderer {
         @Volatile
         private var deviceLost = false
 
+        /**
+         * Bumped on every successful device creation after the first: filters and other
+         * device-bound caches compare against it to detect a recreation and rebuild
+         * (see [ca.mpreg.webgpuviewer.filter.Filter.syncDevice]). Starts 0 and is only
+         * ever incremented by [recreateDevice], so instances built before any loss never
+         * spuriously reset.
+         */
+        var deviceGeneration = 0L
+            private set
+
+        /**
+         * Notified on the device-lost callback thread when the device is lost - the previous
+         * behaviour was a silent permanent latch ([deviceLost] set, every later frame dropped).
+         * Listeners typically call [reinit] to try to acquire a fresh device.
+         */
+        fun interface DeviceLostListener {
+            fun onDeviceLost(reason: Int, message: String)
+        }
+
+        private val deviceLostListeners = CopyOnWriteArrayList<DeviceLostListener>()
+
+        fun addDeviceLostListener(listener: DeviceLostListener) {
+            deviceLostListeners.add(listener)
+        }
+
+        fun removeDeviceLostListener(listener: DeviceLostListener) {
+            deviceLostListeners.remove(listener)
+        }
+
+        private fun notifyDeviceLost(reason: Int, message: String) {
+            for (listener in deviceLostListeners) {
+                try {
+                    listener.onDeviceLost(reason, message)
+                } catch (e: Throwable) {
+                    Log.w("WebGpuRenderer", "device-lost listener failed", e)
+                }
+            }
+        }
+
+        private fun deviceDescriptor() = GPUDeviceDescriptor(
+            deviceLostCallback = DeviceLostCallback { lostDevice, reason, message ->
+                deviceLost = true
+                Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$lostDevice")
+                notifyDeviceLost(reason, message)
+            },
+            deviceLostCallbackExecutor = Executor(Runnable::run),
+            uncapturedErrorCallback = defaultUncapturedErrorCallback,
+            uncapturedErrorCallbackExecutor = Executor(Runnable::run),
+            requiredFeatures = requiredFeaturesFor(adapter),
+        )
+
+        private fun requiredFeaturesFor(adapter: GPUAdapter): IntArray =
+            if (runCatching { adapter.hasFeature(FeatureName.TimestampQuery) }.getOrDefault(false)) {
+                intArrayOf(FeatureName.TimestampQuery)
+            } else {
+                intArrayOf()
+            }
+
+        /**
+         * Retry acquiring the device after [deviceLost] (or a failed init) instead of staying
+         * latched dead. Suspends on the render dispatcher under the render mutex, so it never
+         * runs against an in-flight frame. True when the device is usable afterwards.
+         * Device-only: per-instance GPU state (surfaces, tile atlas, filter resources) is
+         * dropped by the owner via [recoverFromDeviceLoss], which calls this first.
+         */
+        suspend fun reinit(): Boolean {
+            if (isAvailable) return true
+            return try {
+                withContext(dispatcher) {
+                    mutex.withLock {
+                        recreateDeviceLocked()
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "reinit failed", e)
+                false
+            }
+        }
+
+        /**
+         * Device-only recreation shared by [reinit] and [recoverFromDeviceLoss].
+         * Must hold [mutex].
+         */
+        internal suspend fun recreateDeviceLocked(): Boolean {
+            if (isAvailable) return true
+            return try {
+                device = adapter.requestDevice(deviceDescriptor())
+                initialized = true
+                deviceLost = false
+                initError = null
+                deviceGeneration++
+                Log.i("WebGpuRenderer", "recreated the device (generation $deviceGeneration)")
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "recreateDevice requestDevice failed", e)
+                initError = e
+                false
+            }
+        }
+
+        /** Non-suspending best-effort [reinit] for callbacks that cannot suspend. */
+        fun requestReinit() {
+            try {
+                runBlocking(dispatcher) {
+                    reinit()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "requestReinit dispatch failed", e)
+            }
+        }
+
         val isAvailable: Boolean get() = initialized && !deviceLost && initError == null &&
             ::instance.isInitialized && ::adapter.isInitialized && ::device.isInitialized
 
@@ -189,25 +307,7 @@ class WebGpuRenderer {
                     }
                     adapter = gotAdapter
 
-                    val requiredFeatures =
-                        if (runCatching { adapter.hasFeature(FeatureName.TimestampQuery) }.getOrDefault(false)) {
-                            intArrayOf(FeatureName.TimestampQuery)
-                        } else {
-                            intArrayOf()
-                        }
-
-                    device = adapter.requestDevice(
-                        GPUDeviceDescriptor(
-                            deviceLostCallback = DeviceLostCallback { lostDevice, reason, message ->
-                                deviceLost = true
-                                Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$lostDevice")
-                            },
-                            deviceLostCallbackExecutor = Executor(Runnable::run),
-                            uncapturedErrorCallback = defaultUncapturedErrorCallback,
-                            uncapturedErrorCallbackExecutor = Executor(Runnable::run),
-                            requiredFeatures = requiredFeatures,
-                        )
-                    )
+                    device = adapter.requestDevice(deviceDescriptor())
                     initialized = true
                     deviceLost = false
                     initError = null
@@ -272,6 +372,92 @@ class WebGpuRenderer {
 
     private var scope: CoroutineScope? = null
 
+    // Retained so [recoverFromDeviceLoss] can rebuild the swapchain without waiting for
+    // the app to hand over a new surface (no new surface callback fires on device loss).
+    private var platformSurface: Surface? = null
+
+    /**
+     * Full per-instance recovery after a device loss: recreates the shared device, drops
+     * this instance's device-bound caches (filter pool, stale swapchain) and rebuilds the
+     * swapchain from the retained platform surface. Tile caches live in
+     * [ca.mpreg.webgpuviewer.viewer.ImageViewerState] and are dropped by its own recovery,
+     * which calls this first. True when frames can draw again afterwards.
+     */
+    suspend fun recoverFromDeviceLoss(): Boolean {
+        if (isAvailable) return true
+        return try {
+            withContext(dispatcher) {
+                mutex.withLock {
+                    if (isAvailable) return@withLock true
+                    if (!recreateDeviceLocked()) return@withLock false
+                    try {
+                        filters.cleanup()
+                    } catch (e: Throwable) {
+                        Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
+                    }
+                    val platform = platformSurface
+                    if (platform == null || !platform.isValid) {
+                        Log.w("WebGpuRenderer", "recovery has no live platform surface; next init() rebuilds it")
+                        return@withLock true
+                    }
+                    replaceSurface(platform)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.e("WebGpuRenderer", "recoverFromDeviceLoss failed", e)
+            false
+        }
+    }
+
+    /**
+     * Close the live swapchain (if any) and build a fresh one from [platform] on the
+     * current device. Must hold [mutex]. Returns false and keeps the previous surface
+     * when the build fails.
+     */
+    private fun replaceSurface(platform: Surface): Boolean {
+        if (width < 8 || height < 8) {
+            Log.w("WebGpuRenderer", "replaceSurface skipped for tiny ${width}x$height")
+            return false
+        }
+        return try {
+            if (!platform.isValid) throw IllegalStateException("Platform surface became invalid before createSurface")
+            // Build the replacement before touching the live one: a frame already in
+            // flight may still be reading it, and a failed create must leave the
+            // previous surface drawing rather than a null gap.
+            val replacement = instance.createSurface(
+                GPUSurfaceDescriptor(
+                    surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
+                        safeWindowFromSurface(platform)
+                    )
+                )
+            ).apply {
+                configure(
+                    GPUSurfaceConfiguration(
+                        device,
+                        width,
+                        height,
+                        TextureFormat.RGBA8Unorm,
+                        TextureUsage.RenderAttachment
+                    )
+                )
+            }
+            val previous = surface
+            surface = replacement
+            try {
+                previous?.close()
+            } catch (_: Throwable) {
+            }
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.e("WebGpuRenderer", "Failed to create surface ${width}x$height, keeping previous", e)
+            false
+        }
+    }
+
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         if (!isAvailable) {
@@ -306,39 +492,18 @@ class WebGpuRenderer {
         this.scope = scope
         this.width = width
         this.height = height
+        this.platformSurface = surface
 
         val isOnDispatcherThread = isOnRenderThread()
 
         val initSurface = {
             try {
                 if (!surface.isValid) throw IllegalStateException("Surface became invalid before createSurface")
-                val current = this@WebGpuRenderer.surface
-                try { current?.close() } catch (_: Throwable) {}
-                this@WebGpuRenderer.surface = surface.let {
-                    instance.createSurface(
-                        GPUSurfaceDescriptor(
-                            surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
-                                safeWindowFromSurface(it)
-                            )
-                        )
-                    ).apply {
-                        configure(
-                            GPUSurfaceConfiguration(
-                                device,
-                                width,
-                                height,
-                                TextureFormat.RGBA8Unorm,
-                                TextureUsage.RenderAttachment
-                            )
-                        )
-                    }
-                }
+                replaceSurface(surface)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
                 Log.e("WebGpuRenderer", "Failed to create surface ${width}x$height", e)
-                try { this@WebGpuRenderer.surface?.close() } catch (_: Throwable) {}
-                this@WebGpuRenderer.surface = null
             }
         }
 

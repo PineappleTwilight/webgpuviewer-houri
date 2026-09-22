@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.webgpu.BufferUsage
 import androidx.webgpu.GPUBuffer
 import androidx.webgpu.GPUBufferDescriptor
+import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureView
 import ca.mpreg.webgpuviewer.ImageUtil
@@ -140,8 +141,11 @@ class Image private constructor(
 
             // No render mutex: Mipmap.create yields between upload chunks so queued frames get
             // the thread back. Safe since the image isn't reachable from any page yet.
+            // The uniform buffer is created here too: buffer creation is GPU work and
+            // belongs on the render dispatcher, not the caller's thread.
             WebGpuRenderer.onDispatcher { device ->
                 try {
+                    image.ensureBuffer(device)
                     for (data in mipmapDataList) {
                         image.mipmaps.add(
                             Mipmap.create(data.pixels, data.w, data.h, data.scale, tilesize)
@@ -151,6 +155,7 @@ class Image private constructor(
                     Log.e("Renderer", "Error creating image", e)
                     image.mipmaps.forEach { it.cleanup() }
                     image.mipmaps.clear()
+                    image.destroyBuffer()
                     throw e
                 }
             }
@@ -160,11 +165,13 @@ class Image private constructor(
 
         suspend operator fun invoke(width: Int, height: Int): Image {
             return Image(width, height).apply {
-                WebGpuRenderer.withContext { _ ->
+                WebGpuRenderer.withContext { device ->
                     try {
+                        ensureBuffer(device)
                         mipmaps.add(Mipmap(width, height))
                     } catch (e: Exception) {
                         Log.e("Renderer", "Error creating drawable image", e)
+                        destroyBuffer()
                         throw e
                     }
                 }
@@ -175,17 +182,25 @@ class Image private constructor(
     @Volatile
     private var cleaned = false
 
-    private var _buffer: GPUBuffer? = try {
-        WebGpuRenderer.device.createBuffer(
-            GPUBufferDescriptor(size = BUFFER_SIZE, usage = BufferUsage.CopyDst or BufferUsage.Uniform)
-        )
-    } catch (e: Throwable) {
-        android.util.Log.e("Renderer", "Image buffer create failed", e)
-        null
-    }
+    @Volatile
+    private var _buffer: GPUBuffer? = null
 
     val buffer: GPUBuffer
         get() = _buffer ?: error("Image buffer accessed after cleanup (cleaned=$cleaned)")
+
+    internal fun ensureBuffer(device: GPUDevice): GPUBuffer {
+        _buffer?.let { return it }
+        val created = device.createBuffer(
+            GPUBufferDescriptor(size = BUFFER_SIZE, usage = BufferUsage.CopyDst or BufferUsage.Uniform)
+        )
+        _buffer = created
+        return created
+    }
+
+    private fun destroyBuffer() {
+        try { _buffer?.destroy() } catch (_: Throwable) {}
+        _buffer = null
+    }
 
     val mipmaps: MutableList<Mipmap> = mutableListOf()
 
@@ -195,8 +210,7 @@ class Image private constructor(
         cleaned = true
         mipmaps.forEach { try { it.cleanup() } catch (_: Throwable) {} }
         mipmaps.clear()
-        try { _buffer?.destroy() } catch (_: Throwable) {}
-        _buffer = null
+        destroyBuffer()
     }
 
     val isCleaned: Boolean get() = cleaned

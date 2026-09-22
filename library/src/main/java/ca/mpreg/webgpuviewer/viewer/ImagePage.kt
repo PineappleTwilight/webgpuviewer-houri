@@ -415,6 +415,13 @@ open class ImagePage {
             this.frames = frames
             currentFrameImage = frames.firstOrNull()?.first
 
+            // A single frame never advances: publish it once instead of looping
+            // invalidate()s at its duration forever.
+            if (frames.size < 2) {
+                invalidate()
+                return
+            }
+
             // Use the page's scope if available, otherwise use the shared background scope
             val loopScope = scope ?: cleanupScope
             animationLoop = loopScope.launch {
@@ -424,8 +431,11 @@ open class ImagePage {
                         currentFrameImage = img
                         // Keeps running off screen - frames stay in step with their durations,
                         // and invalidate() asks for a redraw only while there is one to ask for.
+                        // Floored at MIN_ANIM_FRAME_MS: degenerate (0-10ms) GIF delays would
+                        // otherwise churn frameVersion and wake the render loop uncapped.
+                        // Animated pages stay on the fast path, never the tile cache.
                         invalidate()
-                        delay(duration.coerceAtLeast(0).milliseconds)
+                        delay(duration.coerceAtLeast(MIN_ANIM_FRAME_MS).milliseconds)
                     } ?: break
                     frameIndex = (frameIndex + 1) % (this@ImageSingle.frames?.size ?: 1)
                 }
@@ -1145,6 +1155,9 @@ open class ImagePage {
 
         /** Default [fadeIn] length. */
         const val FADE_MILLIS = 200
+
+        /** Minimum animation frame duration - caps animated pages at ~60fps. */
+        const val MIN_ANIM_FRAME_MS = 16
     }
 
     /** True once page content has been decoded/is otherwise ready to draw. */

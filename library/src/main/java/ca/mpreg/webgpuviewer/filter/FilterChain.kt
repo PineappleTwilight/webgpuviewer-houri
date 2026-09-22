@@ -130,7 +130,10 @@ class FilterChain {
 
                 val dstSlot = if (direct) null
                 else acquire(outWidth, outHeight, filter.outputFormat, filter.usesCompute)
-                val dst = dstSlot?.view ?: surface.createView()
+                // The swapchain texture rotates every frame, so a fresh view each frame would
+                // allocate and miss FilterFullscreen's bind-group cache forever - reuse one
+                // view per backing buffer instead.
+                val dst = dstSlot?.view ?: swapchainView(surface)
 
                 filter.run(this, encoder, src, width, height, dst, outWidth, outHeight)
 
@@ -143,11 +146,13 @@ class FilterChain {
 
                 if (last && !direct) tailBlit.run(
                     this, encoder, src, width, height,
-                    surface.createView(), surface.width, surface.height
+                    swapchainView(surface), surface.width, surface.height
                 )
             }
         } finally {
-            srcSlot?.let { it.inUse = false }
+            // A throwing filter must not strand slots: the pool only ever lives within one
+            // frame, so hand everything back rather than just the current source.
+            releaseAll()
             active.clear()
         }
     }
@@ -299,6 +304,28 @@ class FilterChain {
         pool.clear()
         poolTotalBytes = 0L
         sceneSlot = null
+        for ((_, view) in swapchainViews) {
+            try { view.close() } catch (_: Throwable) {}
+        }
+        swapchainViews.clear()
+    }
+
+    private val swapchainViews = HashMap<Long, GPUTextureView>()
+
+    private fun swapchainView(surface: GPUTexture): GPUTextureView {
+        val handle = surface.handle
+        swapchainViews[handle]?.let { return it }
+        if (swapchainViews.size >= MAX_CACHED_SWAP_VIEWS) {
+            val itr = swapchainViews.entries.iterator()
+            while (itr.hasNext()) {
+                val entry = itr.next()
+                if (entry.key != handle) {
+                    try { entry.value.close() } catch (_: Throwable) {}
+                    itr.remove()
+                }
+            }
+        }
+        return surface.createView().also { swapchainViews[handle] = it }
     }
 
     // ---- tail blit ----
@@ -333,6 +360,9 @@ class FilterChain {
     private companion object {
         /** Textures kept per size and format, so consecutive frames don't share one. */
         const val RING = 3
+
+        /** Backing buffers a rotating swapchain ever holds at once - one cached view each. */
+        const val MAX_CACHED_SWAP_VIEWS = 4
 
         const val BLIT_FS = """
 @group(0) @binding(0) var src: texture_2d<f32>;

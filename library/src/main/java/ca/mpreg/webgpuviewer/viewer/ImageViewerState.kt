@@ -39,6 +39,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -268,7 +269,15 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             // Drop the wake this frame's invalidate left, or going idle costs a spurious one.
             renderWake.tryReceive()
             // Capture render state on main thread before any thread switching
-            val snapshot = captureRenderState() ?: continue
+            val snapshot = captureRenderState()
+            if (snapshot == null) {
+                // No page to draw yet: back off instead of spinning a vsync-rate
+                // capture loop. Coalescing is preserved - dirty was already cleared
+                // above, and any invalidate during the delay re-sets it with a
+                // buffered wake, so nothing is dropped.
+                delay(IDLE_BACKOFF_MS)
+                continue
+            }
             // Now render on GPU thread with captured state
             drawing = launch(dispatcher) {
                 // Nothing drawn - ask for the frame again.
@@ -405,5 +414,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         animationJob?.cancel()
         tiles.cleanup()
         renderer.cleanup()
+    }
+
+    companion object {
+        /** Idle pause when collect() has no page to draw - keeps it off a vsync-rate spin. */
+        const val IDLE_BACKOFF_MS = 32L
     }
 }

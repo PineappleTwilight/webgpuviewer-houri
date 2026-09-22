@@ -1,5 +1,6 @@
 package ca.mpreg.webgpuviewer.renderer
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.webgpu.FilterMode
 import androidx.webgpu.GPUBindGroup
@@ -50,15 +51,31 @@ class UpscalerArtCnn : Upscaler() {
     /** Eight 3x3 convolutions plus pass 9's tap: an output pixel reads eight input pixels out. */
     override val halo: Int get() = 8
 
-    override val supported: Boolean get() = !failed
+    override val supported: Boolean
+        get() = SystemClock.uptimeMillis() - lastFailureMs >= backoffMs
 
     @Volatile
-    private var failed = false
+    private var failureCount = 0
+
+    @Volatile
+    private var lastFailureMs = 0L
+
+    @Volatile
+    private var backoffMs = 0L
+
+    /** Clear the failure history so the next [input] rebuilds pipelines immediately. */
+    fun reset() {
+        failureCount = 0
+        lastFailureMs = 0L
+        backoffMs = 0L
+    }
 
     override val inputView: GPUTextureView? get() = textures?.inputView
 
     override fun input(size: Int): GPUTexture? {
-        if (failed) return null
+        // Inside the backoff window this answers null, so the tile path falls back to
+        // Catmull-Rom for this tile; once the window lapses the pipelines are re-attempted.
+        if (!supported) return null
         return try {
             // Not in [encode]: this is the last point the tile path can still change its mind,
             // so a device that cannot build them falls back instead of committing a blank tile.
@@ -77,7 +94,6 @@ class UpscalerArtCnn : Upscaler() {
 
     override fun encode(encoder: GPUCommandEncoder, size: Int) {
         val t = textures ?: return
-        if (failed) return
         try {
             // One pass for all nine: WebGPU orders dispatches within a pass and inserts the
             // barriers, and nine begin/end pairs per tile is real work on a tiler.
@@ -98,7 +114,6 @@ class UpscalerArtCnn : Upscaler() {
 
     override fun resolve(pass: GPURenderPassEncoder) {
         val t = textures ?: return
-        if (failed) return
         try {
             pass.setPipeline(resolvePipeline)
             pass.setBindGroup(0, t.resolveGroup)
@@ -113,12 +128,18 @@ class UpscalerArtCnn : Upscaler() {
         textures = null
     }
 
-    /** Give up for good - the tile path reads [supported] and goes back to Catmull-Rom. */
+    /**
+     * Back off and let the tile path fall back to Catmull-Rom - a transient failure
+     * (OOM, lost device) must not latch this off forever. The next [input] after the
+     * window re-attempts [pipelines]; [reset] retries immediately.
+     */
     private fun fail(e: Exception) {
-        if (failed) return
-        failed = true
-        Log.w("UpscalerArtCnn", "unavailable, falling back to Catmull-Rom", e)
+        failureCount++
+        lastFailureMs = SystemClock.uptimeMillis()
+        backoffMs = (RETRY_BASE_MS shl (failureCount - 1).coerceAtMost(6)).coerceAtMost(RETRY_MAX_MS)
+        Log.w("UpscalerArtCnn", "unavailable, falling back to Catmull-Rom for ${backoffMs}ms", e)
         cleanup()
+        built = null
     }
 
     // ---- pipelines ----
@@ -275,6 +296,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     private companion object {
         const val LABEL = "ArtCNN"
+
+        const val RETRY_BASE_MS = 500L
+        const val RETRY_MAX_MS = 30_000L
 
         /** Matches `@workgroup_size(8, 8)` in every pass - see the class doc for why 8. */
         const val WORKGROUP = 8
