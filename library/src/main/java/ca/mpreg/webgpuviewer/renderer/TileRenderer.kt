@@ -181,7 +181,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         /** Measurements a size needs before it is allowed to win, or lose, a comparison. */
         private const val TILE_SIZE_SAMPLES = 4
 
-        /** How much cheaper per pixel another size must look before the grids are re-cut. */
+        /** How much cheaper per pixel another size must look before [preferredTileSize] switches. */
         private const val TILE_SIZE_MARGIN = 1.15
 
         /** FrameParams: snap, dst_size, clip, then ts and the atlas's side. */
@@ -422,13 +422,18 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * Pick the size whose pixels are cheapest, among those with [TILE_SIZE_SAMPLES] readings and
      * a tile inside [BATCH_TARGET_NS] - one tile is the smallest unit [schedule] can pace, so a
      * tile costing more than a batch's target is itself the hitch. A challenger needs
-     * [TILE_SIZE_MARGIN] to win, since switching re-cuts every grid.
+     * [TILE_SIZE_MARGIN] to win, so measurement noise alone can't oscillate [preferredTileSize].
+     *
+     * A switch never re-cuts a live grid: existing grids keep the size they were cut at (the
+     * atlas holds slabs of every size, so mixed cuts draw side by side), and only a new grid
+     * ([newGrid]) or the next wipe for scale/centerYOffset reasons adopts the new preferred
+     * size - see [drawCore]. Re-cutting on the switch alone is what made high-quality tiles
+     * drop out and back mid-scroll while only the scroll moved.
      *
      * Frozen while [staged], because the sizes are then not comparable: the size in use is timed
      * generating real tiles through the rescaler, every other size by [probeTileSize] without one.
      * So the size in use reads as expensive, this switches away, and the size it switches to
-     * becomes expensive in turn - and every switch re-cuts every grid (see [drawCore]), which on
-     * screen is the high-quality tiles dropping out and back while only the scroll moves.
+     * becomes expensive in turn.
      */
     private fun reconsiderTileSize() {
         if (staged) return
@@ -454,7 +459,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
         if (best == current) return
 
-        // Grids re-cut on their next draw - see drawCore's invalidation.
+        // Only affects new grids and the next wipe for scale/height reasons - see drawCore.
         preferredTileSize = TILE_SIZES[best]
         invalidate()
     }
@@ -1121,7 +1126,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val a = pagedAnchor(page, dst, 0f, 0f, 1f)
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
-        if (st.scale != a.pageScale || st.tileSize != preferredTileSize) {
+        // Only a scale change re-cuts; a preferred-size change rides the existing cut until
+        // the next wipe - see [drawCore].
+        if (st.scale != a.pageScale) {
             releaseTiles(st)
             st.pending.clear()
             st.scale = a.pageScale
@@ -1202,9 +1209,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val a = continuousAnchor(page, dst, cameraDocY, docTop, viewerOffsetX, scale) ?: return
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
-        if (st.scale != a.pageScale || st.centerYOffset != a.centerYOffset ||
-            st.tileSize != preferredTileSize
-        ) {
+        // Preferred-size changes don't wipe either - see [drawCore].
+        if (st.scale != a.pageScale || st.centerYOffset != a.centerYOffset) {
             releaseTiles(st)
             st.pending.clear()
             st.scale = a.pageScale
@@ -1354,12 +1360,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             }
         }
 
-        if (st.scale != pageScale || st.centerYOffset != centerYOffset ||
-            st.tileSize != preferredTileSize
-        ) {
-            // A changed centerYOffset at fixed scale means a placeholder corrected its guessed
-            // height - invalidate the same way a scale change does. A changed preferred size
-            // rides the same path: this is the one moment a grid can be re-cut for free.
+        // A changed centerYOffset at fixed scale means a placeholder corrected its guessed
+        // height - invalidate the same way a scale change does. A preferred-size change alone
+        // must NOT wipe: mid-scroll that re-cut every grid is the visible chunk flicker (tiles
+        // regenerate from scratch while only the scroll moves). Existing grids keep their cut
+        // until a scale/height wipe like this one, adopting the current preferred size inside
+        // it; newGrid starts new grids at it. Mixed cuts draw side by side - the atlas holds
+        // slabs of every size and each grid carries its own tileSize into gridPlacement.
+        if (st.scale != pageScale || st.centerYOffset != centerYOffset) {
             releaseTiles(st)
             st.pending.clear()
             st.scale = pageScale
@@ -1387,7 +1395,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             return true
         }
 
-        val ts = TILE_SIZE.toFloat()
+        val ts = gp.ts
 
         // In tile coordinates, unlike wantT/wantB - not offset by centerYOffset, since a tile's
         // blit position is snapY + ty*ts regardless of which page it belongs to.
