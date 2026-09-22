@@ -248,8 +248,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
     /**
      * The size grids are cut at from now on, chosen by [reconsiderTileSize] from measured cost.
-     * A grid adopts it on its next draw, through the same wipe a scale change goes through, so
-     * this never disturbs one mid-gesture.
+     * Existing grids keep the size they were cut at - the atlas holds slabs of every size - and
+     * adopt a new value only inside a wipe for scale/centerYOffset reasons (see [drawCore]);
+     * [newGrid] cuts new ones at it. A switch alone never disturbs a live grid.
      */
     var preferredTileSize = TILE_SIZE
         set(value) {
@@ -296,6 +297,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         workerScope.launch {
             pages.values.forEach { releaseTiles(it) }
             previous.cleanup()
+            // Cost history was measured through the old rescaler; ranking sizes with it would
+            // bias picks. Start clean and let probes re-measure under the new one.
+            tileCostNs.fill(0.0)
+            tileSamples.fill(0)
             invalidate()
         }
     }
@@ -442,7 +447,6 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         if (totalTileCostNs(current) > BATCH_TARGET_NS && current > 0) {
             preferredTileSize = TILE_SIZES[current - 1]
-            invalidate()
             return
         }
 
@@ -459,9 +463,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
         if (best == current) return
 
-        // Only affects new grids and the next wipe for scale/height reasons - see drawCore.
+        // No invalidate: nothing on-screen changes on a switch - existing grids keep their cut
+        // and newGrid reads the value when it next runs. Only new grids and the next wipe for
+        // scale/height reasons pick it up - see drawCore.
         preferredTileSize = TILE_SIZES[best]
-        invalidate()
     }
 
     /** One cached tile: where in the [TileAtlas] it sits (packed), and when it was last drawn. */
@@ -629,6 +634,22 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.sweptRange = null
     }
 
+    /**
+     * Wipe [st] and re-cut it at [scale] under the current [preferredTileSize]. Shared by all
+     * three wipe sites for one invariant: the release must run before the tileSize
+     * reassignment, since [releaseTiles] frees slabs by [st]'s *old* tileSize and reordering
+     * would leak the old slots. A preferred-size change riding any of these sites unchecked is
+     * exactly how mid-scroll re-cuts flickered.
+     */
+    private fun rewindGrid(st: PageTiles, scale: Float) {
+        releaseTiles(st)
+        st.pending.clear()
+        st.scale = scale
+        st.tileSize = preferredTileSize
+        st.stable = false
+        invalidate()
+    }
+
     /** Packed atlas position - both halves are well inside 16 bits at any sane atlas size. */
     private fun pack(x: Int, y: Int) = (x shl 16) or y
 
@@ -641,7 +662,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         var scale: Float,
         val page: ImagePage.ImageSingle,
         val frameUniform: GPUBuffer,
-        /** Cut at this size until the grid is wiped, which is when it adopts a new preferred one. */
+        /**
+         * Cut at this size until [TileRenderer.rewindGrid] re-cuts it, which is when it
+         * adopts a new preferred one.
+         */
         var tileSize: Int,
     ) {
         val tiles = HashMap<Long, Tile>()
@@ -1129,12 +1153,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         // Only a scale change re-cuts; a preferred-size change rides the existing cut until
         // the next wipe - see [drawCore].
         if (st.scale != a.pageScale) {
-            releaseTiles(st)
-            st.pending.clear()
-            st.scale = a.pageScale
-            st.tileSize = preferredTileSize
-            st.stable = false
-            invalidate()
+            rewindGrid(st, a.pageScale)
         } else {
             st.stable = true
         }
@@ -1211,12 +1230,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         // Preferred-size changes don't wipe either - see [drawCore].
         if (st.scale != a.pageScale || st.centerYOffset != a.centerYOffset) {
-            releaseTiles(st)
-            st.pending.clear()
-            st.scale = a.pageScale
-            st.tileSize = preferredTileSize
-            st.stable = false
-            invalidate()
+            rewindGrid(st, a.pageScale)
         } else {
             st.stable = true
         }
@@ -1368,12 +1382,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         // it; newGrid starts new grids at it. Mixed cuts draw side by side - the atlas holds
         // slabs of every size and each grid carries its own tileSize into gridPlacement.
         if (st.scale != pageScale || st.centerYOffset != centerYOffset) {
-            releaseTiles(st)
-            st.pending.clear()
-            st.scale = pageScale
-            st.tileSize = preferredTileSize
-            st.stable = false
-            invalidate()
+            rewindGrid(st, pageScale)
         } else {
             // Two frames landing on the same scale isn't enough proof of settling while a
             // gesture/animation is still actively driving it.
