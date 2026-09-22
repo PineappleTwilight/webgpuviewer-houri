@@ -487,6 +487,9 @@ class WebGpuRenderer {
             this.scope = scope
             this.width = width.coerceIn(8, 8192)
             this.height = height.coerceIn(8, 8192)
+            // Retained even though no swapchain is built here: recoverFromDeviceLoss
+            // needs it to rebuild after a device loss without a new surface callback.
+            this.platformSurface = surface
             return
         }
         this.scope = scope
@@ -669,12 +672,5 @@ private val defaultUncapturedErrorCallback
     get(): UncapturedErrorCallback {
         return UncapturedErrorCallback { _, type, message ->
             Log.e("WebGpuRenderer", "Uncaptured WebGPU error type=$type: $message")
-        }
-    }
-
-private val defaultDeviceLostCallback
-    get(): DeviceLostCallback {
-        return DeviceLostCallback { device, reason, message ->
-            Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$device")
         }
     }
