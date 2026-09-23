@@ -128,8 +128,10 @@ fun ImageViewer(
                     if (waitForCleanUp(firstDown.id, doubleTapTimeout, touchSlop) != null) {
                         longPressJob?.cancel()
                         // A stop settles below and fires no tap, but still waits out the double
-                        // tap window: it can be the first of a pair.
-                        val secondDown = waitForDown(doubleTapTimeout)
+                        // tap window: it can be the first of a pair. Opt-out keeps secondDown
+                        // null: the single-tap path runs now, pair window never opens.
+                        val secondDown =
+                            if (state.doubleTapZoomEnabled) waitForDown(doubleTapTimeout) else null
                         if (secondDown == null) {
                             pageTurnJob?.cancel()
                             if (state.pageOffset != 0f) {

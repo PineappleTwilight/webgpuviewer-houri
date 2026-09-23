@@ -10,6 +10,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.util.fastCoerceAtLeast
 import androidx.compose.ui.util.fastCoerceAtMost
@@ -23,6 +24,9 @@ import androidx.webgpu.GPUTexture
 import androidx.webgpu.LoadOp
 import androidx.webgpu.StoreOp
 import ca.mpreg.webgpuviewer.filter.FilterChain
+import ca.mpreg.webgpuviewer.reader.OnReaderStateChanged
+import ca.mpreg.webgpuviewer.reader.PageAnchor
+import ca.mpreg.webgpuviewer.reader.ReaderState
 import ca.mpreg.webgpuviewer.renderer.Downscaler
 import ca.mpreg.webgpuviewer.renderer.DownscalerBox
 import ca.mpreg.webgpuviewer.renderer.Rescaler
@@ -42,6 +46,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 
 open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boolean = false) {
@@ -131,9 +136,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             field = v
 
             if (pageDelta != 0) {
-                try { onPageChange?.invoke(if (isReversed) -pageDelta else pageDelta) } catch (e: Throwable) {
-                    android.util.Log.w("ImageViewerState", "onPageChange failed", e)
-                }
+                notifyPageChange(if (isReversed) -pageDelta else pageDelta)
             }
 
             if (settling) {
@@ -188,6 +191,108 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     var onTap: ((Offset) -> Unit)? = null
     var onLongTap: ((Offset) -> Unit)? = null
 
+    /**
+     * Absolute page index for [captureAnchor]/[applyAnchor]. Seeded app-side via
+     * [seedPageIndex] (the host owns chapter page identity), then advanced by the
+     * signed deltas passed to [notifyPageChange]. [PageAnchor.UNSET_INDEX] until seeded.
+     */
+    @Volatile
+    var absolutePageIndex: Int = PageAnchor.UNSET_INDEX
+        private set
+
+    /** Host hook: last visible position after each coalesced [emitReaderState]. */
+    @Volatile
+    var onReaderStateChanged: OnReaderStateChanged? = null
+
+    @Volatile
+    private var lastReadyAtMs = 0L
+
+    /** Adopt the host's absolute index for the page now current (or about to be reported). */
+    fun seedPageIndex(index: Int) {
+        if (index < 0) return
+        absolutePageIndex = index
+    }
+
+    /**
+     * Single path for every whole-page crossing: keeps [absolutePageIndex] in lockstep
+     * with the host's chain, invokes [onPageChange], then force-emits a [ReaderState.Ready].
+     * Paged already resolves isReversed before calling; continuous passes raw scroll sign.
+     */
+    protected fun notifyPageChange(signedDelta: Int) {
+        if (absolutePageIndex != PageAnchor.UNSET_INDEX) {
+            absolutePageIndex = (absolutePageIndex + signedDelta).coerceAtLeast(0)
+        }
+        try {
+            onPageChange?.invoke(signedDelta)
+        } catch (e: Throwable) {
+            android.util.Log.w("ImageViewerState", "onPageChange failed", e)
+        }
+        emitReaderState(force = true)
+    }
+
+    /**
+     * Coalesced Ready emission: at most one per [READER_STATE_THROTTLE_MS] unless [force]
+     * (a page crossing always forces so display/progress never lags a turn). Safe under
+     * continuous's scrollLock - [captureAnchor] re-enters the same monitor on one thread.
+     */
+    fun emitReaderState(force: Boolean = false) {
+        val listener = onReaderStateChanged ?: return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastReadyAtMs < READER_STATE_THROTTLE_MS) return
+        lastReadyAtMs = now
+        try {
+            listener.invoke(ReaderState.Ready(captureAnchor()))
+        } catch (e: Throwable) {
+            android.util.Log.w("ImageViewerState", "onReaderStateChanged failed", e)
+        }
+    }
+
+    /**
+     * Mode-agnostic reading-position snapshot. Base (paged): absolute index plus the
+     * current page's zoom/pan; document scroll fields stay at defaults. Continuous
+     * overrides with documentY/fraction under scrollLock.
+     */
+    open fun captureAnchor(): PageAnchor {
+        val page = try { getPage(0) } catch (_: Throwable) { null }
+        return PageAnchor(
+            pageIndex = absolutePageIndex.coerceAtLeast(0),
+            documentY = 0f,
+            offsetX = page?.x ?: 0f,
+            scale = page?.scale ?: 1f,
+            fraction = 0f,
+        ).sanitized()
+    }
+
+    /**
+     * Apply a prior [captureAnchor] to the surface now live. Base seeds the index and
+     * restores zoom/pan on the current page (page navigation stays host-owned).
+     * Continuous overrides with a full document restore. Returns false when no page
+     * is available yet (nothing applied).
+     */
+    open fun applyAnchor(anchor: PageAnchor): Boolean {
+        if (anchor.pageIndex >= 0) seedPageIndex(anchor.pageIndex)
+        val a = anchor.sanitized()
+        val page = try { getPage(0) } catch (_: Throwable) { null } ?: return false
+        return try {
+            page.scale = a.scale.coerceIn(page.minScale, page.maxScale)
+            val minX = page.minX(page.scale)
+            val maxX = page.maxX(page.scale)
+            page.x = a.offsetX.coerceIn(minX, maxX)
+            invalidate()
+            emitReaderState(force = true)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * When false, a double tap (and double-tap-drag) does not zoom: the first tap
+     * resolves as a single tap immediately instead of waiting out the pair window.
+     * Default true preserves built-in behavior.
+     */
+    var doubleTapZoomEnabled: Boolean = true
+
     /** Override for the "from" page during far navigation animation */
     var transitionFromPage: ImagePage? = null
 
@@ -215,6 +320,9 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
+        try {
+            onReaderStateChanged?.invoke(ReaderState.Idle)
+        } catch (_: Throwable) {}
         this.renderer.init(scope, surface, width, height)
         this.scope = scope
 
@@ -398,6 +506,25 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     private val _postInit = mutableListOf<(suspend () -> Unit)>()
 
+    var showTileHud by mutableStateOf(false)
+
+    /** In viewer-Box coordinates (TileHud's boundsInParent) - for gesture hit-testing. */
+    @Volatile
+    var tileHudBounds: Rect? = null
+
+    fun hitsTileHud(pos: Offset): Boolean =
+        showTileHud && tileHudBounds?.contains(pos) == true
+
+    internal suspend fun residencySnapshot(): List<TileRenderer.GridResidency> =
+        withContext(dispatcher) { tiles.residency() }
+
+    internal suspend fun gridTraceSnapshot(): List<TileRenderer.GridChangeEvent> =
+        withContext(dispatcher) { tiles.changeTrace() }
+
+    fun dumpGridTrace() {
+        CoroutineScope(dispatcher).launch { tiles.dumpTrace() }
+    }
+
     @Synchronized
     fun post(fn: suspend () -> Unit) {
         val activeScope = scope
@@ -414,10 +541,16 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         animationJob?.cancel()
         tiles.cleanup()
         renderer.cleanup()
+        try {
+            onReaderStateChanged?.invoke(ReaderState.Released)
+        } catch (_: Throwable) {}
     }
 
     companion object {
         /** Idle pause when collect() has no page to draw - keeps it off a vsync-rate spin. */
         const val IDLE_BACKOFF_MS = 32L
+
+        /** Coalescing window for non-forced [emitReaderState] (scroll settles). */
+        const val READER_STATE_THROTTLE_MS = 500L
     }
 }

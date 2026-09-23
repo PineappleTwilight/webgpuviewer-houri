@@ -9,6 +9,7 @@ import androidx.webgpu.GPUTexture
 import ca.mpreg.webgpuviewer.closeTo
 import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.draw.clear
+import ca.mpreg.webgpuviewer.reader.PageAnchor
 import ca.mpreg.webgpuviewer.renderer.RenderPage
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
@@ -174,9 +175,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     scrollYInternal = 0.0
                     break
                 }
-                if (!isRestoring) {
-                    try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
-                }
+                if (!isRestoring) notifyPageChange(-1)
                 val newPage = getPage(0) ?: return
                 val newHeight = getPageSlotHeight(newPage).toDouble()
                 anchorDocYInternal -= newHeight
@@ -197,9 +196,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     scrollYInternal = pageHeight
                     break
                 }
-                if (!isRestoring) {
-                    try { onPageChange?.invoke(1) } catch (_: Throwable) {}
-                }
+                if (!isRestoring) notifyPageChange(1)
                 anchorDocYInternal += pageHeight
                 val newPage = getPage(0) ?: return
                 currentPageHeight = getPageSlotHeight(newPage).toFloat()
@@ -210,6 +207,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             if (scrollYInternal.isNaN() || scrollYInternal.isInfinite()) scrollYInternal = 0.0
             if (anchorDocYInternal.isNaN() || anchorDocYInternal.isInfinite()) anchorDocYInternal = 0.0
         }
+        emitReaderState()
     }
 
     private fun maxScrollYLocked(): Double? {
@@ -238,9 +236,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 scrollYInternal = 0.0
                 return
             }
-            if (!isRestoring) {
-                try { onPageChange?.invoke(-1) } catch (_: Throwable) {}
-            }
+            if (!isRestoring) notifyPageChange(-1)
             val newPage = getPage(0) ?: return
             val newHeight = getPageSlotHeight(newPage).toDouble()
             anchorDocYInternal -= newHeight
@@ -291,6 +287,50 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             }
             applyRestoreLocked(pos, animate)
         }
+        emitReaderState(force = true)
+    }
+
+    override fun captureAnchor(): PageAnchor {
+        val pos = savePosition()
+        return PageAnchor(
+            pageIndex = absolutePageIndex.coerceAtLeast(0),
+            documentY = pos.documentY,
+            offsetX = pos.offsetX,
+            scale = pos.scale,
+            fraction = pos.fractionWithinPage,
+        ).sanitized()
+    }
+
+    override fun applyAnchor(anchor: PageAnchor): Boolean {
+        if (anchor.pageIndex >= 0) seedPageIndex(anchor.pageIndex)
+        val a = anchor.sanitized()
+        if (a.documentY > 0f) {
+            restorePosition(
+                ContinuousPosition(
+                    documentY = a.documentY,
+                    scale = a.scale,
+                    offsetX = a.offsetX,
+                    pageIndexHint = -1,
+                    fractionWithinPage = a.fraction,
+                ),
+                animate = false,
+            )
+            return true
+        }
+        if (a.pageIndex > 0) {
+            restorePosition(
+                ContinuousPosition(
+                    documentY = 0f,
+                    scale = a.scale,
+                    offsetX = a.offsetX,
+                    pageIndexHint = a.pageIndex,
+                    fractionWithinPage = a.fraction,
+                ),
+                animate = false,
+            )
+            return true
+        }
+        return false
     }
 
     private fun applyRestoreLocked(pos: ContinuousPosition, animate: Boolean) {
@@ -517,6 +557,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val canRestore = getPage(0) != null && width > 0 && height > 0
             if (canRestore) {
                 applyRestoreLocked(pending, animate = false)
+                emitReaderState(force = true)
             }
         }
 
@@ -619,6 +660,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         scrolledThrough?.takeIf { it !== lastScrolledThrough }?.let {
             lastScrolledThrough = it
             try { onPageScrolledThrough?.invoke(it) } catch (_: Throwable) {}
+            emitReaderState(force = true)
         }
 
         ContinuousRenderSnapshot(

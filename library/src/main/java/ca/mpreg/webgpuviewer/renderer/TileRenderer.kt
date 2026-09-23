@@ -84,6 +84,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -203,6 +204,18 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
          * buffer count so a rotated stencil texture is never still in flight from a prior frame.
          */
         private const val STENCIL_BUFFER_COUNT = 3
+
+        /**
+         * [PageTiles.centerYOffset] deltas below this never wipe, in device pixels: the
+         * viewer's page-boundary re-anchor recomputes docTop through a different arithmetic
+         * path and lands here (ULP-scale), while genuine placeholder height corrections are
+         * whole pixels. Tiles bake centerYOffset at generation, so a kept grid is wrong by
+         * exactly the tolerated delta - sub-pixel, under the blit's integer snap.
+         */
+        private const val CENTER_Y_EPSILON = 0.5f
+
+        /** Ring capacity for [gridChangeTrace] - last ~64 lifecycle events for debug overlays. */
+        private const val CHANGE_TRACE_CAP = 64
 
         private val device get() = WebGpuRenderer.device
 
@@ -614,13 +627,21 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     )
 
     /**
-     * Release the grid longest without a draw, to get whole slabs back. Never one on screen: its
-     * slots may belong to a pass still being recorded.
+     * Release the coldest grid to get whole slabs back - coldest by [PageTiles.lastDrawn],
+     * never one blitted this frame or last (its slots may belong to a pass still being
+     * recorded). Freshness replaces the old `!page.isOnScreen` guard: that flag comes from
+     * the last captureRenderState, so a page just scrolled into view read as off-screen and
+     * victiming it wiped a visible page's whole grid under slab pressure.
      */
     private fun freeColdestGrid(keep: PageTiles) {
-        val victim = pages.values.firstOrNull {
-            it !== keep && it.tiles.isNotEmpty() && !it.page.isOnScreen
-        } ?: return
+        val victim = pages.values
+            .filter { it !== keep && it.tiles.isNotEmpty() && it.lastDrawn < frame - 1 }
+            .minByOrNull { it.lastDrawn } ?: return
+        traceChange(
+            GridChangeReason.SLAB_PRESSURE,
+            pageId(victim.page),
+            "freed for ${pageId(keep.page)}",
+        )
         releaseTiles(victim)
         victim.pending.clear()
     }
@@ -639,14 +660,19 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * three wipe sites for one invariant: the release must run before the tileSize
      * reassignment, since [releaseTiles] frees slabs by [st]'s *old* tileSize and reordering
      * would leak the old slots. A preferred-size change riding any of these sites unchecked is
-     * exactly how mid-scroll re-cuts flickered.
+     * exactly how mid-scroll re-cuts flickered. [reason]/[detail] are the Phase 0 trace: every
+     * wipe of a grid is recorded before it happens.
      */
-    private fun rewindGrid(st: PageTiles, scale: Float) {
+    private fun rewindGrid(st: PageTiles, scale: Float, reason: GridChangeReason, detail: String) {
+        traceChange(reason, pageId(st.page), detail)
         releaseTiles(st)
         st.pending.clear()
         st.scale = scale
         st.tileSize = preferredTileSize
         st.stable = false
+        if (st.tiles.isNotEmpty() || st.pending.isNotEmpty()) {
+            Log.w(TAG, "rewindGrid left residue: tiles=${st.tiles.size} pend=${st.pending.size}")
+        }
         invalidate()
     }
 
@@ -702,11 +728,20 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
          * This page's exact, unrounded vertical offset from the grid's shared anchor - see
          * [draw]'s continuous overload. Always 0 for the paged overload.
          *
-         * Also doubles as a staleness key, compared each call like [scale]: a changed offset at
-         * fixed scale means the page's document position shifted, so existing tiles no longer
-         * agree with where it sits.
+         * Also doubles as a staleness key, compared each call like [scale] but with a
+         * [CENTER_Y_EPSILON] tolerance: a move of at least half a device pixel at fixed scale
+         * means the page's document position really shifted, so existing tiles (which baked
+         * this value at generation) no longer agree with where it sits. Smaller deltas are
+         * re-anchor/ULP drift and are ridden out - wiping on them wiped on-screen grids.
          */
         var centerYOffset = 0f
+
+        /**
+         * Frame [drawCore] last blitted this grid; 0 when never drawn. [freeColdestGrid]'s
+         * victim key - blitted this frame or last is off-limits (a pass may still be
+         * recording), replacing the stale `page.isOnScreen` check.
+         */
+        var lastDrawn = 0L
 
         // The strictly visible tile range as of the last draw, in tile coordinates. The worker
         // prioritises against it at pull time, so a pan mid-fill redirects generation without
@@ -738,6 +773,97 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     // Access-ordered so getOrPut's read-then-maybe-write always moves the touched page to the
     // end (most recently drawn), whether or not it was already present - see RETAIN_MARGIN.
     private val pages = LinkedHashMap<ImagePage.ImageSingle, PageTiles>(16, 0.75f, true)
+
+    /** Why a grid's tiles went away - the Phase 0 trace anchor for field repros. */
+    enum class GridChangeReason {
+        /** [rewindGrid]: the page's scale moved. */
+        SCALE,
+        /** [rewindGrid]: [PageTiles.centerYOffset] moved a real (>= [CENTER_Y_EPSILON]) step. */
+        CAMERA,
+        /** [freeColdestGrid]: the atlas was out of slabs for this size. */
+        SLAB_PRESSURE,
+        /** [evict]: tile bytes crossed the budget; cold tiles released. */
+        LRU,
+        /** [draw]'s paged retain-window trim destroyed off-grace pages. */
+        RETAIN_TRIM,
+        /** The app dropped the page ([newFrame]) or the surface is going away ([cleanup]). */
+        PAGE_DESTROY,
+    }
+
+    /** One lifecycle event: which grid lost its tiles (or a trim ran) and why. */
+    data class GridChangeEvent(
+        val frame: Long,
+        val reason: GridChangeReason,
+        val page: String,
+        val detail: String,
+    )
+
+    /**
+     * One grid's residency at snapshot time - what the tile HUD shows. [framesSinceDrawn] is
+     * relative to [frame] when the snapshot was taken; a freshly rewound grid can still report
+     * instanceCapacity above count (the instance buffer is dropped lazily).
+     */
+    data class GridResidency(
+        val page: String,
+        val tiles: Int,
+        val pending: Int,
+        val scale: Float,
+        val tileSize: Int,
+        val stable: Boolean,
+        val centerYOffset: Float,
+        val framesSinceDrawn: Long,
+        val instanceCount: Int,
+        val instanceCapacity: Int,
+    )
+
+    /**
+     * Last [CHANGE_TRACE_CAP] events, oldest first. Written only on the render thread (every
+     * caller runs on [WebGpuRenderer.dispatcher]); not synchronized - hop threads before reading.
+     */
+    private val gridChangeTrace = ArrayDeque<GridChangeEvent>()
+
+    /** Snapshot of [gridChangeTrace] for debug overlays / bug reports. */
+    fun changeTrace(): List<GridChangeEvent> = gridChangeTrace.toList()
+
+    /** Snapshot of every live grid - same threading contract as [changeTrace]. */
+    fun residency(): List<GridResidency> = pages.map { (page, st) ->
+        GridResidency(
+            page = pageId(page),
+            tiles = st.tiles.size,
+            pending = st.pending.size,
+            scale = st.scale,
+            tileSize = st.tileSize,
+            stable = st.stable,
+            centerYOffset = st.centerYOffset,
+            framesSinceDrawn = frame - st.lastDrawn,
+            instanceCount = st.instanceCount,
+            instanceCapacity = st.instanceCapacity,
+        )
+    }
+
+    /** Log the whole ring plus current residency - the HUD's tap action. Render thread only. */
+    fun dumpTrace() {
+        gridChangeTrace.forEach { e ->
+            Log.i(TAG, "trace f=${e.frame} ${e.reason} ${e.page} ${e.detail}")
+        }
+        residency().forEach { r ->
+            Log.i(
+                TAG,
+                "grid ${r.page} t=${r.tiles} pend=${r.pending} s=${r.scale} ts=${r.tileSize} " +
+                    "stable=${r.stable} dY=${r.centerYOffset} age=${r.framesSinceDrawn} " +
+                    "i=${r.instanceCount}/${r.instanceCapacity}",
+            )
+        }
+    }
+
+    private fun traceChange(reason: GridChangeReason, page: String, detail: String) {
+        if (!WebGpuRenderer.isOnRenderThread()) {
+            Log.w(TAG, "traceChange off render thread: $reason $page $detail")
+        }
+        gridChangeTrace.addLast(GridChangeEvent(frame, reason, page, detail))
+        while (gridChangeTrace.size > CHANGE_TRACE_CAP) gridChangeTrace.removeFirst()
+        Log.d(TAG, "grid ${reason.name} $page $detail")
+    }
 
     private fun key(tx: Int, ty: Int) = (tx.toLong() shl 32) or (ty.toLong() and 0xFFFFFFFFL)
 
@@ -928,6 +1054,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         while (it.hasNext()) {
             val st = it.next().value
             if (st.destroyed) {
+                traceChange(GridChangeReason.PAGE_DESTROY, pageId(st.page), "dropped")
                 st.destroyAll(atlasOrNull)
                 it.remove()
             }
@@ -1151,9 +1278,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
         // Only a scale change re-cuts; a preferred-size change rides the existing cut until
-        // the next wipe - see [drawCore].
+        // the next wipe - see [drawCore]. Prewarm never compares centerYOffset: it has no
+        // camera (home position), so there is no drift to tolerate here.
         if (st.scale != a.pageScale) {
-            rewindGrid(st, a.pageScale)
+            rewindGrid(st, a.pageScale, GridChangeReason.SCALE, "${st.scale}->${a.pageScale}")
         } else {
             st.stable = true
         }
@@ -1228,9 +1356,20 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val a = continuousAnchor(page, dst, cameraDocY, docTop, viewerOffsetX, scale) ?: return
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
-        // Preferred-size changes don't wipe either - see [drawCore].
-        if (st.scale != a.pageScale || st.centerYOffset != a.centerYOffset) {
-            rewindGrid(st, a.pageScale)
+        // Preferred-size changes don't wipe either; same half-pixel camera tolerance as
+        // [drawCore] - re-anchor drift in docTop must not churn a prewarmed grid.
+        if (st.scale != a.pageScale || abs(st.centerYOffset - a.centerYOffset) >= CENTER_Y_EPSILON) {
+            val scaleChanged = st.scale != a.pageScale
+            rewindGrid(
+                st,
+                a.pageScale,
+                if (scaleChanged) GridChangeReason.SCALE else GridChangeReason.CAMERA,
+                if (scaleChanged) {
+                    "${st.scale}->${a.pageScale}"
+                } else {
+                    "dY=${a.centerYOffset - st.centerYOffset}"
+                },
+            )
         } else {
             st.stable = true
         }
@@ -1357,6 +1496,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (page.destroyed || !page.highQuality || page.isAnimated) return false
         if (!page.hasUploadedImage) return false
 
+        if (!anchorX.isFinite() || !anchorY.isFinite() ||
+            !centerYOffset.isFinite() || !pageScale.isFinite()
+        ) {
+            Log.w(TAG, "drawCore non-finite camera: x=$anchorX y=$anchorY cY=$centerYOffset s=$pageScale")
+            return false
+        }
+
         viewportWidth = dst.width
         viewportHeight = dst.height
 
@@ -1366,23 +1512,43 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             // getOrPut just moved page to the end of this access-ordered map - trim the front
             // (least recently drawn) down to the grace window. A page turn animates via
             // Transition's own cache, never this one, so anything evicted here isn't on screen.
+            var trimmed = 0
             while (pages.size > RETAIN_MARGIN) {
                 val eldest = pages.entries.iterator()
                 val entry = eldest.next()
                 entry.value.destroyAll(atlasOrNull)
                 eldest.remove()
+                trimmed++
+            }
+            if (trimmed > 0) {
+                traceChange(GridChangeReason.RETAIN_TRIM, "-", "pages=$trimmed")
             }
         }
 
-        // A changed centerYOffset at fixed scale means a placeholder corrected its guessed
-        // height - invalidate the same way a scale change does. A preferred-size change alone
-        // must NOT wipe: mid-scroll that re-cut every grid is the visible chunk flicker (tiles
-        // regenerate from scratch while only the scroll moves). Existing grids keep their cut
-        // until a scale/height wipe like this one, adopting the current preferred size inside
-        // it; newGrid starts new grids at it. Mixed cuts draw side by side - the atlas holds
-        // slabs of every size and each grid carries its own tileSize into gridPlacement.
-        if (st.scale != pageScale || st.centerYOffset != centerYOffset) {
-            rewindGrid(st, pageScale)
+        // A centerYOffset move of at least [CENTER_Y_EPSILON] device pixels at fixed scale means
+        // the page's document position really shifted (placeholder height corrections) -
+        // invalidate the same way a scale change does. Smaller deltas are the viewer's
+        // re-anchor/ULP drift recomputing docTop through a different arithmetic path; tiles bake
+        // centerYOffset at generation (renderTileContent), so tolerating them leaves at most a
+        // sub-pixel image error - the same order as the grid's own pixel snap. A preferred-size
+        // change alone must NOT wipe: mid-scroll that re-cut every grid is the visible chunk
+        // flicker (tiles regenerate from scratch while only the scroll moves). Existing grids
+        // keep their cut until a scale/height wipe like this one, adopting the current preferred
+        // size inside it; newGrid starts new grids at it. Mixed cuts draw side by side - the
+        // atlas holds slabs of every size and each grid carries its own tileSize into
+        // gridPlacement.
+        if (st.scale != pageScale || abs(st.centerYOffset - centerYOffset) >= CENTER_Y_EPSILON) {
+            val scaleChanged = st.scale != pageScale
+            rewindGrid(
+                st,
+                pageScale,
+                if (scaleChanged) GridChangeReason.SCALE else GridChangeReason.CAMERA,
+                if (scaleChanged) {
+                    "${st.scale}->${pageScale}"
+                } else {
+                    "dY=${centerYOffset - st.centerYOffset}"
+                },
+            )
         } else {
             // Two frames landing on the same scale isn't enough proof of settling while a
             // gesture/animation is still actively driving it.
@@ -1433,6 +1599,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             }
         }
 
+        st.lastDrawn = frame
         drawInstanced(pass, st, useStencilMask)
 
         // Drop what fell outside the wanted range, else a page scrolling past keeps accumulating
@@ -1467,6 +1634,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (st.instancesDirty) uploadInstances(st)
         val instances = st.instances ?: return
         if (st.instanceCount == 0) return
+        if (st.instanceCount > st.instanceCapacity) {
+            Log.w(TAG, "drawInstanced count=${st.instanceCount} > capacity=${st.instanceCapacity}")
+            return
+        }
 
         if (useStencilMask) {
             pass.setPipeline(blitPipelineStencilWrite)
@@ -2113,6 +2284,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             total -= tileBytes(st)
             i++
         }
+        if (i > 0) traceChange(GridChangeReason.LRU, "-", "tiles=$i")
     }
 
     /**
@@ -2130,6 +2302,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             try { upscaler.cleanup() } catch (_: Throwable) {}
             try { downscaler.cleanup() } catch (_: Throwable) {}
             try {
+                traceChange(GridChangeReason.PAGE_DESTROY, "-", "cleanup")
                 pages.values.forEach { try { it.destroyAll(atlasOrNull) } catch (_: Throwable) {} }
                 pages.clear()
             } catch (_: Throwable) {}
