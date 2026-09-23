@@ -381,22 +381,28 @@ class WebGpuRenderer {
      * this instance's device-bound caches (filter pool, stale swapchain) and rebuilds the
      * swapchain from the retained platform surface. Tile caches live in
      * [ca.mpreg.webgpuviewer.viewer.ImageViewerState] and are dropped by its own recovery,
-     * which calls this first. True when frames can draw again afterwards.
+     * which calls this first. True when the device is available; a missing surface waits for
+     * the next surface callback.
      */
     suspend fun recoverFromDeviceLoss(): Boolean {
-        if (isAvailable) return true
         return try {
             withContext(dispatcher) {
                 mutex.withLock {
-                    if (isAvailable) return@withLock true
                     if (!recreateDeviceLocked()) return@withLock false
                     try {
                         filters.cleanup()
                     } catch (e: Throwable) {
                         Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
                     }
+                    val previous = surface
+                    surface = null
+                    try {
+                        previous?.close()
+                    } catch (_: Throwable) {
+                    }
                     val platform = platformSurface
                     if (platform == null || !platform.isValid) {
+                        platformSurface = null
                         Log.w("WebGpuRenderer", "recovery has no live platform surface; next init() rebuilds it")
                         return@withLock true
                     }
@@ -640,6 +646,7 @@ class WebGpuRenderer {
                 width = 0
                 height = 0
                 scope = null
+                platformSurface = null
             }
         }
 
@@ -659,6 +666,7 @@ class WebGpuRenderer {
             Log.w("WebGpuRenderer", "cleanup dispatch failed", e)
             try { surface?.close() } catch (_: Throwable) {}
             surface = null
+            platformSurface = null
         }
     }
 }

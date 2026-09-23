@@ -2295,10 +2295,29 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     @Volatile
     private var cleaned = false
 
+    @Volatile
+    private var cleanupJob: Job? = null
+
+    /**
+     * Drop all device-bound tile state after a WebGPU device loss and leave the renderer ready
+     * for the replacement device. The old handles are no longer usable, so this is deliberately
+     * a state reset rather than a normal surface teardown path.
+     */
+    suspend fun recoverFromDeviceLoss() {
+        cleanup()
+        cleanupJob?.join()
+        resetAfterCleanup()
+    }
+
+    suspend fun awaitCleanup() {
+        cleanupJob?.join()
+        if (cleaned) resetAfterCleanup()
+    }
+
     fun cleanup() {
         if (cleaned) return
         cleaned = true
-        workerScope.launch {
+        cleanupJob = workerScope.launch {
             try { upscaler.cleanup() } catch (_: Throwable) {}
             try { downscaler.cleanup() } catch (_: Throwable) {}
             try {
