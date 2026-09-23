@@ -527,6 +527,7 @@ fun ImageViewerContinuous(
         ) {
             onSurface { surface, width, height ->
                 try {
+                    state.prepareForSurface()
                     state.init(scope, surface, width, height)
                     state.invalidate()
                     state.collect()

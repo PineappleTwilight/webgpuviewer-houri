@@ -10,6 +10,7 @@ import ca.mpreg.webgpuviewer.closeTo
 import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.draw.clear
 import ca.mpreg.webgpuviewer.reader.PageAnchor
+import ca.mpreg.webgpuviewer.renderer.Image
 import ca.mpreg.webgpuviewer.renderer.RenderPage
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
@@ -521,6 +522,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
     private class VisiblePage(val page: ImagePage, val docTop: Float, val pageHeight: Float)
 
+    private data class PlacedImage(
+        val image: Image,
+        val x: Float,
+        val y: Float,
+        val imageScale: Float,
+    )
+
     /**
      * A page past the visible window queued for idle tile generation: [docTop] is the same
      * document-space top the draw walk would compute for it, so the prewarmed grid matches
@@ -690,6 +698,34 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     if (page.destroyed || !page.isDecoded || page.width <= 0) return@forEach
 
                     val pageScale = dstW / page.width
+                    val placedImages = ArrayList<PlacedImage>(1)
+                    page.forEachImage { image, srcOffsetX, sideScale ->
+                        if (image.mipmaps.isEmpty()) return@forEachImage
+                        val imageScale = pageScale * s.scale * sideScale
+                        val docCenterX =
+                            pageScale * (srcOffsetX + sideScale * image.x)
+                        val docCenterY = vp.docTop + 0.5f * vp.pageHeight +
+                                pageScale * sideScale * image.y
+                        val targetX = anchorX + s.scale * docCenterX
+                        val targetY = anchorY + s.scale * docCenterY
+                        val (x, y) = solveImagePlacement(
+                            targetX, targetY, imageScale, image, dstW, dstH
+                        )
+                        placedImages += PlacedImage(image, x, y, imageScale)
+                        // Paint the fallback before the tile blit. The tile pass writes the
+                        // stencil mask; drawing this after it would overwrite cached pixels that
+                        // the masked fast path then skips.
+                        val halfW = image.width * imageScale / 2f
+                        val halfH = image.height * imageScale / 2f
+                        RenderPage.drawMaskedRect(
+                            pass,
+                            (targetX - halfW - 1f) / dstW,
+                            (targetY - halfH - 1f) / dstH,
+                            (targetX + halfW + 1f) / dstW,
+                            (targetY + halfH + 1f) / dstH,
+                            image.backgroundColor,
+                        )
+                    }
 
                     val covered = !page.isAnimated && tiles.draw(
                         pass,
@@ -703,39 +739,16 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
-                        page.forEachImage { image, srcOffsetX, sideScale ->
-                            if (image.mipmaps.isEmpty()) return@forEachImage
-                            val imageScale = pageScale * s.scale * sideScale
-                            val docCenterX =
-                                pageScale * (srcOffsetX + sideScale * image.x)
-                            val docCenterY = vp.docTop + 0.5f * vp.pageHeight +
-                                    pageScale * sideScale * image.y
-                            val targetX = anchorX + s.scale * docCenterX
-                            val targetY = anchorY + s.scale * docCenterY
-                            val (x, y) = solveImagePlacement(
-                                targetX, targetY, imageScale, image, dstW, dstH
-                            )
-                            // The fast path draws only the bitmap, so a sub-pixel
-                            // rasterization gap between abutting pages shows the
-                            // transparent-black clear color as a 1px seam until tiles
-                            // generate. Underlay the image extent, overlapped by 1px
-                            // so pages drawn later cover the overshoot, with the
-                            // image's trim-detected background color.
-                            val halfW = image.width * imageScale / 2f
-                            val halfH = image.height * imageScale / 2f
-                            RenderPage.drawMaskedRect(
-                                pass,
-                                (targetX - halfW - 1f) / dstW,
-                                (targetY - halfH - 1f) / dstH,
-                                (targetX + halfW + 1f) / dstW,
-                                (targetY + halfH + 1f) / dstH,
-                                image.backgroundColor,
-                            )
+                        placedImages.forEach { placed ->
+                            val image = placed.image
                             if (page.isAnimated || page.highQuality) {
-                                RenderPage.renderFast(pass, image, texture, x, y, imageScale)
+                                RenderPage.renderFast(
+                                    pass, image, texture, placed.x, placed.y, placed.imageScale
+                                )
                             } else {
                                 RenderPage.renderFast(
-                                    pass, image, texture, x, y, imageScale, linear = false
+                                    pass, image, texture, placed.x, placed.y, placed.imageScale,
+                                    linear = false,
                                 )
                             }
                         }

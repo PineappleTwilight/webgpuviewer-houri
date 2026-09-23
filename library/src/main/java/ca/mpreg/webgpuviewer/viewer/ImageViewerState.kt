@@ -318,6 +318,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     internal fun isOnScreen(page: ImagePage): Boolean = onScreenPages.any { it.covers(page) }
 
+    suspend fun prepareForSurface() {
+        tiles.awaitCleanup()
+    }
+
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         try {
@@ -535,6 +539,18 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         } else {
             _postInit.add(fn)
         }
+    }
+
+    /**
+     * Recreate the device and discard all device-bound viewer state before the next frame.
+     * Returns true when the replacement device is available, even if the platform surface must
+     * wait for the next surface callback.
+     */
+    suspend fun recoverFromDeviceLoss(): Boolean {
+        tiles.recoverFromDeviceLoss()
+        if (!renderer.recoverFromDeviceLoss()) return false
+        invalidate()
+        return true
     }
 
     fun cleanup() {
