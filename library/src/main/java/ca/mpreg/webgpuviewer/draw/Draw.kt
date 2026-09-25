@@ -27,10 +27,20 @@ object Draw {
     private val frameBuffers = ThreadLocal.withInitial { mutableListOf<GPUBuffer>() }
 
     fun submit(block: Draw.(GPUCommandEncoder) -> Unit) {
-        val encoder = device.createCommandEncoder()
-        block.invoke(this, encoder)
-        device.queue.submit(arrayOf(encoder.finish()))
-        onFrameSubmitted()
+        val buffers = tempBuffers.get()
+        var encoder: GPUCommandEncoder? = device.createCommandEncoder()
+        try {
+            block.invoke(this, encoder!!)
+            device.queue.submitAndRelease(encoder)
+            encoder = null
+        } finally {
+            encoder?.close()
+            buffers.forEach {
+                it.destroy()
+                it.close()
+            }
+            buffers.clear()
+        }
     }
 
     internal fun createBuffer(size: Long, usage: Int): GPUBuffer {

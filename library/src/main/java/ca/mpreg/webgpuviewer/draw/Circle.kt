@@ -19,6 +19,7 @@ import androidx.webgpu.PrimitiveTopology
 import ca.mpreg.webgpuviewer.renderer.FormatKeyed
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.setTransientBindGroup
+import ca.mpreg.webgpuviewer.renderer.groupLayout
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -143,10 +144,12 @@ fun Draw.circle(
 
     val pipeline = pipelines[format]
     pass.setPipeline(pipeline)
-    val bindGroup = device.createBindGroup(
-        GPUBindGroupDescriptor(
-            layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
-                GPUBindGroupEntry(0, buffer = uniformBuffer)
+    pass.setTransientBindGroup(
+        0, device.createBindGroup(
+            GPUBindGroupDescriptor(
+                layout = pipeline.groupLayout(), entries = arrayOf(
+                    GPUBindGroupEntry(0, buffer = uniformBuffer)
+                )
             )
         )
     )

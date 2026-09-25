@@ -32,6 +32,7 @@ import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.withContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -563,14 +564,35 @@ class WebGpuRenderer {
 
         val isOnDispatcherThread = isOnRenderThread()
 
-        val initSurface = {
-            try {
-                if (!surface.isValid) throw IllegalStateException("Surface became invalid before createSurface")
-                replaceSurface(surface)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                Log.e("WebGpuRenderer", "Failed to create surface ${width}x$height", e)
+        val initSurface = initSurface@{
+            // A cleanup queued first let [pending] go; a surface from it would leak.
+            if (surface != null || pendingSurface !== pending) return@initSurface
+            this@WebGpuRenderer.surface = pending.let {
+                instance.createSurface(
+                    GPUSurfaceDescriptor(
+                        surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
+                            windowFromSurface(it).also { acquired -> window = acquired }
+                        )
+                    )
+                ).apply {
+                    // Before the first latch, so the swapchain is configured knowing
+                    // whether float is even available.
+                    Hdr.resolve(this, adapter)
+                    // No images exist yet, so a previous session's stranded retains can go
+                    // without discarding a live one.
+                    Hdr.resetContent()
+                    Hdr.latchFrameFormat()
+                    configure(
+                        GPUSurfaceConfiguration(
+                            device,
+                            this@WebGpuRenderer.width,
+                            this@WebGpuRenderer.height,
+                            Hdr.frameFormat,
+                            TextureUsage.RenderAttachment
+                        )
+                    )
+                    this@WebGpuRenderer.configuredFormat = Hdr.frameFormat
+                }
             }
         }
 
@@ -619,14 +641,19 @@ class WebGpuRenderer {
             // An HDR image arriving, or the last one leaving, changes what the swapchain should
             // be. Here rather than at the decode: the format can only change between frames, and
             // this is the one place guaranteed to be between them - hence the latch too.
-            Hdr.latchFrameFormat()
-            if (Hdr.frameFormat != configuredFormat) {
-                reconfigure(surface)
-                Hdr.syncPresentation()
-            } else if (Hdr.consumePresentationDirty()) {
-                // Same format, but a brighter image arrived (or the brightest was freed), so the
-                // headroom asked of the display has moved.
-                Hdr.syncPresentation()
+            try {
+                Hdr.latchFrameFormat()
+                if (Hdr.frameFormat != configuredFormat) {
+                    reconfigure(surface)
+                    Hdr.syncPresentation()
+                } else if (Hdr.consumePresentationDirty()) {
+                    // Same format, but a brighter image arrived (or the brightest was freed), so
+                    // the headroom asked of the display has moved.
+                    Hdr.syncPresentation()
+                }
+            } catch (e: Exception) {
+                // Escaping would end the frame loop.
+                Log.e("WebGpuRenderer", "HDR presentation update failed", e)
             }
 
             val current = try {
@@ -658,24 +685,26 @@ class WebGpuRenderer {
                 return FrameResult.Retry
             }
 
+            var encoder: GPUCommandEncoder? = null
             try {
-                val encoder = device.createCommandEncoder()
+                encoder = device.createCommandEncoder()
                 // Draws into an offscreen texture when filters are enabled; endFrame runs them
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))
                 filters.endFrame(encoder, texture)
-                device.queue.submit(arrayOf(encoder.finish()))
-                // The one submit per frame that every Draw primitive records into, so this is where
-                // their per-frame buffers become releasable. The release waits on a queue fence
-                // rather than happening here, since the work submitted above has not run yet.
-                Draw.onFrameSubmitted()
+                device.queue.submitAndRelease(encoder)
+                encoder = null
                 surface.present()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e("WebGpuRenderer", "Render error", e)
                 // Don't rethrow - allow the app to continue rendering next frame
+            } catch (e: OutOfMemoryError) {
+                Log.e("WebGpuRenderer", "Out of memory rendering", e)
             } finally {
+                // Unsubmitted if the frame threw.
+                encoder?.close()
                 // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
                 texture.close()
             }
@@ -745,15 +774,17 @@ class WebGpuRenderer {
             }
         }
 
-        try {
-            if (isOnDispatcherThread) {
-                runBlocking {
-                    doCleanup()
-                }
-            } else {
-                runBlocking(dispatcher) {
-                    doCleanup()
-                }
+        if (isOnDispatcherThread && mutex.isLocked) {
+            // The mutex holder is on this thread: blocking would deadlock.
+            CoroutineScope(dispatcher).launch { doCleanup() }
+        } else if (isOnDispatcherThread) {
+            // Already on dispatcher, run synchronously
+            runBlocking {
+                doCleanup()
+            }
+        } else {
+            runBlocking(dispatcher) {
+                doCleanup()
             }
         } catch (e: CancellationException) {
             throw e
