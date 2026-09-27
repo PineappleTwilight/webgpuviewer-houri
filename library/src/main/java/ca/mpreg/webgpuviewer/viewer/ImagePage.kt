@@ -458,6 +458,9 @@ open class ImagePage {
                         // otherwise churn frameVersion and wake the render loop uncapped.
                         // Animated pages stay on the fast path, never the tile cache.
                         invalidate()
+                        // A single remaining frame never advances: stop the loop rather
+                        // than invalidating it on its duration forever.
+                        if ((this@ImageSingle.frames?.size ?: 0) <= 1) return@launch
                         delay(duration.coerceAtLeast(MIN_ANIM_FRAME_MS).milliseconds)
                     } ?: break
                     frameIndex = (frameIndex + 1) % (this@ImageSingle.frames?.size ?: 1)
@@ -1770,6 +1773,11 @@ open class ImagePage {
 
             origin != null -> y.fastCoerceIn(minY, maxY)
             else -> targetY
+        }
+
+        if (!scaleChanging && endX == startX && endY == startY) {
+            animationJob = null
+            return
         }
 
         animationJob = scope?.launch {
