@@ -668,14 +668,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * victiming it wiped a visible page's whole grid under slab pressure.
      */
     private fun freeColdestGrid(keep: PageTiles) {
-        val victim = pages.values
-            .filter { it !== keep && it.tiles.isNotEmpty() && it.lastDrawn < frame - 1 }
-            .minByOrNull { it.lastDrawn } ?: return
-        traceChange(
-            GridChangeReason.SLAB_PRESSURE,
-            pageId(victim.page),
-            "freed for ${pageId(keep.page)}",
-        )
+        val victim = pages.values.firstOrNull {
+            it !== keep && it.tiles.isNotEmpty() && !it.page.isOnScreen &&
+                    it.tiles.values.none { t -> t.lastUsed >= frame - 1 }
+        } ?: return
         releaseTiles(victim)
         victim.pending.clear()
     }
@@ -728,6 +724,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
          */
         var tileSize: Int,
     ) {
+        /** [ImagePage.ImageSingle.contentVersion] the tiles were cut from. */
+        var contentVersion = page.contentVersion
+
         val tiles = HashMap<Long, Tile>()
         val pending = HashSet<Long>()
 
@@ -1301,6 +1300,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         val st = pages[page] ?: return null
         val a = pagedAnchor(page, dst, 0f, 0f, 1f)
+        if (st.contentVersion != page.contentVersion || st.scale != a.pageScale ||
+            st.tileSize != preferredTileSize
+        ) return emptySet()
         val gp =
             gridPlacement(page, dst, a.anchorX, a.anchorY, 0f, a.pageScale, st.tileSize)
                 ?: return null
@@ -1336,11 +1338,17 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val a = pagedAnchor(page, dst, 0f, 0f, 1f)
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
-        // Only a scale change re-cuts; a preferred-size change rides the existing cut until
-        // the next wipe - see [drawCore]. Prewarm never compares centerYOffset: it has no
-        // camera (home position), so there is no drift to tolerate here.
-        if (st.scale != a.pageScale) {
-            rewindGrid(st, a.pageScale, GridChangeReason.SCALE, "${st.scale}->${a.pageScale}")
+        val version = page.contentVersion
+        if (st.scale != a.pageScale || st.tileSize != preferredTileSize ||
+            st.contentVersion != version
+        ) {
+            releaseTiles(st)
+            st.pending.clear()
+            st.scale = a.pageScale
+            st.tileSize = preferredTileSize
+            st.contentVersion = version
+            st.stable = false
+            invalidate()
         } else {
             st.stable = true
         }
@@ -1588,30 +1596,20 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             }
         }
 
-        // A centerYOffset move of at least [CENTER_Y_EPSILON] device pixels at fixed scale means
-        // the page's document position really shifted (placeholder height corrections) -
-        // invalidate the same way a scale change does. Smaller deltas are the viewer's
-        // re-anchor/ULP drift recomputing docTop through a different arithmetic path; tiles bake
-        // centerYOffset at generation (renderTileContent), so tolerating them leaves at most a
-        // sub-pixel image error - the same order as the grid's own pixel snap. A preferred-size
-        // change alone must NOT wipe: mid-scroll that re-cut every grid is the visible chunk
-        // flicker (tiles regenerate from scratch while only the scroll moves). Existing grids
-        // keep their cut until a scale/height wipe like this one, adopting the current preferred
-        // size inside it; newGrid starts new grids at it. Mixed cuts draw side by side - the
-        // atlas holds slabs of every size and each grid carries its own tileSize into
-        // gridPlacement.
-        if (st.scale != pageScale || abs(st.centerYOffset - centerYOffset) >= CENTER_Y_EPSILON) {
-            val scaleChanged = st.scale != pageScale
-            rewindGrid(
-                st,
-                pageScale,
-                if (scaleChanged) GridChangeReason.SCALE else GridChangeReason.CAMERA,
-                if (scaleChanged) {
-                    "${st.scale}->${pageScale}"
-                } else {
-                    "dY=${centerYOffset - st.centerYOffset}"
-                },
-            )
+        val version = page.contentVersion
+        if (st.scale != pageScale || st.centerYOffset != centerYOffset ||
+            st.tileSize != preferredTileSize || st.contentVersion != version
+        ) {
+            // A changed centerYOffset at fixed scale means a placeholder corrected its guessed
+            // height - invalidate the same way a scale change does. A changed preferred size
+            // rides the same path: this is the one moment a grid can be re-cut for free.
+            releaseTiles(st)
+            st.pending.clear()
+            st.scale = pageScale
+            st.tileSize = preferredTileSize
+            st.contentVersion = version
+            st.stable = false
+            invalidate()
         } else {
             // Two frames landing on the same scale isn't enough proof of settling while a
             // gesture/animation is still actively driving it.
@@ -1980,6 +1978,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private fun generate(req: Request, measurementScope: CoroutineScope): Job? {
         val st = req.state
         if (st.destroyed || !st.stable) return null
+        if (st.contentVersion != st.page.contentVersion) return null
         return generateTileNow(st, req.tx, req.ty, measurementScope, req.onScreen)
     }
 

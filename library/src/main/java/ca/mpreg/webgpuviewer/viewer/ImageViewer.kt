@@ -106,6 +106,7 @@ fun ImageViewer(
                 if (stoppedMotion) {
                     page.isScaleAnimating = false
                     page.isFlinging = false
+                    page.invalidate()
                 }
 
                 var longPressed = false
@@ -567,7 +568,10 @@ fun ImageViewer(
                             willFlingZoom =
                                 abs(dragVelocity.y) > 200 && page.scale > page.homeScale && page.scale < page.maxScale
                         } finally {
-                            if (!willFlingZoom) page.isScaleAnimating = false
+                            if (!willFlingZoom) {
+                                page.isScaleAnimating = false
+                                page.invalidate()
+                            }
                         }
 
                         val velocity = velocityTracker.calculateVelocity()
@@ -603,6 +607,7 @@ fun ImageViewer(
                                     }
                                 } finally {
                                     page.isScaleAnimating = false
+                                    page.invalidate()
                                 }
                             }
                         } else {
@@ -755,6 +760,7 @@ fun ImageViewer(
                         } while (!canceled && event.changes.any { it.pressed })
                     } finally {
                         page.isScaleAnimating = false
+                        page.invalidate()
                     }
 
                     longPressJob?.cancel()

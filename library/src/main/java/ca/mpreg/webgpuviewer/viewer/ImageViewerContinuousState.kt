@@ -665,14 +665,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val cameraDocY = (anchorDocYInternal - y0 + 0.5 * screenH).toFloat()
 
         val pages = mutableListOf<VisiblePage>()
-        val visTop = 0.5f * screenH - screenH / (2f * scale)
-        val screenBot = 0.5f * screenH + screenH / (2f * scale)
-        val visBot = screenBot + tiles.preferredTileSize / scale
-        // Same one-tile margin above as visBot carries below: scrolling up had no lookahead,
-        // so tiles only started generating once visible. Page inclusion uses this; the
-        // scrolled-through check below keeps the unextended visTop so read position doesn't
-        // advance for a page that is still half on screen.
-        val visTopTiles = visTop - tiles.preferredTileSize / scale
+        // Undecoded ones too: [pages] skips them, and their decode's invalidate must still land.
+        val visible = mutableListOf<ImagePage>()
 
         fun isScrolledThrough(top: Float, pageHeight: Float) =
             pageHeight > 0f && (top + pageHeight <= screenBot || top < visTop)
@@ -699,12 +693,17 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         while (yTop > visTopTiles && -iBack <= reachLimit(yTop - visTopTiles)) {
             val page = getPage(iBack) ?: break
             above = -iBack
-            val pageHeight = getPageHeight(page)
-            val slotHeight = pageHeight + pageGapPx
-            if (slotHeight > 0f) smallestSlot = minOf(smallestSlot, slotHeight)
-            docTopBack -= slotHeight.toDouble()
-            yTop -= slotHeight
-            if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
+            val contentHeight = getPageHeight(page)
+            val pageHeight = contentHeight + pageGapPx
+            docTopBack -= pageHeight
+            yTop -= pageHeight
+            // Walking up, so the first match is the deepest one above page 0.
+            if (scrolledThrough == null && isScrolledThrough(yTop, contentHeight)) {
+                scrolledThrough = page
+            }
+            visible.add(page)
+            // Walked upward, so each goes in front of the last - top to bottom, as the
+            // forward walk appends.
             if (page.isDecoded) {
                 pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight))
             }
@@ -723,10 +722,15 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             below = i
             if (hasPrev) docTop += prevSlot.toDouble()
             hasPrev = true
-            val pageHeight = getPageHeight(page)
-            if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
-            if (y + pageHeight > visTopTiles && page.isDecoded) {
-                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
+            val contentHeight = getPageHeight(page)
+            val pageHeight = contentHeight + pageGapPx
+
+            // Walking down, so a later match replaces whatever the backward walk found.
+            if (isScrolledThrough(y, contentHeight)) scrolledThrough = page
+
+            if (y + pageHeight > visTop) {
+                visible.add(page)
+                if (page.isDecoded) pages.add(VisiblePage(page, docTop, pageHeight, contentHeight))
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
@@ -735,33 +739,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             i++
         }
 
-        // Idle decode-ahead: the next pages below the visible window, with the same docTop
-        // math as the walk above. Drawn pages never touch these - renderSnapshot prewarms
-        // their tiles while nothing is moving, so scrolling down arrives sharp. Kept out of
-        // pages/pagesBelow/onScreenPages: nothing here is on screen yet.
-        val prewarmTargets = ArrayList<PrewarmTarget>(PREWARM_AHEAD_PAGES)
-        // Gated like renderSnapshot's prewarm call below: no fetches for off-screen pages
-        // while a gesture or fling is driving the camera, when they'd be stale on arrival.
-        if (!isScaleAnimating && !isFlinging) {
-            var extra = 0
-            while (extra < PREWARM_AHEAD_PAGES && i <= reachLimit(visBot - y)) {
-                val page = getPage(i) ?: break
-                if (hasPrev) docTop += prevSlot.toDouble()
-                hasPrev = true
-                val pageHeight = getPageHeight(page)
-                if (pageHeight <= 0f) break
-                val single = page as? ImagePage.ImageSingle
-                if (single != null && single.isDecoded && !single.destroyed) {
-                    prewarmTargets.add(PrewarmTarget(single, docTop.toFloat()))
-                }
-                prevSlot = pageHeight + pageGapPx
-                y += prevSlot
-                i++
-                extra++
-            }
-        }
-
-        onScreenPages = pages.map { it.page }
+        onScreenPages = visible
         pagesBelow = below
         pagesAbove = above
         if (smallestSlot != Float.MAX_VALUE) smallestSlotSeen = smallestSlot
