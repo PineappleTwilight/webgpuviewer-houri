@@ -22,6 +22,8 @@ import androidx.webgpu.GPURenderPassEncoder
 import androidx.webgpu.GPUTexture
 import androidx.webgpu.LoadOp
 import androidx.webgpu.StoreOp
+import ca.mpreg.webgpuviewer.draw.Draw
+import ca.mpreg.webgpuviewer.draw.clear
 import ca.mpreg.webgpuviewer.filter.FilterChain
 import ca.mpreg.webgpuviewer.reader.OnReaderStateChanged
 import ca.mpreg.webgpuviewer.reader.PageAnchor
@@ -430,7 +432,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     }
 
     protected open fun captureRenderState(): Any? {
-        val currentPage = getPage(0) ?: return null
+        val currentPage = getPage(0) ?: run {
+            onScreenPages = emptyList()
+            return EmptySnapshot
+        }
         val offset = pageOffset
         val adjacentPage = when {
             offset == 0f -> null
@@ -449,6 +454,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
             currentPage, adjacentPage, nextPage, prevPage, offset, transition, firstPos, currentPos
         )
     }
+
+    private object EmptySnapshot
 
     private class RenderSnapshot(
         val currentPage: ImagePage,
@@ -510,6 +517,10 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     protected open suspend fun renderSnapshot(
         encoder: GPUCommandEncoder, texture: GPUTexture, snapshot: Any
     ) {
+        if (snapshot === EmptySnapshot) {
+            Draw.clear(encoder, texture, 0)
+            return
+        }
         val s = snapshot as RenderSnapshot
         tiles.newFrame()
         val page = s.currentPage
@@ -586,6 +597,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     fun cleanup() {
         animationJob?.cancel()
+        onScreenPages = emptyList()
         // Held by an object that outlives this state, so it has to be dropped by hand - but only
         // if it is still ours: a replacement viewer inits before the one it replaces cleans up.
         if (Hdr.requestFrame === invalidateCallback) Hdr.requestFrame = null

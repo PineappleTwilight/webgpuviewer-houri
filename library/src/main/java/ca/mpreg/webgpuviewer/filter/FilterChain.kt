@@ -195,6 +195,7 @@ class FilterChain {
 
     fun cleanup() {
         filters.forEach { it.cleanup() }
+        tailBlit.cleanup()
         destroyPool()
     }
 

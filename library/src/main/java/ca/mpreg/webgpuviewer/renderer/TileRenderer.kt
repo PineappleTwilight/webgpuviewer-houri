@@ -353,11 +353,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
     private var frame = 0L
     private var workerActive = false
+
     // Tiles are an optimisation over drawing pages directly: a failure in the worker is logged, never
     // left to reach the thread's uncaught exception handler and end the process.
     private val workerScope = CoroutineScope(
         WebGpuRenderer.dispatcher + SupervisorJob() +
-            CoroutineExceptionHandler { _, e -> Log.e(TAG, "Tile worker failed", e) },
+                CoroutineExceptionHandler { _, e -> Log.e(TAG, "Tile worker failed", e) },
     )
 
     // Timestamp-query based GPU cost measurement for [generateTile]'s batches - null wherever the
@@ -499,7 +500,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private fun rescalerApplies(st: PageTiles): Boolean {
         val rescaler: Rescaler = if (st.scale >= 1f) upscaler else downscaler
         return rescaler.factor > 1 && rescaler.supported &&
-            rescaler.appliesAt(st.scale) && rescaler.fits(st.tileSize)
+                rescaler.appliesAt(st.scale) && rescaler.fits(st.tileSize)
     }
 
     /** One cached tile: where in the [TileAtlas] it sits (packed), and when it was last drawn. */
@@ -1763,7 +1764,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     }
 
     // Reused staging, render thread only. writeBuffer sends the whole capacity: pass slice().
-    private var scratchBytes: ByteBuffer = ByteBuffer.allocateDirect(4096).order(ByteOrder.nativeOrder())
+    private var scratchBytes: ByteBuffer =
+        ByteBuffer.allocateDirect(4096).order(ByteOrder.nativeOrder())
 
     private fun scratch(size: Int): ByteBuffer {
         if (scratchBytes.capacity() < size) {
@@ -2199,6 +2201,24 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         // Still nothing - the worker comes back to this tile.
         if (origin < 0) return null
 
+        try {
+            return encodeTile(st, key, origin, pool, measurementScope, staged, prepare, render)
+        } catch (e: Throwable) {
+            pool.release(st.tileSize, origin)
+            throw e
+        }
+    }
+
+    private inline fun encodeTile(
+        st: PageTiles,
+        key: Long,
+        origin: Int,
+        pool: TileAtlas,
+        measurementScope: CoroutineScope,
+        staged: Boolean,
+        prepare: (GPUCommandEncoder, GPUPassTimestampWrites?) -> Unit,
+        render: (GPURenderPassEncoder, GPUTexture) -> Unit
+    ): Job? {
         val queries = timestampQuerySet
         if (queries == null) {
             val encoder = device.createCommandEncoder()
@@ -2219,48 +2239,53 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         val timing = acquireTimestampBuffers()
         val encoder = device.createCommandEncoder()
-
-        // A rescaler's passes run before this one and would otherwise go unmeasured - which
-        // matters, since [nextBatchSize] divides a frame's budget by this number and would queue
-        // eight of a tile that reads as free. So a staged tile puts the opening timestamp on
-        // whatever pass [prepare] opens first, leaving only the closing one here; the GPU runs
-        // everything between the two.
-        //
-        // Per tile, not per renderer: a rescaler declines any tile below its [Rescaler.factor],
-        // and those have no first pass to carry the opening write. Getting that wrong leaves
-        // query 0 unwritten and the elapsed time read off stale memory.
-        val opening = if (staged) {
-            prepare(
-                encoder, GPUPassTimestampWrites(
-                    queries,
-                    beginningOfPassWriteIndex = 0,
-                    endOfPassWriteIndex = Constants.QUERY_SET_INDEX_UNDEFINED
-                )
-            )
-            Constants.QUERY_SET_INDEX_UNDEFINED
-        } else {
-            prepare(encoder, null)
-            0
-        }
-
-        val pass = encoder.beginRenderPass(
-            clearedColorPass(
-                pool.scratchView(st.tileSize), timestampWrites = GPUPassTimestampWrites(
-                    queries, beginningOfPassWriteIndex = opening, endOfPassWriteIndex = 1
-                )
-            )
-        )
         try {
-            render(pass, pool.scratch(st.tileSize))
-        } finally {
-            pass.endAndRelease()
+            // A rescaler's passes run before this one and would otherwise go unmeasured - which
+            // matters, since [nextBatchSize] divides a frame's budget by this number and would queue
+            // eight of a tile that reads as free. So a staged tile puts the opening timestamp on
+            // whatever pass [prepare] opens first, leaving only the closing one here; the GPU runs
+            // everything between the two.
+            //
+            // Per tile, not per renderer: a rescaler declines any tile below its [Rescaler.factor],
+            // and those have no first pass to carry the opening write. Getting that wrong leaves
+            // query 0 unwritten and the elapsed time read off stale memory.
+            val opening = if (staged) {
+                prepare(
+                    encoder, GPUPassTimestampWrites(
+                        queries,
+                        beginningOfPassWriteIndex = 0,
+                        endOfPassWriteIndex = Constants.QUERY_SET_INDEX_UNDEFINED
+                    )
+                )
+                Constants.QUERY_SET_INDEX_UNDEFINED
+            } else {
+                prepare(encoder, null)
+                0
+            }
+
+            val pass = encoder.beginRenderPass(
+                clearedColorPass(
+                    pool.scratchView(st.tileSize), timestampWrites = GPUPassTimestampWrites(
+                        queries, beginningOfPassWriteIndex = opening, endOfPassWriteIndex = 1
+                    )
+                )
+            )
+            try {
+                render(pass, pool.scratch(st.tileSize))
+            } finally {
+                pass.endAndRelease()
+            }
+
+            pool.copyScratchInto(encoder, origin, st.tileSize)
+            encoder.resolveQuerySet(queries, 0, 2, timing.resolve, 0)
+            encoder.copyBufferToBuffer(timing.resolve, 0, timing.result, 0, 16)
+
+            device.queue.submitAndRelease(encoder)
+        } catch (e: Throwable) {
+            encoder.close()
+            releaseTimestampBuffers(timing)
+            throw e
         }
-
-        pool.copyScratchInto(encoder, origin, st.tileSize)
-        encoder.resolveQuerySet(queries, 0, 2, timing.resolve, 0)
-        encoder.copyBufferToBuffer(timing.resolve, 0, timing.result, 0, 16)
-
-        device.queue.submitAndRelease(encoder)
         st.tiles[key] = Tile(origin).also { it.lastUsed = frame; it.plain = !staged }
         st.instancesDirty = true
 
@@ -2437,6 +2462,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 pages.clear()
                 atlasOrNull = null
                 timestampPool.clear()
+                stencilTextures.fill(null)
+                stencilViews.fill(null)
+                stencilWidth = 0
+                stencilHeight = 0
                 return@launch
             }
             // On the worker with everything else it owns: a rescaler's textures can be mid-tile
@@ -2450,6 +2479,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 atlasOrNull = null
                 timestampPool.forEach { it.resolve.destroyAndRelease(); it.result.destroyAndRelease() }
                 timestampPool.clear()
+                for (i in 0 until STENCIL_BUFFER_COUNT) {
+                    stencilViews[i]?.close()
+                    stencilViews[i] = null
+                    stencilTextures[i]?.destroyAndRelease()
+                    stencilTextures[i] = null
+                }
+                stencilWidth = 0
+                stencilHeight = 0
             }
         }
     }
