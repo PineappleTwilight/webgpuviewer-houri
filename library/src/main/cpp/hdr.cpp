@@ -7,6 +7,7 @@
 #include <cstring>
 #include <jni.h>
 #include <stdint.h>
+#include <vector>
 
 /* ------------------------------------------------------------ buffer guard */
 
@@ -186,6 +187,100 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNativeF16(
 
       if (sumA > 0.00001f) {
         float inv = 1.0f / sumA;
+        outR = sumR * inv;
+        outG = sumG * inv;
+        outB = sumB * inv;
+      }
+
+      q[0] = float_to_half(srgb_encode(outR));
+      q[1] = float_to_half(srgb_encode(outG));
+      q[2] = float_to_half(srgb_encode(outB));
+      q[3] = float_to_half(outA);
+      q += 4;
+    }
+  }
+}
+
+/* Each output pixel's source span along one axis, as [first, first + count)
+ * with a weight apiece, over one flat weight array. */
+struct AreaSpans {
+  std::vector<int> first, count, offset;
+  std::vector<float> weight;
+};
+
+static AreaSpans area_spans(int src, int dst) {
+  AreaSpans s;
+  s.first.resize(dst);
+  s.count.resize(dst);
+  s.offset.resize(dst);
+  const double scale = (double)src / dst;
+  for (int i = 0; i < dst; ++i) {
+    const double start = i * scale;
+    const double end = start + scale;
+    const int lo = std::min(src - 1, (int)start);
+    const int hi = std::min(src - 1, std::max(lo, (int)std::ceil(end) - 1));
+    s.first[i] = lo;
+    s.count[i] = hi - lo + 1;
+    s.offset[i] = (int)s.weight.size();
+    for (int p = lo; p <= hi; ++p) {
+      const double w = std::min((double)p + 1.0, end) - std::max((double)p, start);
+      s.weight.push_back(w > 0.0 ? (float)w : 0.0f);
+    }
+  }
+  return s;
+}
+
+/* As resizeLinearAreaNativeF16, to any size; a larger one repeats pixels. */
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaToNativeF16(
+    JNIEnv *env, jobject thiz, jobject src_buffer, jobject dst_buffer,
+    jint srcWidth, jint srcHeight, jint dstWidth, jint dstHeight) {
+  const size_t src_px = pixel_count(srcWidth, srcHeight, 8);
+  const size_t dst_px = pixel_count(dstWidth, dstHeight, 8);
+  if (!src_px || !dst_px)
+    return;
+
+  if (!buffer_holds(env, src_buffer, src_px * 8) ||
+      !buffer_holds(env, dst_buffer, dst_px * 8))
+    return;
+
+  const uint16_t *src =
+      (const uint16_t *)env->GetDirectBufferAddress(src_buffer);
+  uint16_t *dst = (uint16_t *)env->GetDirectBufferAddress(dst_buffer);
+  if (!src || !dst)
+    return;
+
+  const AreaSpans xs = area_spans(srcWidth, dstWidth);
+  const AreaSpans ys = area_spans(srcHeight, dstHeight);
+
+  for (int y = 0; y < dstHeight; ++y) {
+    uint16_t *q = dst + (size_t)y * dstWidth * 4;
+    for (int x = 0; x < dstWidth; ++x) {
+      float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f, sumA = 0.0f, sumW = 0.0f;
+
+      for (int j = 0; j < ys.count[y]; ++j) {
+        const float wy = ys.weight[ys.offset[y] + j];
+        const uint16_t *row =
+            src + ((size_t)(ys.first[y] + j) * srcWidth + xs.first[x]) * 4;
+        for (int i = 0; i < xs.count[x]; ++i) {
+          const float w = wy * xs.weight[xs.offset[x] + i];
+          if (w <= 0.0f)
+            continue;
+          const uint16_t *p = row + (size_t)i * 4;
+          const float a = half_to_float(p[3]) * w;
+          sumR += srgb_decode(half_to_float(p[0])) * a;
+          sumG += srgb_decode(half_to_float(p[1])) * a;
+          sumB += srgb_decode(half_to_float(p[2])) * a;
+          sumA += a;
+          sumW += w;
+        }
+      }
+
+      float outR = 0.0f, outG = 0.0f, outB = 0.0f, outA = 0.0f;
+      if (sumW > 0.0f)
+        outA = sumA / sumW;
+      if (sumA > 0.00001f) {
+        const float inv = 1.0f / sumA;
         outR = sumR * inv;
         outG = sumG * inv;
         outB = sumB * inv;

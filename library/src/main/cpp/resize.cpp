@@ -43,10 +43,12 @@ inline uint8_t exactLinearToAlpha(float linearAlpha) {
   return static_cast<uint8_t>(std::roundf(linearAlpha * 255.0f));
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
-    JNIEnv *env, jobject thiz, jobject src_buffer, jobject dst_buffer,
-    jint srcWidth, jint srcHeight) {
+/* Box filter in linear light to any size; a larger one repeats pixels. A
+ * mismatched size/buffer indexes past its end rather than throwing, so both are
+ * checked. */
+static void resizeArea(JNIEnv *env, jobject src_buffer, jobject dst_buffer,
+                       jint srcWidth, jint srcHeight, jint dstWidth,
+                       jint dstHeight) {
   initLUTs();
 
   if (env == nullptr || src_buffer == nullptr || dst_buffer == nullptr) return;
@@ -67,9 +69,8 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
   const jlong srcNeeded = static_cast<jlong>(srcWidth) * static_cast<jlong>(srcHeight) * 4LL;
   if (srcCapacity < srcNeeded || srcCapacity < 0) return;
 
-  int dstWidth = srcWidth / 2;
-  int dstHeight = srcHeight / 2;
-  if (dstWidth <= 0 || dstHeight <= 0) return;
+  if (dstWidth <= 0 || dstHeight <= 0)
+    return;
 
   const jlong dstNeeded = static_cast<jlong>(dstWidth) * static_cast<jlong>(dstHeight) * 4LL;
   if (dstCapacity < dstNeeded || dstCapacity < 0) return;
@@ -282,4 +283,20 @@ Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
           (finalA << 24) | (finalB << 16) | (finalG << 8) | finalR;
     }
   }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaNative(
+    JNIEnv *env, jobject thiz, jobject src_buffer, jobject dst_buffer,
+    jint srcWidth, jint srcHeight) {
+  resizeArea(env, src_buffer, dst_buffer, srcWidth, srcHeight, srcWidth / 2,
+             srcHeight / 2);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_webgpuviewer_ImageUtil_resizeLinearAreaToNative(
+    JNIEnv *env, jobject thiz, jobject src_buffer, jobject dst_buffer,
+    jint srcWidth, jint srcHeight, jint dstWidth, jint dstHeight) {
+  resizeArea(env, src_buffer, dst_buffer, srcWidth, srcHeight, dstWidth,
+             dstHeight);
 }
