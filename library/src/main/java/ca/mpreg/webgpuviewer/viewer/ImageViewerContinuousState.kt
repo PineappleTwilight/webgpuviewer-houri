@@ -717,12 +717,18 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         // the masked fast path then skips.
                         val halfW = image.width * imageScale / 2f
                         val halfH = image.height * imageScale / 2f
+                        // The slot is the page plus its trailing gap (getPageSlotHeight), and
+                        // the pass cleared to transparent black - so a gap left unpainted reads
+                        // as a hard black line between every page. Carry this image's own
+                        // background down through the gap: document-space pageGapPx becomes
+                        // device pixels once scaled.
+                        val gapPad = pageGapPx * s.scale
                         RenderPage.drawMaskedRect(
                             pass,
                             (targetX - halfW - 1f) / dstW,
                             (targetY - halfH - 1f) / dstH,
                             (targetX + halfW + 1f) / dstW,
-                            (targetY + halfH + 1f) / dstH,
+                            (targetY + halfH + 1f + gapPad) / dstH,
                             image.backgroundColor,
                         )
                     }
