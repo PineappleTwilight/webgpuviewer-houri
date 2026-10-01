@@ -529,6 +529,12 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val imageScale: Float,
     )
 
+    private class DrawablePage(
+        val page: ImagePage.ImageSingle,
+        val vp: VisiblePage,
+        val placed: List<PlacedImage>,
+    )
+
     /**
      * A page past the visible window queued for idle tile generation: [docTop] is the same
      * document-space top the draw walk would compute for it, so the prewarmed grid matches
@@ -692,13 +698,22 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
         var allCovered = true
         if (hasImagePage) {
+            // Every page's background underlay goes down first, then every page's content.
+            // The underlay is deliberately inflated past the page's own edges (down by the
+            // slot gap, by a pixel on the rest) so an unpainted row can't read as a hard line
+            // against the cleared pass - which means consecutive pages' underlays overlap.
+            // Drawing them interleaved with the content let page N+1's underlay land *after*
+            // page N's tiles and paint over the last row of its real pixels, leaving a
+            // background-coloured line at every seam. As the bottom layer they can overlap
+            // freely instead: content always lands on top of them.
             renderPass(encoder, texture) { pass ->
+                val drawable = ArrayList<DrawablePage>(s.pages.size)
                 s.pages.forEach { vp ->
                     val page = vp.page as? ImagePage.ImageSingle ?: return@forEach
                     if (page.destroyed || !page.isDecoded || page.width <= 0) return@forEach
 
                     val pageScale = dstW / page.width
-                    val placedImages = ArrayList<PlacedImage>(1)
+                    val placed = ArrayList<PlacedImage>(1)
                     page.forEachImage { image, srcOffsetX, sideScale ->
                         if (image.mipmaps.isEmpty()) return@forEachImage
                         val imageScale = pageScale * s.scale * sideScale
@@ -711,17 +726,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val (x, y) = solveImagePlacement(
                             targetX, targetY, imageScale, image, dstW, dstH
                         )
-                        placedImages += PlacedImage(image, x, y, imageScale)
-                        // Paint the fallback before the tile blit. The tile pass writes the
-                        // stencil mask; drawing this after it would overwrite cached pixels that
-                        // the masked fast path then skips.
-                        val halfW = image.width * imageScale / 2f
-                        val halfH = image.height * imageScale / 2f
+                        placed += PlacedImage(image, x, y, imageScale)
                         // The slot is the page plus its trailing gap (getPageSlotHeight), and
                         // the pass cleared to transparent black - so a gap left unpainted reads
                         // as a hard black line between every page. Carry this image's own
                         // background down through the gap: document-space pageGapPx becomes
                         // device pixels once scaled.
+                        val halfW = image.width * imageScale / 2f
+                        val halfH = image.height * imageScale / 2f
                         val gapPad = pageGapPx * s.scale
                         RenderPage.drawMaskedRect(
                             pass,
@@ -732,20 +744,24 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             image.backgroundColor,
                         )
                     }
+                    drawable.add(DrawablePage(page, vp, placed))
+                }
 
+                drawable.forEach { d ->
+                    val page = d.page
                     val covered = !page.isAnimated && tiles.draw(
                         pass,
                         page,
                         texture,
                         s.cameraDocY,
-                        vp.docTop,
+                        d.vp.docTop,
                         s.offsetX,
                         s.scale,
                         s.suppressGeneration
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
-                        placedImages.forEach { placed ->
+                        d.placed.forEach { placed ->
                             val image = placed.image
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(
@@ -761,13 +777,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     }
 
                     if (page.fade < 1f) {
-                        val top = anchorY + s.scale * vp.docTop
+                        val top = anchorY + s.scale * d.vp.docTop
                         page.drawFade(
                             pass,
                             (anchorX - s.scale * dstW / 2f) / dstW,
                             top / dstH,
                             (anchorX + s.scale * dstW / 2f) / dstW,
-                            (top + s.scale * vp.pageHeight) / dstH
+                            (top + s.scale * d.vp.pageHeight) / dstH
                         )
                     }
                 }
