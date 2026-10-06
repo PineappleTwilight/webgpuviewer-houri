@@ -373,9 +373,19 @@ open class ImagePage {
         @Volatile
         private var currentFrameImage: Image? = null
 
-        /** True while an animation frame loop owns [currentImage]. The tile cache skips animated pages. */
-        override val isAnimated: Boolean
-            get() = frames != null
+        /** The image [image] swaps with while animating; this page's own. Under this monitor. */
+        private var backImage: Image? = null
+
+        // Bumped by each [animate], so a loop it replaced can't swap or keep a back image.
+        private var animationGeneration = 0
+
+        // Wakes an animation paused off screen.
+        private val shown = Channel<Unit>(Channel.CONFLATED)
+
+        override fun cameOnScreen() {
+            super.cameOnScreen()
+            shown.trySend(Unit)
+        }
 
         private val _frameVersion = AtomicInteger()
 
@@ -1529,6 +1539,14 @@ open class ImagePage {
      * viewer never fetches itself but which still need a scope to animate in and a way back to
      * the screen.
      */
+    /**
+     * Called as this page joins the drawn ones. Redraws, as any [invalidate] before this was
+     * dropped for not being on screen yet.
+     */
+    internal open fun cameOnScreen() {
+        onInvalidate?.invoke()
+    }
+
     internal open fun attach(
         parent: ImageViewerState, scope: CoroutineScope?, onInvalidate: () -> Unit
     ) {

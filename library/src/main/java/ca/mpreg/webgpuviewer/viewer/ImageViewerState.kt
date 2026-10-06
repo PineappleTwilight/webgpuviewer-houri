@@ -326,6 +326,17 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     internal fun isOnScreen(page: ImagePage): Boolean = onScreenPages.any { it.covers(page) }
 
+    /**
+     * Publishes the drawn set, telling every page that just joined. A page that invalidated while
+     * off screen dropped that redraw for having nothing to draw into, so this is what wakes it.
+     */
+    internal fun publishOnScreen(pages: List<ImagePage>) {
+        val was = onScreenPages
+        onScreenPages = pages
+        // After the assignment, so a page woken by it finds itself on screen.
+        for (page in pages) if (was.none { it === page }) page.cameOnScreen()
+    }
+
     suspend fun prepareForSurface() {
         tiles.awaitCleanup()
     }
@@ -440,7 +451,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     protected open fun captureRenderState(): Any? {
         val currentPage = getPage(0) ?: run {
-            onScreenPages = emptyList()
+            publishOnScreen(emptyList())
             return EmptySnapshot
         }
         val offset = pageOffset
@@ -456,7 +467,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         // turning back shows the previous page's tiles just as live as turning forward.
         val nextPage = if (offset == 0f) getPage(1) else null
         val prevPage = if (offset == 0f) getPage(-1) else null
-        onScreenPages = listOfNotNull(currentPage, adjacentPage)
+        publishOnScreen(listOfNotNull(currentPage, adjacentPage))
         return RenderSnapshot(
             currentPage, adjacentPage, nextPage, prevPage, offset, transition, firstPos, currentPos
         )

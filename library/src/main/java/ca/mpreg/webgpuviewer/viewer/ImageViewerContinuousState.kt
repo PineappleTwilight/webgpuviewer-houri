@@ -739,7 +739,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             i++
         }
 
-        onScreenPages = visible
+        publishOnScreen(visible)
         pagesBelow = below
         pagesAbove = above
         if (smallestSlot != Float.MAX_VALUE) smallestSlotSeen = smallestSlot
