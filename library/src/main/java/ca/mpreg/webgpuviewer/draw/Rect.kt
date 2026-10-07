@@ -147,7 +147,9 @@ fun Draw.rect(
  *
  * A fresh uniform buffer is allocated per call: several rects can share one pass, and
  * `queue.writeBuffer` is ordered against `submit` rather than against other writes, so a reused
- * buffer would give every rect in the batch the last colour written.
+ * buffer would give every rect in the batch the last colour written. Destroyed as soon as the
+ * draw is recorded - the render pass runs this every frame for a page placeholder, and an
+ * undestroyed buffer per call accumulated until the driver ran out of memory.
  */
 fun Draw.rect(
     pass: GPURenderPassEncoder,
@@ -180,14 +182,14 @@ fun Draw.rect(
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
     pass.setPipeline(pipeline)
-    pass.setBindGroup(
-        0, device.createBindGroup(
-            GPUBindGroupDescriptor(
-                layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
-                    GPUBindGroupEntry(0, buffer = uniformBuffer)
-                )
+    val bindGroup = device.createBindGroup(
+        GPUBindGroupDescriptor(
+            layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
+                GPUBindGroupEntry(0, buffer = uniformBuffer)
             )
         )
     )
+    pass.setBindGroup(0, bindGroup)
     pass.draw(6)
+    uniformBuffer.destroy()
 }

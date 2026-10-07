@@ -137,14 +137,14 @@ fun Draw.circle(pass: GPURenderPassEncoder, cx: Float, cy: Float, radius: Float,
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
     pass.setPipeline(pipeline)
-    pass.setBindGroup(
-        0, device.createBindGroup(
-            GPUBindGroupDescriptor(
-                layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
-                    GPUBindGroupEntry(0, buffer = uniformBuffer)
-                )
+    val bindGroup = device.createBindGroup(
+        GPUBindGroupDescriptor(
+            layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
+                GPUBindGroupEntry(0, buffer = uniformBuffer)
             )
         )
     )
+    pass.setBindGroup(0, bindGroup)
     pass.draw(6)
+    uniformBuffer.destroy()
 }

@@ -19,6 +19,7 @@ import androidx.webgpu.GPURenderPassDepthStencilAttachment
 import androidx.webgpu.GPURenderPassDescriptor
 import androidx.webgpu.GPURenderPassEncoder
 import androidx.webgpu.GPUTexture
+import androidx.webgpu.GPUTextureView
 import androidx.webgpu.LoadOp
 import androidx.webgpu.StoreOp
 import ca.mpreg.webgpuviewer.closeTo
@@ -190,7 +191,7 @@ open class ImagePage {
          * pass, sharing it with other draws like [rect]/[circle]/[text].
          */
         protected fun sprite(
-            texture: GPUTexture,
+            view: GPUTextureView,
             cx: Float,
             cy: Float,
             sizePx: Float,
@@ -198,7 +199,7 @@ open class ImagePage {
             angleRadians: Float,
             tint: Int,
         ) = Draw.sprite(
-            pass, texture.createView(), cx, cy, sizePx,
+            pass, view, cx, cy, sizePx,
             dst.width.toFloat(), dst.height.toFloat(), angleRadians, tint
         )
 

@@ -137,6 +137,28 @@ class Font private constructor(
         return glyph
     }
 
+    /**
+     * [ensureGlyph] for every codepoint in [codepoints] up front.
+     *
+     * A glyph missing from the atlas costs a rasterize plus a texture upload, and while the atlas
+     * is too small for it [addGlyph] also destroys and re-uploads the whole atlas. Doing that one
+     * glyph at a time mid-string meant a chapter title in a script outside [DEFAULT_CHARS] - the
+     * normal case for a manga - rebuilt the atlas repeatedly on the render thread inside a live
+     * frame. [Draw.text] warms the whole string through here before drawing so that cost lands in
+     * one contiguous batch instead.
+     */
+    @Synchronized
+    internal fun ensureGlyphs(codepoints: IntArray) {
+        val rasterizer = rasterizer ?: return
+        codepoints.forEach { cp ->
+            if (glyphs[cp] != null) return@forEach
+            glyphs[cp] = addGlyph(
+                rasterizer,
+                rasterizeGlyph(rasterizer.paint, cp, rasterizer.rasterSize, rasterizer.padding)
+            )
+        }
+    }
+
     private fun addGlyph(r: Rasterizer, raster: GlyphRaster): Glyph {
         if (!raster.hasQuad) return Glyph(advance = raster.advanceEm)
 
@@ -145,10 +167,17 @@ class Font private constructor(
             r.shelfX = 0
             r.shelfHeight = 0
         }
-        val neededWidth = max(atlasWidth, raster.width)
+        // Both dimensions double, not height alone: growing width only as far as the glyph being
+        // placed made every following glyph re-wrap, so a run of new codepoints regrew the atlas
+        // once each. Doubling turns that into a logarithmic number of full re-uploads.
+        val neededWidth = max(atlasWidth, r.shelfX + raster.width)
         val neededHeight = max(atlasHeight, r.shelfY + raster.height)
         if (neededWidth > atlasWidth || neededHeight > atlasHeight) {
-            growAtlas(r, neededWidth, max(neededHeight, atlasHeight * 2))
+            growAtlas(
+                r,
+                max(neededWidth, atlasWidth * 2),
+                max(neededHeight, atlasHeight * 2)
+            )
         }
 
         val originX = r.shelfX
@@ -842,6 +871,12 @@ fun Draw.text(
     val dstWidth = dst.width.toFloat()
     val dstHeight = dst.height.toFloat()
 
+    // One rasterize-and-upload pass for every codepoint the string needs, before any glyph
+    // instance is built - see Font.ensureGlyphs on why a per-glyph miss mid-string is expensive.
+    text.split("\n").forEach { rawLine ->
+        rawLine.split(" ").forEach { word -> font.ensureGlyphs(codepointsOf(word)) }
+    }
+
     // 8 floats (dst_rect + uv_rect) per glyph - collected first so the whole string can go into
     // one storage buffer and one draw call instead of one of each per glyph.
     val instances = ArrayList<Float>(text.length * 8)
@@ -1018,22 +1053,50 @@ private fun addGlyphInstance(
 }
 
 /**
+ * Thread-local direct staging buffer that grows on demand.
+ *
+ * writeTexture/writeBuffer's JNI binding needs a direct buffer to read a raw native pointer from,
+ * and these are filled on every drawn string - a page placeholder redraws its percentage each
+ * frame - so allocating per call churned the heap on the render thread.
+ */
+private class DirectScratch(initialCapacity: Int) {
+    private var buffer = ByteBuffer.allocateDirect(initialCapacity).order(ByteOrder.nativeOrder())
+
+    fun reserve(bytes: Int): ByteBuffer {
+        if (buffer.capacity() < bytes) {
+            buffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+        }
+        buffer.clear()
+        return buffer
+    }
+}
+
+private val vertexScratch = ThreadLocal.withInitial { DirectScratch(512) }
+private val paramsScratch = ThreadLocal.withInitial { DirectScratch(32) }
+
+/**
  * Uploads [instances] (8 floats per glyph: `dst_rect` then `uv_rect`) into one per-instance
  * vertex buffer and draws every glyph with a single instanced [GPURenderPassEncoder.draw] call,
  * rather than one buffer/bind group/draw call per glyph - see [TEXT_SHADER].
+ *
+ * Both buffers are destroyed once the draw is recorded; the bind group is not, because
+ * GPUBindGroup has no destroy in the WebGPU API and is released with the object that
+ * references it. The buffers cannot be pooled instead: `queue.writeBuffer` is ordered against
+ * `submit`, not against passes, so one reused uniform buffer would give every string in a frame
+ * the last one's values.
  */
 private fun drawGlyphInstances(
     pass: GPURenderPassEncoder,
     font: Font,
     instances: List<Float>,
     color: Int,
-    screenPxRange: Float,
+    screenPxRange: Float
 ) {
     val glyphCount = instances.size / 8
 
-    val vertexBytes = ByteBuffer.allocateDirect(instances.size * 4).order(ByteOrder.nativeOrder())
+    val vertexBytes = vertexScratch.get().reserve(instances.size * 4)
     instances.forEach { vertexBytes.putFloat(it) }
-    vertexBytes.rewind()
+    vertexBytes.flip()
     val vertexBuffer = device.createBuffer(
         GPUBufferDescriptor(
             size = vertexBytes.capacity().toLong(),
@@ -1047,7 +1110,7 @@ private fun drawGlyphInstances(
     val b = (color and 0xFF) / 255f
     val a = ((color ushr 24) and 0xFF) / 255f
 
-    val paramsBytes = ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder())
+    val paramsBytes = paramsScratch.get().reserve(32)
     paramsBytes.putFloat(r)
     paramsBytes.putFloat(g)
     paramsBytes.putFloat(b)
@@ -1056,7 +1119,7 @@ private fun drawGlyphInstances(
     paramsBytes.putFloat(0f)
     paramsBytes.putFloat(0f)
     paramsBytes.putFloat(0f)
-    paramsBytes.rewind()
+    paramsBytes.flip()
     val paramsBuffer = device.createBuffer(
         GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
     )
@@ -1064,16 +1127,17 @@ private fun drawGlyphInstances(
 
     pass.setPipeline(pipeline)
     pass.setVertexBuffer(0, vertexBuffer)
-    pass.setBindGroup(
-        0, device.createBindGroup(
-            GPUBindGroupDescriptor(
-                layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
-                    GPUBindGroupEntry(0, buffer = paramsBuffer),
-                    GPUBindGroupEntry(1, textureView = font.atlasView),
-                    GPUBindGroupEntry(2, sampler = sampler),
-                )
+    val bindGroup = device.createBindGroup(
+        GPUBindGroupDescriptor(
+            layout = pipeline.getBindGroupLayout(0), entries = arrayOf(
+                GPUBindGroupEntry(0, buffer = paramsBuffer),
+                GPUBindGroupEntry(1, textureView = font.atlasView),
+                GPUBindGroupEntry(2, sampler = sampler),
             )
         )
     )
+    pass.setBindGroup(0, bindGroup)
     pass.draw(6, glyphCount)
+    paramsBuffer.destroy()
+    vertexBuffer.destroy()
 }

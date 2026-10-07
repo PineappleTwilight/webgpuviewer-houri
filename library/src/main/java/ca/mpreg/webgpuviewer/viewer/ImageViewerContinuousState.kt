@@ -17,12 +17,17 @@ import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.max
 
 class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     companion object {
         const val MAX_VISIBLE_PAGES = 4
         const val MAX_PAGE_WALK = 64
+
+        /** Ceiling on how far past [MAX_VISIBLE_PAGES] a zoomed-out window may reach. */
+        const val MAX_PAGE_REACH = 12
+
         /** Pages past the visible window whose tiles generate while idle (see prewarmTargets). */
         const val PREWARM_AHEAD_PAGES = 2
     }
@@ -211,10 +216,27 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         emitReaderState()
     }
 
-    private fun maxScrollYLocked(): Double? {
+    /**
+     * Smallest slot height the last [captureRenderState] walk saw.
+     *
+     * Persisted because the document-end measurement runs before any walk of this frame and so
+     * cannot know a slot height yet - without it the clamp measures a shorter document than the
+     * render walk draws, and the reader can scroll several pages past the last one into blank
+     * space.
+     */
+    private var smallestSlotSeen = Float.MAX_VALUE
+
+    private fun reachForViewport(): Int {
+        if (smallestSlotSeen == Float.MAX_VALUE) return MAX_VISIBLE_PAGES
+        val span = if (scale.isFinite() && scale > 0f) height / scale else height.toFloat()
+        val extra = ceil(span / smallestSlotSeen).toInt()
+        return (MAX_VISIBLE_PAGES + extra).coerceAtMost(MAX_PAGE_REACH)
+    }
+
+    private fun maxScrollYLocked(maxPages: Int = reachForViewport()): Double? {
         val viewportHeight = if (scale.isFinite() && scale > 0f) height / scale.toDouble() else height.toDouble()
         var bottom = 0.0
-        for (i in 0..MAX_VISIBLE_PAGES) {
+        for (i in 0..maxPages) {
             val page = getPage(i) ?: return bottom - pageGapPx - viewportHeight
             val pageHeight = getPageHeight(page).toDouble()
             if (pageHeight <= 0.0) break
@@ -224,10 +246,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         return null
     }
 
-    private fun clampToDocumentEndLocked() {
+    private fun clampToDocumentEndLocked(maxPages: Int = reachForViewport()) {
         var guard = 0
         while (guard++ < MAX_PAGE_WALK) {
-            val max = maxScrollYLocked() ?: return
+            val max = maxScrollYLocked(maxPages) ?: return
             if (scrollYInternal <= max) return
             if (max >= 0.0) {
                 scrollYInternal = max
@@ -576,8 +598,15 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
 
         if (page0 != null) {
+// KMK --> NEVER rescale scrollYInternal when the anchor page's slot height changes.
+// A page that has not decoded yet is a ProgressPage reserving one viewport height, so
+// a proportional re-anchor would multiply the reader's position within it by
+// realHeight/viewportHeight the instant it decodes - 3.4x on an 8192px webtoon segment,
+// teleporting the viewport a screen and a half mid-gesture. Holding the absolute
+// document offset is also physically right: the page only changes size below the
+// viewport, so the pixels already on screen stay put. currentPageHeight is kept for
+// the width-change branch above.
             val pageHeight = getPageSlotHeight(page0)
-            currentPageHeight?.let { h -> if (h > 0f && pageHeight > 0f) scrollYInternal *= pageHeight / h }
             if (pageHeight > 0f) currentPageHeight = pageHeight
             clampToDocumentEndLocked()
         }
@@ -598,17 +627,31 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         fun isScrolledThrough(top: Float, pageHeight: Float) =
             pageHeight > 0f && (top + pageHeight <= screenBot || top < visTop)
 
+        // KMK --> How many page slots the visible span can cover. MAX_VISIBLE_PAGES on its own
+        // truncates the window whenever the view is zoomed out far enough that more pages fit than
+        // that count allows - which the minScale of 0.1 in CONTINUOUS_VERTICAL does, needing ~12
+        // where 5 were reachable - leaving the bottom of the screen unpainted. Once a real slot
+        // height has been seen the bound grows to what the geometry asks for; `y < visBot` is still
+        // what actually ends each walk, so this only stops it running away on a degenerate height.
+        var smallestSlot = Float.MAX_VALUE
+        fun reachLimit(remainingSpan: Float): Int {
+            if (smallestSlot == Float.MAX_VALUE) return MAX_VISIBLE_PAGES
+            val extra = ceil(remainingSpan.coerceAtLeast(0f) / smallestSlot).toInt()
+            return (MAX_VISIBLE_PAGES + extra).coerceAtMost(MAX_PAGE_REACH)
+        }
+
         var scrolledThrough: ImagePage? = null
 
         var yTop = y0
         var iBack = -1
         var docTopBack = anchorDocYInternal
         var above = 0
-        while (yTop > visTopTiles && iBack >= -MAX_VISIBLE_PAGES) {
+        while (yTop > visTopTiles && -iBack <= reachLimit(yTop - visTopTiles)) {
             val page = getPage(iBack) ?: break
             above = -iBack
             val pageHeight = getPageHeight(page)
             val slotHeight = pageHeight + pageGapPx
+            if (slotHeight > 0f) smallestSlot = minOf(smallestSlot, slotHeight)
             docTopBack -= slotHeight.toDouble()
             yTop -= slotHeight
             if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
@@ -625,7 +668,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var prevSlot = 0f
         var hasPrev = false
         var below = 0
-        while (y < visBot && i <= MAX_VISIBLE_PAGES) {
+        while (y < visBot && i <= reachLimit(visBot - y)) {
             val page = getPage(i) ?: break
             below = i
             if (hasPrev) docTop += prevSlot.toDouble()
@@ -637,6 +680,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
+            if (prevSlot > 0f) smallestSlot = minOf(smallestSlot, prevSlot)
             y += prevSlot
             i++
         }
@@ -650,7 +694,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         // while a gesture or fling is driving the camera, when they'd be stale on arrival.
         if (!isScaleAnimating && !isFlinging) {
             var extra = 0
-            while (extra < PREWARM_AHEAD_PAGES && i <= MAX_VISIBLE_PAGES) {
+            while (extra < PREWARM_AHEAD_PAGES && i <= reachLimit(visBot - y)) {
                 val page = getPage(i) ?: break
                 if (hasPrev) docTop += prevSlot.toDouble()
                 hasPrev = true
@@ -670,6 +714,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         onScreenPages = pages.map { it.page }
         pagesBelow = below
         pagesAbove = above
+        if (smallestSlot != Float.MAX_VALUE) smallestSlotSeen = smallestSlot
 
         scrolledThrough?.takeIf { it !== lastScrolledThrough }?.let {
             lastScrolledThrough = it
@@ -687,7 +732,12 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     ) {
         val s = snapshot as ContinuousRenderSnapshot
         tiles.newFrame()
-        if (s.pages.isEmpty()) return
+        if (s.pages.isEmpty()) {
+            // getCurrentTexture rotates buffers, so returning without touching them presents
+            // whatever the previous occupant of this one left behind.
+            Draw.clear(encoder, texture, 0)
+            return
+        }
 
         val hasImagePage = s.pages.any { it.page is ImagePage.ImageSingle }
 
