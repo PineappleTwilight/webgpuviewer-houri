@@ -207,7 +207,6 @@ fun Draw.sprite(
     )
     pass.setBindGroup(0, bindGroup)
     pass.draw(6)
-    uniformBuffer.destroy()
 }
 
 /**
