@@ -7,7 +7,6 @@ import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
-import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUFragmentState
@@ -176,9 +175,7 @@ fun Draw.rect(
     byteBuffer.putFloat(a)
     byteBuffer.flip()
 
-    val uniformBuffer = device.createBuffer(
-        GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
-    )
+    val uniformBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
     pass.setPipeline(pipeline)

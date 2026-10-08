@@ -26,6 +26,7 @@ import androidx.webgpu.UncapturedErrorCallback
 import androidx.webgpu.WebGpuRuntimeException
 import androidx.webgpu.helper.Util as WebGpuUtilHelper
 import androidx.webgpu.helper.initLibrary as webgpuInitLibrary
+import ca.mpreg.webgpuviewer.draw.Draw
 import ca.mpreg.webgpuviewer.filter.FilterChain
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.mutex
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.withContext
@@ -582,6 +583,10 @@ class WebGpuRenderer {
                 fn(encoder, filters.beginFrame(texture))
                 filters.endFrame(encoder, texture)
                 device.queue.submit(arrayOf(encoder.finish()))
+                // The one submit per frame that every Draw primitive records into, so this is where
+                // their per-frame buffers become releasable. The release waits on a queue fence
+                // rather than happening here, since the work submitted above has not run yet.
+                Draw.onFrameSubmitted()
                 surface.present()
             } catch (e: CancellationException) {
                 throw e

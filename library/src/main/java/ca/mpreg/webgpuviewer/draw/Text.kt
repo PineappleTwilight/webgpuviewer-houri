@@ -18,7 +18,6 @@ import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
-import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUExtent3D
 import androidx.webgpu.GPUFragmentState
@@ -1097,11 +1096,9 @@ private fun drawGlyphInstances(
     val vertexBytes = vertexScratch.get().reserve(instances.size * 4)
     instances.forEach { vertexBytes.putFloat(it) }
     vertexBytes.flip()
-    val vertexBuffer = device.createBuffer(
-        GPUBufferDescriptor(
-            size = vertexBytes.capacity().toLong(),
-            usage = BufferUsage.Vertex or BufferUsage.CopyDst
-        )
+    val vertexBuffer = createBuffer(
+        vertexBytes.capacity().toLong(),
+        BufferUsage.Vertex or BufferUsage.CopyDst,
     )
     device.queue.writeBuffer(vertexBuffer, 0, vertexBytes)
 
@@ -1120,9 +1117,7 @@ private fun drawGlyphInstances(
     paramsBytes.putFloat(0f)
     paramsBytes.putFloat(0f)
     paramsBytes.flip()
-    val paramsBuffer = device.createBuffer(
-        GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
-    )
+    val paramsBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
     device.queue.writeBuffer(paramsBuffer, 0, paramsBytes)
 
     pass.setPipeline(pipeline)
