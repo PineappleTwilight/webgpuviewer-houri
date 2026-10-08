@@ -10,6 +10,7 @@ import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureView
 import ca.mpreg.webgpuviewer.ImageUtil
 import ca.mpreg.webgpuviewer.Trim
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
@@ -125,6 +126,13 @@ class Image private constructor(
                         withContext(Dispatchers.Default) {
                             ImageUtil.resize(currentPixels, textureWidth, textureHeight)
                         }
+                    } catch (e: CancellationException) {
+                        // Not a resize failure: the scope is being torn down (a page destroyed
+                        // under us during a fast scroll), and CancellationException is an Exception,
+                        // so the catch below would log a warning and carry on building mipmaps for a
+                        // page nobody holds any more. Swallowing it also breaks structured
+                        // concurrency, which is how a teardown keeps allocating after it started.
+                        throw e
                     } catch (e: Exception) {
                         Log.w("Renderer", "mipmap resize failed at $textureWidth x $textureHeight -> $newWidth x $newHeight", e)
                         break
