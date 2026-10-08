@@ -1096,7 +1096,7 @@ private fun drawGlyphInstances(
     val vertexBytes = vertexScratch.get().reserve(instances.size * 4)
     instances.forEach { vertexBytes.putFloat(it) }
     vertexBytes.flip()
-    val vertexBuffer = createBuffer(
+    val vertexBuffer = Draw.createBuffer(
         vertexBytes.capacity().toLong(),
         BufferUsage.Vertex or BufferUsage.CopyDst,
     )
@@ -1117,7 +1117,7 @@ private fun drawGlyphInstances(
     paramsBytes.putFloat(0f)
     paramsBytes.putFloat(0f)
     paramsBytes.flip()
-    val paramsBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
+    val paramsBuffer = Draw.createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
     device.queue.writeBuffer(paramsBuffer, 0, paramsBytes)
 
     pass.setPipeline(pipeline)
