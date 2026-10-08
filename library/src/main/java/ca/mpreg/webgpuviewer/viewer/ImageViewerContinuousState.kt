@@ -147,6 +147,16 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
      */
     fun getPageSlotHeight(page: ImagePage): Float = getPageHeight(page) + pageGapPx
 
+    /**
+     * [scrollY] pulled back to [pageHeight] when it sat past the end of a slot that just shrank.
+     *
+     * Only the overshoot is corrected: an offset still inside the slot is untouched, so a page that
+     * grows (a placeholder resolving to a real, taller page) keeps its absolute document position
+     * exactly as before.
+     */
+    private fun clampScrollWithinPage(scrollY: Double, pageHeight: Float): Double =
+        if (pageHeight > 0f && scrollY > pageHeight) pageHeight.toDouble() else scrollY
+
     private var currentPageHeight: Float? = null
     private var pendingRestore: ContinuousPosition? = null
 
@@ -598,7 +608,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
 
         if (page0 != null) {
-// KMK --> NEVER rescale scrollYInternal when the anchor page's slot height changes.
+// KMK --> NEVER *rescale* scrollYInternal when the anchor page's slot height changes.
 // A page that has not decoded yet is a ProgressPage reserving one viewport height, so
 // a proportional re-anchor would multiply the reader's position within it by
 // realHeight/viewportHeight the instant it decodes - 3.4x on an 8192px webtoon segment,
@@ -606,8 +616,24 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 // document offset is also physically right: the page only changes size below the
 // viewport, so the pixels already on screen stay put. currentPageHeight is kept for
 // the width-change branch above.
+//
+// Clamping to the slot's own height when the page resolves *smaller* is the one case the
+// hold-the-offset rule cannot cover, and it is the common one for a split segment: a
+// segment's placeholder reserves a whole viewport, while the segment itself is usually
+// under half of that in document space (8192px tall at full viewport width is ~1100px).
+// So a reader two thirds of the way down a not-yet-decoded segment ends up past its end
+// the moment it decodes - the viewport is showing the next page while getPage(0), and with it
+// every piece of reader state (progress, saved position, the next page-change delta), still
+// names the segment they were reading. Nothing re-anchors: notifyPageChange only fires from
+// scrollBy, and scrollBy's own walk stops at this page's (now smaller) slot, so the reader
+// silently skips however many pages they overshot by. Clamping to the bottom of the page
+// keeps them on the page they are reading; the still-valid offset is untouched when the page
+// grows, which is what the hold-the-offset rule is about.
             val pageHeight = getPageSlotHeight(page0)
-            if (pageHeight > 0f) currentPageHeight = pageHeight
+            if (pageHeight > 0f) {
+                scrollYInternal = clampScrollWithinPage(scrollYInternal, pageHeight)
+                currentPageHeight = pageHeight
+            }
             clampToDocumentEndLocked()
         }
 
