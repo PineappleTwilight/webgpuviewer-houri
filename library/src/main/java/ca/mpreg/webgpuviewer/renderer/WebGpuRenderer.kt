@@ -180,8 +180,11 @@ class WebGpuRenderer {
 
         private fun deviceDescriptor() = GPUDeviceDescriptor(
             deviceLostCallback = DeviceLostCallback { lostDevice, reason, message ->
+                val first = !deviceLost
                 deviceLost = true
-                Log.e("WebGpuRenderer", "WebGPU device lost reason=$reason: $message device=$lostDevice")
+                deviceLostDetail = "reason=$reason message=$message " +
+                        "lastError=${lastUncapturedError ?: "none"} device=$lostDevice"
+                Log.e("WebGpuRenderer", "WebGPU device lost $deviceLostDetail")
                 notifyDeviceLost(reason, message)
             },
             deviceLostCallbackExecutor = Executor(Runnable::run),
