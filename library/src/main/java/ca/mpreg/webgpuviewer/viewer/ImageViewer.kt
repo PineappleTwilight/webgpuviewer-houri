@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
@@ -28,6 +30,9 @@ import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.window.layout.FoldingFeature
+import androidx.window.layout.WindowInfoTracker
+import ca.mpreg.webgpuviewer.findActivity
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastForEach
 import ca.mpreg.webgpuviewer.NormalMotionDurationScale
@@ -60,16 +65,20 @@ fun ImageViewer(
     val minFlingVelocity = remember(view) {
         android.view.ViewConfiguration.get(view.context).scaledMinimumFlingVelocity.toFloat()
     }
-    // Get cutout top directly in px
-    val cutoutPx = WindowInsets.displayCutout.getTop(density).let { px ->
-        if (px == 0) {
-            val context = LocalContext.current
-            val resourceId =
-                context.resources.getIdentifier("status_bar_height", "dimen", "android")
-            context.resources.getDimensionPixelSize(resourceId).toFloat()
-        } else {
-            px.toFloat()
+    val context = LocalContext.current
+
+    val unfolded by produceState(false, context) {
+        val activity = context.findActivity() ?: return@produceState
+        WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info ->
+            value = info.displayFeatures.any { it is FoldingFeature }
         }
+    }
+    val statusBarPx = remember(context) {
+        val id = context.resources.getIdentifier("status_bar_height", "dimen", "android")
+        if (id != 0) context.resources.getDimensionPixelSize(id).toFloat() else 0f
+    }
+    val cutoutPx = WindowInsets.displayCutout.getTop(density).let { px ->
+        if (px == 0 && unfolded) statusBarPx else px.toFloat()
     }
 
     LaunchedEffect(density) {

@@ -3,6 +3,8 @@ package ca.mpreg.webgpuviewer.renderer
 import android.graphics.Rect
 import android.util.Log
 import androidx.webgpu.BufferUsage
+import androidx.webgpu.ErrorFilter
+import androidx.webgpu.ErrorType
 import androidx.webgpu.GPUBuffer
 import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUExtent3D
@@ -14,10 +16,15 @@ import androidx.webgpu.GPUTextureDescriptor
 import androidx.webgpu.GPUTextureView
 import androidx.webgpu.TextureFormat
 import androidx.webgpu.TextureUsage
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
 import java.nio.ByteBuffer
 import kotlin.math.ceil
 import kotlin.math.min
+import kotlin.time.Duration.Companion.milliseconds
 
 class Mipmap(
     val width: Int,
@@ -49,16 +56,25 @@ class Mipmap(
          */
         private const val UPLOAD_CHUNK_BYTES = 1 shl 20
 
+        /** Texel multiple every tile copy is widened to - see [writeSpan]. Two isn't enough. */
+        private const val COPY_ALIGNMENT = 4
+
+        /** [writeSpan]'s padded rows: one per uploading thread, grown, never shrunk. */
+        private val padScratch = ThreadLocal<ByteBuffer>()
+
         /**
          * Build a mipmap level from [pixels] and upload it.
          *
          * Suspends between chunks, so it must run outside the render mutex (see
          * [WebGpuRenderer.onDispatcher]) for the yields to be worth anything. The level is only
          * returned once every chunk has landed, so no caller can sample a half-filled texture.
+         *
+         * With [checkOom], a tile the driver cannot allocate throws [TextureOutOfMemory] instead of
+         * leaving an error texture behind - for oversized tiles a caller can retry smaller.
          */
         suspend fun create(
             pixels: ByteBuffer, width: Int, height: Int, scale: Float, tilesize: Int,
-            format: Int = TextureFormat.RGBA8Unorm
+            format: Int = TextureFormat.RGBA8Unorm, checkOom: Boolean = false,
         ): Mipmap {
             require(width > 0 && height > 0 && tilesize > 0) { "Mipmap.create: invalid dims ${width}x$height tilesize $tilesize" }
             require(!scale.isNaN() && !scale.isInfinite() && scale > 0f && scale <= 1f) { "Mipmap.create: invalid scale $scale" }
@@ -79,7 +95,7 @@ class Mipmap(
                 format = format,
             )
             try {
-                mipmap.upload(pixels)
+                mipmap.upload(pixels, checkOom)
             } catch (e: Throwable) {
                 // Yielding makes the upload cancellable, so a half-built level can now exist.
                 // Free whatever landed before rethrowing - the caller never sees this instance
@@ -91,8 +107,10 @@ class Mipmap(
         }
     }
 
+    class TextureOutOfMemory(message: String) : Exception(message)
+
     /** Allocate the tile textures and copy [pixels] into them a chunk at a time. */
-    private suspend fun upload(pixels: ByteBuffer) {
+    private suspend fun upload(pixels: ByteBuffer, checkOom: Boolean) {
         val need = width.toLong() * height * bytesPerPixel
         require(pixels.capacity() >= need) { "pixels hold ${pixels.capacity()} B, ${width}x$height needs $need" }
         val rowsPerChunk = (UPLOAD_CHUNK_BYTES / (width * bytesPerPixel)).coerceAtLeast(1)
@@ -117,10 +135,15 @@ class Mipmap(
 
                 // Unyielded driver work - not on the back of the chunk just uploaded.
                 yield()
+                if (checkOom) device.pushErrorScope(ErrorFilter.OutOfMemory)
                 val texture = try {
                     device.createTexture(
                         GPUTextureDescriptor(
-                            size = GPUExtent3D(allocW, allocH),
+                            // Four-texel aligned for [writeSpan], and at least 8 on a side for
+                            // the Adreno gralloc 0x3b workaround above.
+                            size = GPUExtent3D(
+                                alignedWidth(tileWidth).coerceAtLeast(allocW), allocH
+                            ),
                             format = format,
                             usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
                         )
@@ -129,7 +152,7 @@ class Mipmap(
                     System.gc()
                     throw e
                 } catch (e: Exception) {
-                    Log.e("Renderer", "Tile create failed ${tileWidth}x$tileHeight, trying fallback 8x8", e)
+                    Log.e("Renderer", "Tile create failed ${tileWidth}x${tileHeight}, trying fallback 8x8", e)
                     // Fallback: try 8x8 to see if driver tolerates padded size, else propagate
                     if (!isPadded) {
                         try {
@@ -145,25 +168,16 @@ class Mipmap(
                         }
                     } else throw e
                 }
+                textures.add(texture)
+                if (checkOom && popErrorScopePumped() == ErrorType.OutOfMemory) {
+                    throw TextureOutOfMemory("${tileWidth}x$tileHeight tile")
+                }
+                textureViews.add(texture.createView())
 
                 var row = 0
                 while (row < tileHeight) {
                     val rows = min(rowsPerChunk, tileHeight - row)
-
-                    device.queue.writeTexture(
-                        dataLayout = GPUTexelCopyBufferLayout(
-                            // Long arithmetic: y * width overflows Int well before the byte
-                            // offset does on a large page.
-                            offset = ((y + row).toLong() * width + x) * bytesPerPixel,
-                            bytesPerRow = width * bytesPerPixel,
-                            rowsPerImage = height,
-                        ),
-                        data = pixels,
-                        destination = GPUTexelCopyTextureInfo(
-                            texture = texture, origin = GPUOrigin3D(y = row)
-                        ),
-                        writeSize = GPUExtent3D(tileWidth, rows),
-                    )
+                    writeSpan(texture, pixels, x, tileWidth, x, x + tileWidth, y + row, row, rows)
 
                     row += rows
                     yield()
@@ -230,6 +244,20 @@ class Mipmap(
 
     @Volatile
     private var cleaned = false
+    /** popErrorScope only resolves while events are processed - pump them until it does. */
+    private suspend fun popErrorScopePumped(): Int = coroutineScope {
+        val pump = launch {
+            while (isActive) {
+                WebGpuRenderer.instance.processEvents()
+                delay(1.milliseconds)
+            }
+        }
+        try {
+            device.popErrorScope()
+        } finally {
+            pump.cancel()
+        }
+    }
 
     internal fun cleanup() {
         if (cleaned) return
@@ -277,18 +305,9 @@ class Mipmap(
                     // Cleanup can only land between chunks.
                     if (textures.size != tileCount) return false
                     val rows = min(rowsPerChunk, y1 - y)
-                    device.queue.writeTexture(
-                        dataLayout = GPUTexelCopyBufferLayout(
-                            offset = (y.toLong() * width + x0) * bytesPerPixel,
-                            bytesPerRow = width * bytesPerPixel,
-                            rowsPerImage = height,
-                        ),
-                        data = pixels,
-                        destination = GPUTexelCopyTextureInfo(
-                            texture = textures[r * tilesCols + c],
-                            origin = GPUOrigin3D(x = x0 - tileX, y = y - tileY),
-                        ),
-                        writeSize = GPUExtent3D(x1 - x0, rows),
+                    writeSpan(
+                        textures[r * tilesCols + c], pixels, tileX, min(tilesize, width - tileX),
+                        x0, x1, y, y - tileY, rows,
                     )
                     y += rows
                     yield()
@@ -299,6 +318,70 @@ class Mipmap(
     }
 
     private fun ceilDiv(a: Int, b: Int) = (a + b - 1) / b
+
+    private fun alignedWidth(w: Int) = (w + COPY_ALIGNMENT - 1) and (COPY_ALIGNMENT - 1).inv()
+
+    /**
+     * Copies columns [x0, x1) of rows [y, y + rows) of [pixels], a full image of this level, into
+     * [texture] - the tile at column [tileX], [tileWidth] wide - from its row [dstY].
+     *
+     * Every copy is a multiple of [COPY_ALIGNMENT] texels wide: a PowerVR Rogue driver lost the
+     * device, as out-of-memory, on pages 1125 pixels wide with almost nothing allocated - and
+     * still did padded to an even width, but not to a multiple of four. Padding only the texture,
+     * or only the source rows' stride, with the copy at the real width, lost it too: the copy's
+     * own width is what has to be aligned. So the span is widened to aligned columns,
+     * and where that runs off the tile into its padding, the last real column is repeated there
+     * from a packed copy of the rows.
+     */
+    private fun writeSpan(
+        texture: GPUTexture, pixels: ByteBuffer, tileX: Int, tileWidth: Int,
+        x0: Int, x1: Int, y: Int, dstY: Int, rows: Int,
+    ) {
+        val start = (x0 - tileX) and (COPY_ALIGNMENT - 1).inv()
+        val end = start + alignedWidth(x1 - tileX - start)
+        // Columns the image has; past them, only padding.
+        val real = min(end, tileWidth)
+        val spanBytes = (end - start) * bytesPerPixel
+
+        val layout: GPUTexelCopyBufferLayout
+        val data: ByteBuffer
+        if (end == real) {
+            data = pixels
+            layout = GPUTexelCopyBufferLayout(
+                // Long arithmetic: y * width overflows Int well before the byte offset does on
+                // a large page.
+                offset = (y.toLong() * width + tileX + start) * bytesPerPixel,
+                bytesPerRow = width * bytesPerPixel,
+                rowsPerImage = height,
+            )
+        } else {
+            val need = spanBytes * rows
+            data = padScratch.get()?.takeIf { it.capacity() >= need }
+                ?: ByteBuffer.allocateDirect(need).also { padScratch.set(it) }
+            data.clear()
+            val realBytes = (real - start) * bytesPerPixel
+            val src = pixels.duplicate()
+            for (r in 0 until rows) {
+                val rowStart = (((y + r).toLong() * width + tileX + start) * bytesPerPixel).toInt()
+                src.limit(rowStart + realBytes).position(rowStart)
+                data.put(src)
+                // The padding columns: the last real pixel again.
+                repeat(end - real) {
+                    src.limit(rowStart + realBytes).position(rowStart + realBytes - bytesPerPixel)
+                    data.put(src)
+                }
+            }
+            data.flip()
+            layout = GPUTexelCopyBufferLayout(offset = 0, bytesPerRow = spanBytes, rowsPerImage = rows)
+        }
+
+        device.queue.writeTexture(
+            dataLayout = layout,
+            data = data,
+            destination = GPUTexelCopyTextureInfo(texture = texture, origin = GPUOrigin3D(x = start, y = dstY)),
+            writeSize = GPUExtent3D(end - start, rows),
+        )
+    }
 
     class Quad(
         val tiles: List<GPUTexture>, val tileViews: List<GPUTextureView>, val x: Int, val y: Int
@@ -432,8 +515,8 @@ class Mipmap(
         val quad = Quad(
             listOf(t00, t01, t10, t11),
             listOf(v00, v01, v10, v11),
-            tX * t00.width,
-            tY * t00.height
+            tX * tilesize,
+            tY * tilesize
         )
         lastQuadTX = tX
         lastQuadTY = tY

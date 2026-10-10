@@ -13,6 +13,7 @@ import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUDeviceDescriptor
 import androidx.webgpu.GPUInstance
 import androidx.webgpu.GPUInstanceDescriptor
+import androidx.webgpu.GPULimits
 import androidx.webgpu.GPURequestAdapterOptions
 import androidx.webgpu.GPUSurface
 import androidx.webgpu.GPUSurfaceConfiguration
@@ -52,6 +53,13 @@ class WebGpuRenderer {
         lateinit var instance: GPUInstance
         lateinit var adapter: GPUAdapter
         lateinit var device: GPUDevice
+
+        /**
+         * The device's real texture size ceiling - requested at creation, since Compatibility mode
+         * otherwise caps it at 4096 whatever the hardware can do.
+         */
+        var maxTextureDimension2D = 4096
+            private set
         private val mutex = Mutex()
 
         @Volatile
@@ -191,6 +199,11 @@ class WebGpuRenderer {
             uncapturedErrorCallback = defaultUncapturedErrorCallback,
             uncapturedErrorCallbackExecutor = Executor(Runnable::run),
             requiredFeatures = requiredFeaturesFor(adapter),
+            // Requested at creation, since Compatibility mode otherwise caps it at 4096
+            // whatever the hardware can do.
+            requiredLimits = GPULimits(
+                maxTextureDimension2D = adapter.getLimits().maxTextureDimension2D,
+            ),
         )
 
         private fun requiredFeaturesFor(adapter: GPUAdapter): IntArray =
@@ -321,10 +334,15 @@ class WebGpuRenderer {
                     }
                     adapter = gotAdapter
 
+                    val adapterLimits = adapter.getLimits()
+
                     device = adapter.requestDevice(deviceDescriptor())
-                    initialized = true
-                    deviceLost = false
-                    initError = null
+                    maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+                    Log.i(
+                        "WebGpuRenderer",
+                        "maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} " +
+                            "device=$maxTextureDimension2D"
+                    )
                 } catch (e: Throwable) {
                     Log.e("WebGpuRenderer", "Failed to initialize WebGPU", e)
                     initialized = false

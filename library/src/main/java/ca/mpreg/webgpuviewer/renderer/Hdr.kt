@@ -2,7 +2,6 @@ package ca.mpreg.webgpuviewer.renderer
 
 import android.app.Activity
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.hardware.DataSpace
 import android.os.Build
@@ -39,6 +38,7 @@ import ca.mpreg.webgpuviewer.renderer.Hdr.resetContent
 import ca.mpreg.webgpuviewer.renderer.Hdr.retainHdrImage
 import ca.mpreg.webgpuviewer.renderer.Hdr.supportedByDevice
 import ca.mpreg.webgpuviewer.renderer.Hdr.syncColorMode
+import ca.mpreg.webgpuviewer.findActivity
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import java.lang.ref.WeakReference
@@ -622,14 +622,5 @@ object Hdr {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val activity = context.findActivity() ?: return
         activity.window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
-    }
-
-    private fun Context.findActivity(): Activity? {
-        var context: Context? = this
-        while (context != null) {
-            if (context is Activity) return context
-            context = (context as? ContextWrapper)?.baseContext
-        }
-        return null
     }
 }

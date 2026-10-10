@@ -11,6 +11,7 @@ kotlin-compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.
 
 [libraries]
 androidx-annotation = { module = "androidx.annotation:annotation", version = "1.11.0" }
+androidx-window = { module = "androidx.window:window", version = "1.5.1" }
 androidx-annotation-experimental = { module = "androidx.annotation:annotation-experimental", version = "1.6.0" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.11.0" }
 androidx-appcompat = { module = "androidx.appcompat:appcompat", version = "1.8.0" }
