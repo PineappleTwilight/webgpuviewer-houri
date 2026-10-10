@@ -10,6 +10,7 @@ import androidx.webgpu.GPUSamplerDescriptor
 import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureDescriptor
 import androidx.webgpu.GPUTextureView
+import androidx.webgpu.TextureFormat
 import androidx.webgpu.TextureUsage
 import ca.mpreg.webgpuviewer.renderer.Hdr
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer

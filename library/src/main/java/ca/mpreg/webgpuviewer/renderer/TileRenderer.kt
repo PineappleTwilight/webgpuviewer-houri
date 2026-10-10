@@ -1070,11 +1070,6 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                             size = GPUExtent3D(w, h),
                             format = TextureFormat.Stencil8,
                         )
-
-                    GPUTextureDescriptor(
-                        usage = TextureUsage.RenderAttachment,
-                        size = GPUExtent3D(dst.width, dst.height),
-                        format = TextureFormat.Stencil8,
                     )
                 } catch (e: OutOfMemoryError) {
                     System.gc()
@@ -1424,6 +1419,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         dst: GPUTexture,
         cameraDocY: Float,
         docTop: Float,
+        pageHeight: Float,
         viewerOffsetX: Float,
         scale: Float,
     ) {
@@ -1433,7 +1429,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         viewportWidth = dst.width
         viewportHeight = dst.height
 
-        val a = continuousAnchor(page, dst, cameraDocY, docTop, viewerOffsetX, scale) ?: return
+        val a = continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale)
+            ?: return
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
         // Preferred-size changes don't wipe either; same half-pixel camera tolerance as

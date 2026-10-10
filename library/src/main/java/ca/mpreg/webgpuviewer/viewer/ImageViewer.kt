@@ -136,358 +136,23 @@ fun ImageViewer(
                     }
                 } else null
 
-                    if (waitForCleanUp(firstDown.id, doubleTapTimeout, touchSlop) != null) {
-                        longPressJob?.cancel()
-                        // A stop settles below and fires no tap, but still waits out the double
-                        // tap window: it can be the first of a pair. Opt-out keeps secondDown
-                        // null: the single-tap path runs now, pair window never opens.
-                        val secondDown =
-                            if (state.doubleTapZoomEnabled) waitForDown(doubleTapTimeout) else null
-                        if (secondDown == null) {
-                            pageTurnJob?.cancel()
-                            if (state.pageOffset != 0f) {
-                                state.animationJob = scope.launch {
-                                    Animatable(state.pageOffset).animateTo(
-                                        0f, animationSpec = spring(
-                                            stiffness = Spring.StiffnessMediumLow,
-                                            visibilityThreshold = 0.002f
-                                        )
-                                    ) {
-                                        state.pageOffset = value
-                                        state.invalidate()
-                                    }
-                                }
-                            }
-                            page.animateTo(Offset(0.5f, 0.5f))
-                            if (!stoppedMotion) {
-                                state.onTap?.invoke(
-                                    Offset(
-                                        firstDown.position.x / state.width,
-                                        firstDown.position.y / state.height
-                                    )
-                                )
-                            }
-                            return@awaitEachGesture
-                        }
-
-                        if (waitForCleanUp(secondDown.id, doubleTapTimeout, touchSlop) != null) {
-                            // double tap — let any in-progress page turn finish committing first
-                            val tapX = secondDown.position.x / state.width
-                            val tapY = secondDown.position.y / state.height
-                            scope.launch {
-                                pageTurnJob?.join()
-                                val zoomPage = state.getPage(0) ?: return@launch
-                                if (zoomPage.atHomeScale) {
-                                    zoomPage.animateTo(
-                                        Offset(tapX, tapY), targetScale = zoomPage.doubleTapScale
-                                    )
-                                } else {
-                                    zoomPage.animateTo(
-                                        Offset(tapX, tapY), targetScale = zoomPage.homeScale
-                                    )
-                                }
-                            }
-                        } else {
-                            // double tap drag
-                            val velocityTracker = VelocityTracker()
-                            velocityTracker.addPointerInputChange(secondDown)
-
-                            val dragPointerId = secondDown.id
-
-                            val originalScale = page.scale
-                            val originalX = page.x
-                            val originalY = page.y
-                            var totalDeltaY = 0f
-
-                            state.animationJob?.cancel()
-
-                            page.isScaleAnimating = true
-                            var willFlingZoom = false
-                            try {
-                                while (true) {
-                                    val event = awaitPointerEvent(pass = PointerEventPass.Initial)
-                                    val change =
-                                        event.changes.firstOrNull { it.id == dragPointerId }
-
-                                    if (change == null || change.changedToUp() || change.isConsumed) {
-                                        break
-                                    }
-
-                                    velocityTracker.addPointerInputChange(change)
-
-                                    if (change.positionChanged()) {
-                                        val pan = event.calculatePan()
-                                        totalDeltaY += pan.y
-                                        if (totalDeltaY != 0f) {
-
-                                            val px = secondDown.position.x / state.width - 0.5f
-                                            val py = secondDown.position.y / state.height - 0.5f
-
-                                            var newScale =
-                                                originalScale * 10f.pow(2 * totalDeltaY / state.height)
-                                            // A restricted maxScale (zoom-in disabled clamps it to
-                                            // homeScale) bounds the gesture; otherwise overshoot
-                                            // settles back on release as before.
-                                            if (page.maxScale <= page.homeScale) {
-                                                newScale = newScale.coerceAtMost(page.maxScale)
-                                            }
-                                            page.scale = newScale
-                                            val diff = 1 / page.scale - 1 / originalScale
-
-                                            page.setPos(
-                                                (originalX + px * diff).orZero(),
-                                                (originalY + py * diff).orZero()
-                                            )
-
-                                            change.consume()
-                                        }
-                                    }
-                                }
-                                val dragVelocity = velocityTracker.calculateVelocity()
-                                // Decided before the finally below, so isScaleAnimating has no gap
-                                // between this drag ending and its fling starting.
-                                willFlingZoom =
-                                    abs(dragVelocity.y) > 200 && page.scale > page.homeScale && page.scale < page.maxScale
-                            } finally {
-                                if (!willFlingZoom) page.isScaleAnimating = false
-                            }
-
-                            val velocity = velocityTracker.calculateVelocity()
-                            if (willFlingZoom) {
-                                // fling zoom
-                                page.animationJob = scope.launch(NormalMotionDurationScale) {
-                                    try {
-                                        Animatable(0f).animateDecay(
-                                            velocity.y, exponentialDecay()
-                                        ) {
-                                            val px = secondDown.position.x / state.width - 0.5f
-                                            val py = secondDown.position.y / state.height - 0.5f
-
-                                            val newScale =
-                                                originalScale * 10f.pow(2 * (totalDeltaY + value) / state.height)
-
-                                            page.scale =
-                                                newScale.fastCoerceIn(page.homeScale, page.maxScale)
-                                            val diff = 1 / page.scale - 1 / originalScale
-
-                                            val x = (originalX + px * diff).orZero()
-                                            val y = (originalY + py * diff).orZero()
-
-                                            val minX = page.minX(page.scale)
-                                            val maxX = page.maxX(page.scale)
-                                            val minY = page.minY(page.scale)
-                                            val maxY = page.maxY(page.scale)
-
-                                            page.setPos(
-                                                x.fastCoerceIn(minX, maxX),
-                                                y.fastCoerceIn(minY, maxY)
-                                            )
-                                        }
-                                    } finally {
-                                        page.isScaleAnimating = false
-                                    }
-                                }
-                            } else {
-                                page.animateTo(
-                                    Offset(
-                                        secondDown.position.x / state.width,
-                                        secondDown.position.y / state.height
-                                    )
-                                )
-                            }
-                        }
-                    } else {
-                        if (!wasScrolling) page.animateTo(Offset(0.5f, 0.5f))
+                if (waitForCleanUp(firstDown.id, doubleTapTimeout, touchSlop) != null) {
+                    longPressJob?.cancel()
+                    // A stop settles below and fires no tap, but still waits out the double
+                    // tap window: it can be the first of a pair.
+                    val secondDown = waitForDown(doubleTapTimeout)
+                    if (secondDown == null) {
                         pageTurnJob?.cancel()
-
-                        var lastMoveTime = firstDown.uptimeMillis
-                        var lastEventTime: Long = firstDown.uptimeMillis
-                        var acc = Offset.Zero
-
-                        var scaleOrigin = Offset(0.5f, 0.5f)
-
-                        var single = true
-                        var pageTurning = wasScrolling
-
-                        // If grabbing mid-animation, update firstPos so panning continues smoothly
-                        if (wasScrolling) {
-                            state.firstPos = firstDown.position
-                        }
-
-                        val velocityTracker = VelocityTracker()
-                        velocityTracker.addPointerInputChange(firstDown)
-
-                        page.animationJob?.cancel()
-
-                        var canceled = false
-                        try {
-                            do {
-                                val event = awaitPointerEvent(pass = PointerEventPass.Initial)
-                                canceled = event.changes.any { it.isConsumed }
-                                if (canceled) {
-                                    longPressJob?.cancel()
-                                } else {
-                                    val change = event.changes[0]
-                                    lastEventTime = change.uptimeMillis
-
-                                    if (change.positionChanged()) {
-                                        lastMoveTime = change.uptimeMillis
-                                    }
-
-                                    val centroid = event.calculateCentroid(useCurrent = true)
-
-                                    val twoFingers =
-                                        event.changes.size > 1 && event.changes.all { it.pressed }
-                                    page.isScaleAnimating = twoFingers
-
-                                    var pointerCountChanged = false
-                                    if (twoFingers) {
-                                        if (single && !pageTurning) {
-                                            longPressJob?.cancel()
-                                            velocityTracker.resetTracking()
-                                            acc = Offset.Zero
-                                            pointerCountChanged = true
-                                        }
-                                        if (!pageTurning) {
-                                            velocityTracker.addPointerInputChange(change)
-                                            single = false
-                                            scaleOrigin = Offset(
-                                                centroid.x / state.width, centroid.y / state.height
-                                            )
-                                        }
-                                    } else if (single) {
-                                        velocityTracker.addPointerInputChange(change)
-                                    }
-
-                                    if (pointerCountChanged) continue
-
-                                    val pan = event.calculatePan()
-                                    if (acc.getDistance() > touchSlop) longPressJob?.cancel()
-                                    acc += pan
-
-                                    if (pageTurning) {
-                                        val prev = state.pageOffset
-                                        // Always the raw drag direction - pageOffset's sign is
-                                        // also the live visual pan amount (see renderSnapshot's use
-                                        // of it as a transition's frac), so it has to keep tracking
-                                        // the finger 1:1 regardless of reading direction. isReversed
-                                        // is resolved separately, in getPage/onPageChange, where it
-                                        // only affects which page a crossing reveals - not how far
-                                        // the finger has to move to cause one.
-                                        val panAmount =
-                                            if (state.isVertical) -pan.y / state.height else -pan.x / state.width
-                                        state.pageOffset += panAmount
-                                        if ((prev > 0f && state.pageOffset <= 0f) || (prev < 0f && state.pageOffset >= 0f)) {
-                                            state.pageOffset = 0f
-                                            pageTurning = false
-                                            acc = Offset.Zero
-                                        }
-                                        state.currentPos = event.changes[0].position
-                                        state.invalidate()
-                                        event.changes.fastForEach { if (it.positionChanged()) it.consume() }
-                                    } else {
-                                        val zoom = event.calculateZoom()
-
-                                        if (zoom != 1f || pan != Offset.Zero) {
-                                            var newScale = page.scale * zoom
-                                            // A restricted maxScale (zoom-in disabled clamps it to
-                                            // homeScale) bounds the gesture; otherwise overshoot
-                                            // settles back on release as before.
-                                            if (page.maxScale <= page.homeScale) {
-                                                newScale = newScale.coerceAtMost(page.maxScale)
-                                            }
-                                            val diff = 1 / newScale - 1 / page.scale
-
-                                            var x = page.x + (pan.x / state.width) / page.scale
-                                            var y = page.y + (pan.y / state.height) / page.scale
-
-                                            x += (centroid.x / state.width - 0.5f) * diff
-                                            y += (centroid.y / state.height - 0.5f) * diff
-
-                                            val minX = page.minX(newScale)
-                                            val maxX = page.maxX(newScale)
-                                            val minY = page.minY(newScale)
-                                            val maxY = page.maxY(newScale)
-
-                                            if (single) {
-                                                val clampedX = x.fastCoerceIn(minX, maxX)
-                                                val clampedY = y.fastCoerceIn(minY, maxY)
-                                                val overflow = if (state.isVertical) {
-                                                    y - clampedY
-                                                } else {
-                                                    x - clampedX
-                                                }
-                                                val isBiased = if (state.isVertical) {
-                                                    abs(acc.y) > abs(acc.x)
-                                                } else {
-                                                    abs(acc.x) > abs(acc.y)
-                                                }
-                                                if (overflow != 0f && isBiased) {
-                                                    page.animateTo(Offset(0.5f, 0.5f))
-                                                    pageTurning = true
-                                                    state.firstPos = firstDown.position
-                                                    state.pageOffset += -overflow * page.scale
-                                                    state.invalidate()
-                                                }
-                                                x = clampedX
-                                                y = clampedY
-                                            }
-
-                                            page.scale = newScale
-                                            page.setPos(x.orZero(), y.orZero())
-
-                                            event.changes.fastForEach { if (it.positionChanged()) it.consume() }
-                                        }
-                                    }
-                                }
-                            } while (!canceled && event.changes.any { it.pressed })
-                        } finally {
-                            page.isScaleAnimating = false
-                        }
-
-                        longPressJob?.cancel()
-                        if (longPressed || canceled) return@awaitEachGesture
-
-                        if (pageTurning) {
-                            val velocity = velocityTracker.calculateVelocity()
-                            // Always raw, matching panAmount above - see that comment.
-                            val initialVelocity =
-                                if (state.isVertical) -velocity.y / state.height else -velocity.x / state.width
-
-                            // Flicking opposite to current direction = go back to 0
-                            val flickingOpposite =
-                                (state.pageOffset > 0f && initialVelocity < -0.5f) || (state.pageOffset < 0f && initialVelocity > 0.5f)
-
-                            val target = when {
-                                flickingOpposite -> 0f
-                                initialVelocity > 1f && state.haveNext -> 1f
-                                initialVelocity < -1f && state.havePrev -> -1f
-                                state.pageOffset > 0.5f && state.haveNext -> 1f
-                                state.pageOffset < -0.5f && state.havePrev -> -1f
-                                else -> 0f
-                            }
-
-                            if (!state.transition.isAnimated) {
-                                // No-animation transition: snap to the landing page. Assigning
-                                // through pageOffset still walks whole-page deltas, so a commit
-                                // fires onPageChange exactly like the spring path would.
-                                state.pageOffset = target
-                                state.invalidate()
-                            } else {
-                                state.animationJob = scope.launch {
-                                    val anim = Animatable(state.pageOffset)
-                                    anim.updateBounds(lowerBound = -1f, upperBound = 1f)
-                                    anim.animateTo(
-                                        target,
-                                        initialVelocity = initialVelocity,
-                                        animationSpec = spring(
-                                            stiffness = Spring.StiffnessMediumLow,
-                                            visibilityThreshold = 0.002f
-                                        )
-                                    ) {
-                                        state.pageOffset = value
-                                        state.invalidate()
-                                    }
+                        if (state.pageOffset != 0f) {
+                            state.animationJob = scope.launch {
+                                Animatable(state.pageOffset).animateTo(
+                                    0f, animationSpec = spring(
+                                        stiffness = Spring.StiffnessMediumLow,
+                                        visibilityThreshold = 0.002f
+                                    )
+                                ) {
+                                    state.pageOffset = value
+                                    state.invalidate()
                                 }
                             }
                         }
@@ -504,6 +169,7 @@ fun ImageViewer(
                     }
 
                     if (waitForCleanUp(secondDown.id, doubleTapTimeout, touchSlop) != null) {
+                        if (!state.doubleTapZoomEnabled) return@awaitEachGesture
                         // double tap — let any in-progress page turn finish committing first
                         val tapX = secondDown.position.x / state.width
                         val tapY = secondDown.position.y / state.height
@@ -723,7 +389,9 @@ fun ImageViewer(
                                     state.invalidate()
                                     event.changes.fastForEach { if (it.positionChanged()) it.consume() }
                                 } else {
-                                    val zoom = event.calculateZoom()
+                                    // Off leaves two fingers panning without scaling.
+                                    val zoom =
+                                        if (state.pinchZoomEnabled) event.calculateZoom() else 1f
 
                                     if (zoom != 1f || pan != Offset.Zero) {
                                         val newScale = page.scale * zoom
@@ -798,6 +466,13 @@ fun ImageViewer(
                             else -> 0f
                         }
 
+                        if (!state.transition.isAnimated) {
+                            // No-animation transition: snap to the landing page. Assigning
+                            // through pageOffset still walks whole-page deltas, so a commit
+                            // fires onPageChange exactly like the spring path would.
+                            state.pageOffset = target
+                            state.invalidate()
+                        } else {
                         state.animationJob = scope.launch {
                             val anim = Animatable(state.pageOffset)
                             anim.updateBounds(lowerBound = -1f, upperBound = 1f)
@@ -812,6 +487,7 @@ fun ImageViewer(
                                 state.pageOffset = value
                                 state.invalidate()
                             }
+                        }
                         }
                     } else {
                         val minX = page.minX(page.scale)
@@ -871,6 +547,7 @@ fun ImageViewer(
                         }
                     }
                 }
+            }
         }
 
     ViewerSurface(surfaceModifier) { surface, width, height ->

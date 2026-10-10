@@ -381,7 +381,6 @@ fun ImageViewerContinuous(
                     var multiZoomed = false
 
                     var canceled = false
-                    state.isPanning = true
                     try {
                         do {
                             val event = awaitPointerEvent()
@@ -464,7 +463,6 @@ fun ImageViewerContinuous(
                         } while (!canceled && event.changes.any { it.pressed })
                     } finally {
                         state.isScaleAnimating = false
-                        state.isPanning = false
                         state.invalidate()
                     }
 
@@ -542,6 +540,7 @@ fun ImageViewerContinuous(
                 attachHdrDisplay(view)
                 state.prepareForSurface()
                 state.init(scope, surface, width, height)
+                surface.onChanged { w, h -> state.resize(w, h) }
                 // After init, so Hdr.resolve has run and the surface's capability is known too.
                 attachHdrSurface(view)
                 state.invalidate()

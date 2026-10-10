@@ -7,6 +7,7 @@ import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
+import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUFragmentState
 import androidx.webgpu.GPUPrimitiveState
@@ -127,7 +128,7 @@ fun Draw.circle(
     val b = (color and 0xFF) / 255f
     val a = ((color ushr 24) and 0xFF) / 255f
 
-    val byteBuffer = byteBufferLocal.get()!!
+    val byteBuffer = byteBufferLocal.get()
     byteBuffer.clear()
     byteBuffer.putFloat(cx)
     byteBuffer.putFloat(cy)
@@ -139,7 +140,9 @@ fun Draw.circle(
     byteBuffer.putFloat(a)
     byteBuffer.flip()
 
-    val uniformBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
+    val uniformBuffer = device.createBuffer(
+        GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
+    )
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
     val pipeline = pipelines[format]
@@ -153,7 +156,6 @@ fun Draw.circle(
             )
         )
     )
-    pass.setBindGroup(0, bindGroup)
     pass.draw(6)
     uniformBuffer.close()
 }

@@ -372,11 +372,11 @@ class Image private constructor(
             try {
                 WebGpuRenderer.withContext { device ->
                     try {
-                        ensureBuffer(device)
+                        image.ensureBuffer(device)
                         image.mipmaps.add(Mipmap(width, height))
                     } catch (e: Exception) {
                         Log.e("Renderer", "Error creating drawable image", e)
-                        destroyBuffer()
+                        image.destroyBuffer()
                         throw e
                     }
                 }
@@ -464,6 +464,9 @@ class Image private constructor(
             background?.let { this@Image.backgroundColor = it }
         }
     }
+
+    @Volatile
+    private var cleaned = false
 
     private var _buffer: GPUBuffer? = WebGpuRenderer.device.createBuffer(
         GPUBufferDescriptor(size = BUFFER_SIZE, usage = BufferUsage.CopyDst or BufferUsage.Uniform)

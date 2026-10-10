@@ -475,10 +475,6 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     private object EmptySnapshot
 
-    private companion object {
-        const val MAX_RETRIES = 10
-    }
-
     private class RenderSnapshot(
         val currentPage: ImagePage,
         val adjacentPage: ImagePage?,
@@ -637,5 +633,8 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
         /** Coalescing window for non-forced [emitReaderState] (scroll settles). */
         const val READER_STATE_THROTTLE_MS = 500L
+
+        /** FrameResult.Retry attempts past which collect() parks until something else invalidates. */
+        const val MAX_RETRIES = 10
     }
 }

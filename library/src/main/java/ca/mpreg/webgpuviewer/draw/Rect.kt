@@ -7,6 +7,7 @@ import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
+import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUFragmentState
@@ -149,9 +150,7 @@ fun Draw.rect(
  *
  * A fresh uniform buffer is allocated per call: several rects can share one pass, and
  * `queue.writeBuffer` is ordered against `submit` rather than against other writes, so a reused
- * buffer would give every rect in the batch the last colour written. Destroyed as soon as the
- * draw is recorded - the render pass runs this every frame for a page placeholder, and an
- * undestroyed buffer per call accumulated until the driver ran out of memory.
+ * buffer would give every rect in the batch the last colour written.
  */
 fun Draw.rect(
     pass: GPURenderPassEncoder,
@@ -168,7 +167,7 @@ fun Draw.rect(
     val b = (color and 0xFF) / 255f
     val a = ((color ushr 24) and 0xFF) / 255f
 
-    val byteBuffer = byteBufferLocal.get()!!
+    val byteBuffer = byteBufferLocal.get()
     byteBuffer.clear()
     byteBuffer.putFloat(x1)
     byteBuffer.putFloat(y1)
@@ -180,7 +179,9 @@ fun Draw.rect(
     byteBuffer.putFloat(a)
     byteBuffer.flip()
 
-    val uniformBuffer = createBuffer(32L, BufferUsage.Uniform or BufferUsage.CopyDst)
+    val uniformBuffer = device.createBuffer(
+        GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
+    )
     device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
 
     val pipeline = pipelines[format]
@@ -194,7 +195,6 @@ fun Draw.rect(
             )
         )
     )
-    pass.setBindGroup(0, bindGroup)
     pass.draw(6)
     uniformBuffer.close()
 }

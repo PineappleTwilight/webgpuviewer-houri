@@ -14,8 +14,6 @@ import ca.mpreg.webgpuviewer.renderer.Image
 import ca.mpreg.webgpuviewer.renderer.RenderPage
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
-import ca.mpreg.webgpuviewer.viewer.ImageViewerContinuousState.Companion.MAX_PAGE_WALK
-import ca.mpreg.webgpuviewer.viewer.ImageViewerContinuousState.Companion.MAX_VISIBLE_PAGES
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -228,11 +226,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         emitReaderState()
     }
 
-    private val safeScale: Float get() = if (scale.isSane() && scale > 0f) scale else 1f
-
-    /** Page-space height of the viewport. Runs from page-space 0 - the camera is top-anchored. */
-    private val bandHeight: Double get() = height / safeScale.toDouble()
-
     /**
      * Smallest slot height the last [captureRenderState] walk saw.
      *
@@ -260,11 +253,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             bottom += pageHeight + pageGapPx
             if (bottom - pageGapPx - viewportHeight > scrollYInternal) break
         }
-
-        // Zoomed out past what [MAX_VISIBLE_PAGES] can measure. Bound by the last page it
-        // reaches, not "no bound": past that is only blank, and unbounded scrolls off and snaps
-        // back once the end comes into range.
-        return max(0.0, slotTop - pageGapPx) - bottomEdge
+        return null
     }
 
     private fun clampToDocumentEndLocked(maxPages: Int = reachForViewport()) {
@@ -547,20 +536,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (!deltaPixels.isFinite()) return
         animationJob?.cancel()
         animationJob = scope?.launch {
-            isFlinging = true
-            try {
-                var lastValue = 0f
-                animate(
-                    0f, deltaPixels, animationSpec = spring(
-                        stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
-                    )
-                ) { value, _ ->
-                    scrollBy(value - lastValue)
-                    lastValue = value
-                    invalidate()
-                }
-            } finally {
-                isFlinging = false
+            var lastValue = 0f
+            animate(
+                0f, deltaPixels, animationSpec = spring(
+                    stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
+                )
+            ) { value, _ ->
+                scrollBy(value - lastValue)
+                lastValue = value
                 invalidate()
             }
         }
@@ -589,7 +572,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
      * document-space top the draw walk would compute for it, so the prewarmed grid matches
      * what drawing asks for once the page scrolls into view.
      */
-    private class PrewarmTarget(val page: ImagePage.ImageSingle, val docTop: Float)
+    private class PrewarmTarget(
+        val page: ImagePage.ImageSingle,
+        val docTop: Float,
+        val pageHeight: Float,
+    )
 
     private class ContinuousRenderSnapshot(
         val pages: List<VisiblePage>,
@@ -600,14 +587,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val prewarmTargets: List<PrewarmTarget>,
     )
 
-    override fun captureRenderState(): Any {
-        val snapshot = captureLocked()
-
-        if (isFlinging || isPanning) onViewport?.runCatching { invoke(snapshot.readThrough) }
-        return snapshot
-    }
-
-    private fun captureLocked(): ContinuousRenderSnapshot = synchronized(scrollLock) {
+    override fun captureRenderState(): Any = synchronized(scrollLock) {
         val screenH = height.toFloat()
         val page0 = getPage(0)
 
@@ -665,8 +645,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val cameraDocY = (anchorDocYInternal - y0 + 0.5 * screenH).toFloat()
 
         val pages = mutableListOf<VisiblePage>()
-        // Undecoded ones too: [pages] skips them, and their decode's invalidate must still land.
-        val visible = mutableListOf<ImagePage>()
+        val visTop = 0.5f * screenH - screenH / (2f * scale)
+        val screenBot = 0.5f * screenH + screenH / (2f * scale)
+        val visBot = screenBot + tiles.preferredTileSize / scale
+        // Same one-tile margin above as visBot carries below: scrolling up had no lookahead,
+        // so tiles only started generating once visible. Page inclusion uses this; the
+        // scrolled-through check below keeps the unextended visTop so read position doesn't
+        // advance for a page that is still half on screen.
+        val visTopTiles = visTop - tiles.preferredTileSize / scale
 
         fun isScrolledThrough(top: Float, pageHeight: Float) =
             pageHeight > 0f && (top + pageHeight <= screenBot || top < visTop)
@@ -693,17 +679,12 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         while (yTop > visTopTiles && -iBack <= reachLimit(yTop - visTopTiles)) {
             val page = getPage(iBack) ?: break
             above = -iBack
-            val contentHeight = getPageHeight(page)
-            val pageHeight = contentHeight + pageGapPx
-            docTopBack -= pageHeight
-            yTop -= pageHeight
-            // Walking up, so the first match is the deepest one above page 0.
-            if (scrolledThrough == null && isScrolledThrough(yTop, contentHeight)) {
-                scrolledThrough = page
-            }
-            visible.add(page)
-            // Walked upward, so each goes in front of the last - top to bottom, as the
-            // forward walk appends.
+            val pageHeight = getPageHeight(page)
+            val slotHeight = pageHeight + pageGapPx
+            if (slotHeight > 0f) smallestSlot = minOf(smallestSlot, slotHeight)
+            docTopBack -= slotHeight.toDouble()
+            yTop -= slotHeight
+            if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
             if (page.isDecoded) {
                 pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight))
             }
@@ -722,15 +703,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             below = i
             if (hasPrev) docTop += prevSlot.toDouble()
             hasPrev = true
-            val contentHeight = getPageHeight(page)
-            val pageHeight = contentHeight + pageGapPx
-
-            // Walking down, so a later match replaces whatever the backward walk found.
-            if (isScrolledThrough(y, contentHeight)) scrolledThrough = page
-
-            if (y + pageHeight > visTop) {
-                visible.add(page)
-                if (page.isDecoded) pages.add(VisiblePage(page, docTop, pageHeight, contentHeight))
+            val pageHeight = getPageHeight(page)
+            if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
+            if (y + pageHeight > visTopTiles && page.isDecoded) {
+                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
@@ -739,7 +715,35 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             i++
         }
 
-        publishOnScreen(visible)
+        // Idle decode-ahead: the next pages below the visible window, with the same docTop
+        // math as the walk above. Drawn pages never touch these - renderSnapshot prewarms
+        // their tiles while nothing is moving, so scrolling down arrives sharp. Kept out of
+        // pages/pagesBelow/onScreenPages: nothing here is on screen yet.
+        val prewarmTargets = ArrayList<PrewarmTarget>(PREWARM_AHEAD_PAGES)
+        // Gated like renderSnapshot's prewarm call below: no fetches for off-screen pages
+        // while a gesture or fling is driving the camera, when they'd be stale on arrival.
+        if (!isScaleAnimating && !isFlinging) {
+            var extra = 0
+            while (extra < PREWARM_AHEAD_PAGES && i <= reachLimit(visBot - y)) {
+                val page = getPage(i) ?: break
+                if (hasPrev) docTop += prevSlot.toDouble()
+                hasPrev = true
+                val pageHeight = getPageHeight(page)
+                if (pageHeight <= 0f) break
+                val single = page as? ImagePage.ImageSingle
+                if (single != null && single.isDecoded && !single.destroyed) {
+                    prewarmTargets.add(
+                        PrewarmTarget(single, docTop.toFloat(), pageHeight)
+                    )
+                }
+                prevSlot = pageHeight + pageGapPx
+                y += prevSlot
+                i++
+                extra++
+            }
+        }
+
+        onScreenPages = pages.map { it.page }
         pagesBelow = below
         pagesAbove = above
         if (smallestSlot != Float.MAX_VALUE) smallestSlotSeen = smallestSlot
@@ -833,6 +837,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         texture,
                         s.cameraDocY,
                         d.vp.docTop,
+                        d.vp.pageHeight,
                         s.offsetX,
                         s.scale,
                         s.suppressGeneration
@@ -858,7 +863,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val top = anchorY + s.scale * d.vp.docTop
                         page.drawFade(
                             pass,
-                            texture.format,
                             (anchorX - s.scale * dstW / 2f) / dstW,
                             top / dstH,
                             (anchorX + s.scale * dstW / 2f) / dstW,
@@ -868,7 +872,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 }
             }
         } else {
-            Draw.clear(encoder, texture, s.backgroundColor)
+            Draw.clear(encoder, texture, 0)
         }
 
         s.pages.forEach { vp ->
@@ -878,7 +882,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
             val renderScale = s.scale * page.scale
             val targetX = anchorX
-            val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.contentHeight)
+            val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.pageHeight)
 
             val x = (targetX - dstW / 2f) / (renderScale * dstW)
             val y = (targetY - dstH / 2f) / (renderScale * dstH)
@@ -891,7 +895,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (!s.suppressGeneration && allCovered) {
             s.prewarmTargets.forEach { target ->
                 tiles.prewarmContinuous(
-                    target.page, texture, s.cameraDocY, target.docTop, s.offsetX, s.scale
+                    target.page, texture, s.cameraDocY, target.docTop,
+                    target.pageHeight, s.offsetX, s.scale
                 )
             }
         }

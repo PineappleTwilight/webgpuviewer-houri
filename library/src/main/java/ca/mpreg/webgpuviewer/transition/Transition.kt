@@ -361,12 +361,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Bumped on every swap or clear; a render records its metadata only if unchanged.
         private var cacheGeneration = 0
 
-        // Textures pending destruction (deferred to avoid use-after-free), with the views over them:
-        // a view is a Dawn handle of its own and only close() releases it.
-        private var pendingDestroy1: GPUTexture? = null
-        private var pendingDestroy2: GPUTexture? = null
-        private var pendingView1: GPUTextureView? = null
-        private var pendingView2: GPUTextureView? = null
+        // Deferred to avoid use-after-free - safe now that at least one frame has passed.
+        // A view is a Dawn handle of its own and only close() releases it, so the views are
+        // tracked beside the textures they were made from.
+        private val pendingDestroy = ArrayList<GPUTexture>(4)
+        private val pendingDestroyViews = ArrayList<GPUTextureView>(4)
 
         private fun ensureTexturesLocked(width: Int, height: Int) {
             if (pendingDestroy.isNotEmpty()) {
@@ -390,6 +389,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             if (cacheWidth != w || cacheHeight != h || cacheFormat != format) {
                 texture1?.let { pendingDestroy.add(it) }
                 texture2?.let { pendingDestroy.add(it) }
+                view1?.let { pendingDestroyViews.add(it) }
+                view2?.let { pendingDestroyViews.add(it) }
                 view1?.let { pendingDestroyViews.add(it) }
                 view2?.let { pendingDestroyViews.add(it) }
 
