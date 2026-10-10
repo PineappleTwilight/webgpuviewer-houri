@@ -34,13 +34,22 @@ object ImageUtil {
     fun resize(source: ByteBuffer, width: Int, height: Int): ByteBuffer {
         requireAvailable()
         require(width >= 8 && height >= 8) { "resize: dimensions must be >=8, got ${width}x$height (avoids gralloc 0x3b)" }
-        require(width <= 8192 && height <= 8192) { "resize: dimensions too large ${width}x$height" }
-        require(width in 8..16384 && height in 8..16384) { "resize: non-finite dimensions ${width}x$height" }
+        // 16384 per side, the native contract (resize.cpp refuses past it) and the same bound
+        // Image.invoke validates a whole page against and Mipmap.create uploads under. The old
+        // 8192 cap was stricter than every caller, so the first mipmap step of a long strip
+        // (an 800x16000 webtoon segment) threw "dimensions too large" and the chain stopped at
+        // level 0 - every zoomed-out frame then sampled the full-res texture through the tile
+        // grid, which is the stutter the long-strip reader showed.
+        require(width <= 16384 && height <= 16384) { "resize: dimensions too large ${width}x$height" }
         require(source.isDirect) { "resize: source must be direct ByteBuffer" }
         val srcNeeded = width.toLong() * height * 4L
         require(srcNeeded >= 0) { "resize: src overflow ${width}x$height" }
         require(source.capacity().toLong() >= srcNeeded) { "resize: source capacity ${source.capacity()} < needed $srcNeeded" }
-        if (srcNeeded > 64L * 1024 * 1024) throw IllegalArgumentException("resize: src too large ${width}x$height")
+        // The 64MP area Image.invoke accepts a whole page at, in bytes. The source is the
+        // caller's own buffer - nothing is allocated for it here - so this is the contract
+        // check, not an allocation guard; the only allocation is the destination, bounded a
+        // quarter of it below. The old 64MB byte cap rejected any strip wider than ~1600px.
+        require(srcNeeded <= 256L * 1024 * 1024) { "resize: src too large ${width}x$height" }
         val dstWidth = (width / 2).coerceAtLeast(8)
         val dstHeight = (height / 2).coerceAtLeast(8)
         if (dstWidth < 8 || dstHeight < 8) throw IllegalArgumentException("resize: dst too small ${dstWidth}x$dstHeight")
