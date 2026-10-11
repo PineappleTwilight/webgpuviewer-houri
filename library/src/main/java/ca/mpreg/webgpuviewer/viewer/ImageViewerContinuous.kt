@@ -411,7 +411,8 @@ fun ImageViewerContinuous(
                                 velocityTracker.addPointerInputChange(change)
 
                                 val pan = event.calculatePan()
-                                val zoom = event.calculateZoom()
+                                val zoom =
+                                    if (state.pinchZoomEnabled) event.calculateZoom() else 1f
                                 // Any two fingers down: a quiet moment mid-pinch is still
                                 // a pinch, so generation stays held off.
                                 state.isScaleAnimating =

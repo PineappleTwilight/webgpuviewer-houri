@@ -647,13 +647,17 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         get() = atlasOrNull
             ?: TileAtlas(atlasSide(), Hdr.frameFormat).also { atlasOrNull = it }
 
-    /** Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. Capped at 4096. */
+    /**
+     * Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. Uncapped: the
+     * budget is already byte-bounded, and capping the side truncated the atlas under its own
+     * budget once the viewport (times [cacheScreens]) asked for more than 64 slabs.
+     */
     private fun atlasSide(): Int {
         val budget = budgetTiles()
         atlasBudgetTiles = budget
         val perSlab = (SLAB_SIZE / TILE_SIZE) * (SLAB_SIZE / TILE_SIZE)
         val slabs = (budget + perSlab - 1) / perSlab
-        return ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1).coerceAtMost(8) * SLAB_SIZE
+        return ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1) * SLAB_SIZE
     }
 
     private fun newGrid(page: ImagePage.ImageSingle, pageScale: Float) = PageTiles(

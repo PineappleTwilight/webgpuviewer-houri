@@ -81,7 +81,12 @@ class Mipmap(
             if (width < 8 || height < 8) throw IllegalArgumentException("Mipmap too small ${width}x$height, refusing <8 to avoid gralloc 0x3b")
             if (width > 16384 || height > 16384) throw IllegalArgumentException("Mipmap too large ${width}x$height")
             if (width.toLong() * height > 64L * 1024 * 1024) throw IllegalArgumentException("Mipmap area too large ${width}x$height")
-            require(tilesize in 8..4096) { "Mipmap.create: invalid tilesize $tilesize" }
+            // Up to the device's own ceiling: a level may be uploaded as one large tile rather
+            // than split at TILESIZE (see Image.Level.upload), and Compatibility mode reports at
+            // least 4096 whatever the hardware can do.
+            require(tilesize in 8..WebGpuRenderer.maxTextureDimension2D.coerceAtLeast(4096)) {
+                "Mipmap.create: invalid tilesize $tilesize"
+            }
             require(pixels.isDirect) { "Mipmap.create: pixels must be direct" }
             require(pixels.capacity().toLong() >= width.toLong() * height * 4L) { "Mipmap.create: pixels too small" }
             if (!WebGpuRenderer.isAvailable) throw IllegalStateException("Mipmap.create: WebGPU not available")
