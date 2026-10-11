@@ -567,8 +567,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             val (texture, view, identityMatches, blittedKeys) = synchronized(cacheLock) {
                 ensureTexturesLocked(dstWidth, dstHeight)
                 generation = cacheGeneration
-                val texture = if (isPage1) texture1!! else texture2!!
-                val view = if (isPage1) view1!! else view2!!
+                val texture = (if (isPage1) texture1 else texture2) ?: return null
+                val view = (if (isPage1) view1 else view2) ?: return null
                 val blitted = if (isPage1) blittedKeys1 else blittedKeys2
                 // Never a hit for an animated page - it swaps images every frame, so every call
                 // needs a fresh LoadOp.Clear + renderCacheSeed to blit whatever frame is current
