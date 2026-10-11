@@ -1,5 +1,8 @@
 package ca.mpreg.webgpuviewer.viewer
 
+import android.graphics.Rect
+import android.graphics.RectF
+
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.spring
@@ -115,10 +118,30 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
     fun getPageHeight(page: ImagePage): Float {
         if (page !is ImagePage.ImageSingle) return page.height.toFloat()
-        val pageWidth = page.width
+        val crop = cropOf(page)
+        val pageWidth = crop?.width() ?: page.width
         if (pageWidth <= 0) return page.height.toFloat()
         if (width <= 0) return page.height.toFloat()
-        return page.height * (width.toFloat() / pageWidth)
+        return (crop?.height() ?: page.height) * (width.toFloat() / pageWidth)
+    }
+
+    /**
+     * Cut each page to its measured trim: the trim fills the viewer's width, its slot is the
+     * trim's height, and nothing outside it draws. Unlike the paged viewer, no zoom is involved.
+     */
+    var cropBorders: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            currentPageHeight = null
+            invalidate()
+        }
+
+    /** The part of [page] drawn, in its own pixels; null for all of it. */
+    private fun cropOf(page: ImagePage.ImageSingle): Rect? {
+        if (!cropBorders) return null
+        val trim = page.image?.trim ?: return null
+        return if (trim.width() > 0 && trim.height() > 0) Rect(trim) else null
     }
 
     /**
@@ -552,7 +575,15 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     private fun Float.isFinite(): Boolean = !isNaN() && !isInfinite()
     private fun Double.isFinite(): Boolean = !isNaN() && !isInfinite()
 
-    private class VisiblePage(val page: ImagePage, val docTop: Float, val pageHeight: Float)
+    private class VisiblePage(
+        val page: ImagePage,
+        val docTop: Float,
+        val pageHeight: Float,
+        /** As [getPageHeight] measured it, so the draw places what the layout sized. */
+        val crop: Rect?,
+    )
+
+    private fun cropFor(page: ImagePage) = (page as? ImagePage.ImageSingle)?.let(::cropOf)
 
     private data class PlacedImage(
         val image: Image,
@@ -576,6 +607,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val page: ImagePage.ImageSingle,
         val docTop: Float,
         val pageHeight: Float,
+        val crop: Rect?,
     )
 
     private class ContinuousRenderSnapshot(
@@ -686,7 +718,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             yTop -= slotHeight
             if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
             if (page.isDecoded) {
-                pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight))
+                pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight, cropFor(page)))
             }
             if (pageHeight <= 0f) break
             iBack--
@@ -706,7 +738,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val pageHeight = getPageHeight(page)
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
             if (y + pageHeight > visTopTiles && page.isDecoded) {
-                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight))
+                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight, cropFor(page)))
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
@@ -733,7 +765,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 val single = page as? ImagePage.ImageSingle
                 if (single != null && single.isDecoded && !single.destroyed) {
                     prewarmTargets.add(
-                        PrewarmTarget(single, docTop.toFloat(), pageHeight)
+                        PrewarmTarget(single, docTop.toFloat(), pageHeight, cropFor(single))
                     )
                 }
                 prevSlot = pageHeight + pageGapPx
@@ -757,6 +789,18 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         ContinuousRenderSnapshot(
             pages, scale, offsetX, cameraDocY, isScaleAnimating || isFlinging, prewarmTargets
         )
+    }
+
+    /**
+     * [crop], in [page]'s pixels, in [image]'s - placed [offsetX] from the page's centre and
+     * [imageScale] times over, as [ImagePage.ImageSingle.forEachImage] gives it.
+     */
+    private fun cropInImage(
+        crop: Rect, page: ImagePage.ImageSingle, image: Image, offsetX: Float, imageScale: Float,
+    ): RectF {
+        fun x(px: Int) = (px - page.width / 2f - offsetX) / imageScale - image.x + image.width / 2f
+        fun y(py: Int) = (py - page.height / 2f) / imageScale - image.y + image.height / 2f
+        return RectF(x(crop.left), y(crop.top), x(crop.right), y(crop.bottom))
     }
 
     override suspend fun renderSnapshot(
@@ -794,14 +838,20 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     val page = vp.page as? ImagePage.ImageSingle ?: return@forEach
                     if (page.destroyed || !page.isDecoded || page.width <= 0) return@forEach
 
-                    val pageScale = dstW / page.width
+                    // A crop fills the width, and the page's own centre sits off the crop's.
+                    val crop = vp.crop
+                    val pageScale = dstW / (crop?.width() ?: page.width)
+                    val shiftX = crop?.let { pageScale * (page.width / 2f - it.exactCenterX()) }
+                        ?: 0f
+                    val shiftY = crop?.let { pageScale * (page.height / 2f - it.exactCenterY()) }
+                        ?: 0f
                     val placed = ArrayList<PlacedImage>(1)
                     page.forEachImage { image, srcOffsetX, sideScale ->
                         if (image.mipmaps.isEmpty()) return@forEachImage
                         val imageScale = pageScale * s.scale * sideScale
                         val docCenterX =
-                            pageScale * (srcOffsetX + sideScale * image.x)
-                        val docCenterY = vp.docTop + 0.5f * vp.pageHeight +
+                            shiftX + pageScale * (srcOffsetX + sideScale * image.x)
+                        val docCenterY = vp.docTop + 0.5f * vp.pageHeight + shiftY +
                                 pageScale * sideScale * image.y
                         val targetX = anchorX + s.scale * docCenterX
                         val targetY = anchorY + s.scale * docCenterY
@@ -841,7 +891,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         d.vp.pageHeight,
                         s.offsetX,
                         s.scale,
-                        s.suppressGeneration
+                        s.suppressGeneration,
+                        crop,
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
@@ -849,7 +900,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             val image = placed.image
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(
-                                    pass, image, texture, placed.x, placed.y, placed.imageScale
+                                    pass, image, texture, placed.x, placed.y, placed.imageScale,
+                                    src = crop?.let {
+                                        cropInImage(it, page, image, srcOffsetX, sideScale)
+                                    },
                                 )
                             } else {
                                 RenderPage.renderFast(
@@ -898,7 +952,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             s.prewarmTargets.forEach { target ->
                 tiles.prewarmContinuous(
                     target.page, texture, s.cameraDocY, target.docTop,
-                    target.pageHeight, s.offsetX, s.scale
+                    target.pageHeight, s.offsetX, s.scale, target.crop
                 )
             }
         }

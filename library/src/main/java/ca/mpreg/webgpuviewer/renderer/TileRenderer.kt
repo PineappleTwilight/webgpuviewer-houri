@@ -1,5 +1,6 @@
 package ca.mpreg.webgpuviewer.renderer
 
+import android.graphics.Rect
 import android.util.Log
 import androidx.webgpu.BlendFactor
 import androidx.webgpu.BlendOperation
@@ -1200,24 +1201,33 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         anchorY: Float,
         centerYOffset: Float,
         pageScale: Float,
-        tileSize: Int
+        tileSize: Int,
+        crop: Rect? = null,
     ): GridPlacement? {
         val ts = tileSize.toFloat()
-        val (leftHalf, rightHalf) = pageHorizontalExtent(page, pageScale)
-        val halfH = pageScale * page.height / 2f
-        if (leftHalf + rightHalf <= 0f || halfH <= 0f) return null
+        // Drawn extent from the page's centre, narrowed to [crop].
+        var (leftHalf, rightHalf) = pageHorizontalExtent(page, pageScale)
+        var halfT = pageScale * page.height / 2f
+        var halfB = halfT
+        if (crop != null) {
+            leftHalf = min(leftHalf, pageScale * (page.width / 2f - crop.left))
+            rightHalf = min(rightHalf, pageScale * (crop.right - page.width / 2f))
+            halfT = min(halfT, pageScale * (page.height / 2f - crop.top))
+            halfB = min(halfB, pageScale * (crop.bottom - page.height / 2f))
+        }
+        if (leftHalf + rightHalf <= 0f || halfT + halfB <= 0f) return null
 
         val wantL = max(-anchorX - ts, -leftHalf)
         val wantR = min(dst.width - anchorX + ts, rightHalf)
-        val wantT = max(-anchorY - ts, centerYOffset - halfH)
-        val wantB = min(dst.height - anchorY + ts, centerYOffset + halfH)
+        val wantT = max(-anchorY - ts, centerYOffset - halfT)
+        val wantB = min(dst.height - anchorY + ts, centerYOffset + halfB)
 
         val snapX = round(anchorX)
         val snapY = round(anchorY)
         val clipL = snapX - leftHalf
-        val clipT = snapY + centerYOffset - halfH
+        val clipT = snapY + centerYOffset - halfT
         val clipR = snapX + rightHalf
-        val clipB = snapY + centerYOffset + halfH
+        val clipB = snapY + centerYOffset + halfB
 
         return GridPlacement(
             ts, snapX, snapY, clipL, clipT, clipR, clipB, wantL, wantR, wantT, wantB
@@ -1284,17 +1294,22 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         docTop: Float,
         pageHeight: Float,
         viewerOffsetX: Float,
-        scale: Float
+        scale: Float,
+        crop: Rect? = null,
     ): ContinuousAnchor? {
-        if (page.width <= 0) return null
-        val pageScaleAtZoom1 = dst.width / page.width.toFloat()
+        // [crop], when given, is what fills the viewer's width; the page centres off it.
+        val cropWidth = crop?.width() ?: page.width
+        if (cropWidth <= 0) return null
+        val pageScaleAtZoom1 = dst.width / cropWidth.toFloat()
         val pageScale = pageScaleAtZoom1 * scale
-        val anchorX =
-            dst.width / 2f + scale * (viewerOffsetX * dst.width + WebGpuRenderer.offsetX * dst.width)
+        val shiftX = crop?.let { pageScaleAtZoom1 * (page.width / 2f - it.exactCenterX()) } ?: 0f
+        val shiftY = crop?.let { pageScaleAtZoom1 * (page.height / 2f - it.exactCenterY()) } ?: 0f
+        val anchorX = dst.width / 2f +
+                scale * (viewerOffsetX * dst.width + WebGpuRenderer.offsetX * dst.width + shiftX)
         val anchorY =
             dst.height / 2f - scale * cameraDocY + scale * WebGpuRenderer.offsetY * dst.height
         // The caller's measured height, never one derived here - the two must agree exactly.
-        val centerYOffset = scale * (docTop + pageHeight / 2f)
+        val centerYOffset = scale * (docTop + pageHeight / 2f + shiftY)
         return ContinuousAnchor(pageScale, anchorX, anchorY, centerYOffset)
     }
 
@@ -1433,6 +1448,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pageHeight: Float,
         viewerOffsetX: Float,
         scale: Float,
+        crop: Rect? = null,
     ) {
         if (page.destroyed || !page.highQuality || page.isAnimated) return
         if (!page.hasUploadedImage) return
@@ -1440,8 +1456,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         viewportWidth = dst.width
         viewportHeight = dst.height
 
-        val a = continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale)
-            ?: return
+        val a =
+            continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale, crop)
+                ?: return
         val st = pages.getOrPut(page) { newGrid(page, a.pageScale) }
 
         // Preferred-size changes don't wipe either; same half-pixel camera tolerance as
@@ -1465,7 +1482,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (!st.stable) return
 
         val gp = gridPlacement(
-            page, dst, a.anchorX, a.anchorY, a.centerYOffset, a.pageScale, st.tileSize
+            page, dst, a.anchorX, a.anchorY, a.centerYOffset, a.pageScale, st.tileSize, crop
         ) ?: return
         if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) return
 
@@ -1545,10 +1562,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pageHeight: Float,
         viewerOffsetX: Float,
         scale: Float,
-        suppressGeneration: Boolean
+        suppressGeneration: Boolean,
+        crop: Rect? = null,
     ): Boolean {
-        val a = continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale)
-            ?: return false
+        val a =
+            continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale, crop)
+                ?: return false
         return drawCore(
             pass,
             page,
@@ -1559,7 +1578,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             a.pageScale,
             suppressGeneration,
             applyRetainWindow = false,
-            useStencilMask = true
+            useStencilMask = true,
+            crop = crop,
         )
     }
 
@@ -1580,7 +1600,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pageScale: Float,
         suppressGeneration: Boolean,
         applyRetainWindow: Boolean,
-        useStencilMask: Boolean = false
+        useStencilMask: Boolean = false,
+        crop: Rect? = null,
     ): Boolean {
         if (page.destroyed || !page.highQuality || page.isAnimated) return false
         if (!page.hasUploadedImage) return false
@@ -1641,7 +1662,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.centerYOffset = centerYOffset
 
         val gp =
-            gridPlacement(page, dst, anchorX, anchorY, centerYOffset, pageScale, st.tileSize)
+            gridPlacement(page, dst, anchorX, anchorY, centerYOffset, pageScale, st.tileSize, crop)
         if (gp == null) {
             st.pending.clear()
             return false
