@@ -913,6 +913,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                                 RenderPage.renderFast(
                                     pass, image, texture, placed.x, placed.y, placed.imageScale,
                                     linear = false,
+                                    src = placed.src,
                                 )
                             }
                         }
