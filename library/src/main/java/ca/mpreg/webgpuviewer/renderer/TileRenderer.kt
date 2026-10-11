@@ -467,7 +467,6 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * becomes expensive in turn.
      */
     private fun reconsiderTileSize() {
-        if (staged) return
         val current = sizeIndex(preferredTileSize)
         if (current < 0 || tileSamples[current] < TILE_SIZE_SAMPLES) return
 
@@ -475,6 +474,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             preferredTileSize = TILE_SIZES[current - 1]
             return
         }
+
+        // Only the descent above stays live while staged. It asks whether the size in use costs
+        // more than a whole batch's budget - one number, measured the same way whether or not a
+        // rescaler ran - and it only ever descends, so it cannot oscillate the way the
+        // comparison below would. Staged is also where it is needed most: ArtCnn adds nine
+        // compute dispatches to every tile, enough for one tile to outlast the frame it was
+        // meant to fit inside, and freezing this left no way down from a size we cannot afford.
+        if (staged) return
 
         var best = current
         var bestCost = costPerPixel(current)
