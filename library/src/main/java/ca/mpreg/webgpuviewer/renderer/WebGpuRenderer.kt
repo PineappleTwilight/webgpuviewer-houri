@@ -36,6 +36,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
@@ -255,6 +256,43 @@ class WebGpuRenderer {
                 if (timeNs > maxFrameTimeNs) maxFrameTimeNs = timeNs
                 recentFrameTimes[recentFrameIndex] = timeNs
                 recentFrameIndex = (recentFrameIndex + 1) % 60
+            }
+        }
+
+        /**
+         * [initLibrary], falling back to reflection on the helper class: the wrapper artifact is
+         * not present in every packaging, and a missing one must not take the reader down.
+         */
+        private fun safeInitLibrary() {
+            try {
+                initLibrary()
+                return
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.initLibrary failed, trying WebGpuUtils fallback", e)
+            }
+            try {
+                val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                val m = cls.getMethod("initLibrary")
+                m.invoke(null)
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "Fallback WebGpuUtils.initLibrary also failed", e)
+                throw e
+            }
+        }
+
+        private fun safeWindowFromSurface(surface: Surface): Long {
+            try {
+                return windowFromSurface(surface)
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.windowFromSurface failed, trying WebGpuUtils", e)
+                try {
+                    val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                    val m = cls.getMethod("windowFromSurface", Surface::class.java)
+                    return m.invoke(null, surface) as Long
+                } catch (e2: Throwable) {
+                    Log.e("WebGpuRenderer", "Fallback windowFromSurface also failed", e2)
+                    throw e2
+                }
             }
         }
 
@@ -483,43 +521,6 @@ class WebGpuRenderer {
             block()
         } else {
             runBlocking(dispatcher) { block() }
-        }
-    }
-
-    /**
-     * [initLibrary], falling back to reflection on the helper class: the wrapper artifact is
-     * not present in every packaging, and a missing one must not take the reader down.
-     */
-    private fun safeInitLibrary() {
-        try {
-            initLibrary()
-            return
-        } catch (e: Throwable) {
-            Log.w("WebGpuRenderer", "Util.initLibrary failed, trying WebGpuUtils fallback", e)
-        }
-        try {
-            val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
-            val m = cls.getMethod("initLibrary")
-            m.invoke(null)
-        } catch (e: Throwable) {
-            Log.e("WebGpuRenderer", "Fallback WebGpuUtils.initLibrary also failed", e)
-            throw e
-        }
-    }
-
-    private fun safeWindowFromSurface(surface: Surface): Long {
-        try {
-            return windowFromSurface(surface)
-        } catch (e: Throwable) {
-            Log.w("WebGpuRenderer", "Util.windowFromSurface failed, trying WebGpuUtils", e)
-            try {
-                val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
-                val m = cls.getMethod("windowFromSurface", Surface::class.java)
-                return m.invoke(null, surface) as Long
-            } catch (e2: Throwable) {
-                Log.e("WebGpuRenderer", "Fallback windowFromSurface also failed", e2)
-                throw e2
-            }
         }
     }
 

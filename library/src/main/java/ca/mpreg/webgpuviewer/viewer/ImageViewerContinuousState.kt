@@ -819,6 +819,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val gapPad = pageGapPx * s.scale
                         RenderPage.drawMaskedRect(
                             pass,
+                            texture.format,
                             (targetX - halfW - 1f) / dstW,
                             (targetY - halfH - 1f) / dstH,
                             (targetX + halfW + 1f) / dstW,
@@ -863,6 +864,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val top = anchorY + s.scale * d.vp.docTop
                         page.drawFade(
                             pass,
+                            texture.format,
                             (anchorX - s.scale * dstW / 2f) / dstW,
                             top / dstH,
                             (anchorX + s.scale * dstW / 2f) / dstW,

@@ -303,6 +303,9 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
      */
     var doubleTapZoomEnabled: Boolean = true
 
+    /** Whether two fingers scale the page. Off leaves the page at whatever scale it is on. */
+    var pinchZoomEnabled: Boolean = true
+
     /** Override for the "from" page during far navigation animation */
     var transitionFromPage: ImagePage? = null
 
@@ -440,7 +443,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                     // than spinning the frame clock, and a later resize still wakes it.
                     FrameResult.Unavailable -> if (!reportedUnavailable) {
                         reportedUnavailable = true
-                        val reason = renderer.unavailableReason ?: "no render surface"
+                        val reason = WebGpuRenderer.unavailableReason ?: "no render surface"
                         Log.e("ImageViewerState", "Nothing can be drawn: $reason")
                         onRenderUnavailable?.runCatching { invoke(reason) }
                     }
