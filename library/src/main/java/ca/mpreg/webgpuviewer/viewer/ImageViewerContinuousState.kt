@@ -590,6 +590,8 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val x: Float,
         val y: Float,
         val imageScale: Float,
+        /** The crop in this image's pixels, or null for all of it - see [cropInImage]. */
+        val src: RectF?,
     )
 
     private class DrawablePage(
@@ -858,7 +860,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val (x, y) = solveImagePlacement(
                             targetX, targetY, imageScale, image, dstW, dstH
                         )
-                        placed += PlacedImage(image, x, y, imageScale)
+                        placed += PlacedImage(
+                            image, x, y, imageScale,
+                            crop?.let { cropInImage(it, page, image, srcOffsetX, sideScale) },
+                        )
                         // The slot is the page plus its trailing gap (getPageSlotHeight), and
                         // the pass cleared to transparent black - so a gap left unpainted reads
                         // as a hard black line between every page. Carry this image's own
@@ -882,6 +887,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
                 drawable.forEach { d ->
                     val page = d.page
+                    val crop = d.vp.crop
                     val covered = !page.isAnimated && tiles.draw(
                         pass,
                         page,
@@ -901,9 +907,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             if (page.isAnimated || page.highQuality) {
                                 RenderPage.renderFast(
                                     pass, image, texture, placed.x, placed.y, placed.imageScale,
-                                    src = crop?.let {
-                                        cropInImage(it, page, image, srcOffsetX, sideScale)
-                                    },
+                                    src = placed.src,
                                 )
                             } else {
                                 RenderPage.renderFast(
