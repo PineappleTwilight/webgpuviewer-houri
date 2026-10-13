@@ -11,6 +11,7 @@ import androidx.webgpu.GPUTexture
 import androidx.webgpu.GPUTextureView
 import androidx.webgpu.TextureFormat
 import ca.mpreg.webgpuviewer.ImageUtil
+import ca.mpreg.webgpuviewer.MAX_MIP_AREA
 import ca.mpreg.webgpuviewer.Trim
 import ca.mpreg.webgpuviewer.renderer.Image.Companion.invoke
 import kotlinx.coroutines.Dispatchers
@@ -101,7 +102,7 @@ class Image private constructor(
                 throw IllegalArgumentException("Image too small ${width}x$height (<8), refusing GPU upload to avoid gralloc 0x3b")
             }
             require(width <= 16384 && height <= 16384) { "Image dimensions too large ${width}x$height" }
-            if (width.toLong() * height > 64L * 1024 * 1024) {
+            if (width.toLong() * height > MAX_MIP_AREA) {
                 throw IllegalArgumentException("Image area too large ${width}x$height")
             }
             require(trimColors == null || trimColors.all { it.size >= 3 }) {

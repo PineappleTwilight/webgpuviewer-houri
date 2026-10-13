@@ -16,6 +16,7 @@ import androidx.webgpu.GPUTextureDescriptor
 import androidx.webgpu.GPUTextureView
 import androidx.webgpu.TextureFormat
 import androidx.webgpu.TextureUsage
+import ca.mpreg.webgpuviewer.MAX_MIP_AREA
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -80,7 +81,7 @@ class Mipmap(
             require(!scale.isNaN() && !scale.isInfinite() && scale > 0f && scale <= 1f) { "Mipmap.create: invalid scale $scale" }
             if (width < 8 || height < 8) throw IllegalArgumentException("Mipmap too small ${width}x$height, refusing <8 to avoid gralloc 0x3b")
             if (width > 16384 || height > 16384) throw IllegalArgumentException("Mipmap too large ${width}x$height")
-            if (width.toLong() * height > 64L * 1024 * 1024) throw IllegalArgumentException("Mipmap area too large ${width}x$height")
+            if (width.toLong() * height > MAX_MIP_AREA) throw IllegalArgumentException("Mipmap area too large ${width}x$height")
             // Up to the device's own ceiling: a level may be uploaded as one large tile rather
             // than split at TILESIZE (see Image.Level.upload), and Compatibility mode reports at
             // least 4096 whatever the hardware can do.

@@ -6,6 +6,15 @@ import ca.mpreg.webgpuviewer.ImageUtil.resizeLinearAreaNative
 import ca.mpreg.webgpuviewer.ImageUtil.toneMapToSdrNative
 import java.nio.ByteBuffer
 
+/**
+ * Largest image area the pipeline accepts, in pixels.
+ *
+ * Enforced by [Image] and [Mipmap.create] before a page reaches the GPU. Shared because it is
+ * also the byte cost of a halving resize: `(w/2)*(h/2)*4 == w*h`, so the destination of the first
+ * mip step costs exactly the source area in bytes. One number, two readings - see [resize].
+ */
+const val MAX_MIP_AREA = 64L * 1024 * 1024
+
 object ImageUtil {
     @Volatile
     private var libraryLoaded = false
@@ -163,7 +172,15 @@ object ImageUtil {
         if (dstWidth < 8 || dstHeight < 8) throw IllegalArgumentException("resize: dst too small ${dstWidth}x$dstHeight")
         val dstNeeded = dstWidth.toLong() * dstHeight * 4L
         require(dstNeeded >= 0) { "resize: dst overflow ${dstWidth}x$dstHeight" }
-        require(dstNeeded <= 16L * 1024 * 1024) { "resize: dst too large ${dstWidth}x$dstHeight" }
+        // [MAX_MIP_AREA], not an allocation budget. Halving makes dstNeeded == the source area in
+        // bytes, and Image/Mipmap.create already cap that area at [MAX_MIP_AREA], so this holds for
+        // every page that got here - it only catches a caller passing dims beyond the contract.
+        //
+        // The 16MB cap this replaces was not that. It silently limited pages to ~16.8Mpx against a
+        // 64Mpx contract, so a 5300x4074 page validated, built no mip levels, and died on its first
+        // one with "resize: dst too large 2650x2037" - a page the rest of the pipeline accepts,
+        // failing at a bound nothing else shared.
+        require(dstNeeded <= MAX_MIP_AREA) { "resize: dst too large ${dstWidth}x$dstHeight" }
         val output = try {
             ByteBuffer.allocateDirect(dstNeeded.toInt())
         } catch (e: OutOfMemoryError) {
