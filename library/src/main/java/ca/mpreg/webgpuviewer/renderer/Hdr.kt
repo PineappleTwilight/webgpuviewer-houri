@@ -181,7 +181,12 @@ object Hdr {
         displayRef = display?.let { WeakReference(it) }
         liveHeadroomRatio = display?.let { readLiveHeadroom(it) }
 
-        hdrSdrRatioListener = if (display != null) {
+        // Gated on [available], not merely on a non-null display. registerHdrSdrRatioChangedListener
+        // throws IllegalStateException("HDR/SDR ratio changed not available") unless
+        // isHdrSdrRatioAvailable, so registering on an SDR-only panel failed on every surface
+        // creation - and the catch logged a full stack trace for the display's own answer.
+        // readLiveHeadroom already returns null there, so there is genuinely nothing to track.
+        hdrSdrRatioListener = if (display != null && available) {
             val listener = Consumer<Display> { d ->
                 liveHeadroomRatio = readLiveHeadroom(d)
                 markPresentationDirty()
@@ -189,6 +194,11 @@ object Hdr {
             try {
                 display.registerHdrSdrRatioChangedListener({ it.run() }, listener)
                 listener
+            } catch (e: IllegalStateException) {
+                // The availability flipped between the check above and this call. Expected on a
+                // display that lost HDR during teardown, so no stack trace.
+                Log.i(TAG, "HDR/SDR ratio became unavailable before the listener registered")
+                null
             } catch (e: Exception) {
                 Log.w(
                     TAG,
