@@ -616,6 +616,24 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         return true
     }
 
+    /**
+     * Shed the device-bound caches under memory pressure: the tile atlas, its mip chains and the
+     * filter pool.
+     *
+     * The app sheds decoded pages on `onTrimMemory`, but those are the small half of what a frame
+     * holds - the tile atlas is a single GPU texture sized to the cache budget, and the filter pool
+     * is another full-screen buffer. Nothing on either side reached [TileRenderer.onLowMemory] or
+     * [FilterChain.onLowMemory], so both survived a low-memory callback untouched and the next frame
+     * regenerated everything that had been dropped. Tiles are refilled lazily, so this costs a
+     * visible rebuild rather than correctness.
+     *
+     * Safe to call from any thread: both callees are best-effort and take what they need.
+     */
+    fun onLowMemory() {
+        tiles.onLowMemory()
+        filters.onLowMemory()
+    }
+
     fun cleanup() {
         animationJob?.cancel()
         onScreenPages = emptyList()

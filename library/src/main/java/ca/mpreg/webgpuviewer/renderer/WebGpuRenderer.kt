@@ -486,12 +486,24 @@ class WebGpuRenderer {
     internal suspend fun recreateDeviceLocked(): Boolean {
         if (isAvailable) return true
         return try {
+            // An adapter is consumed by the first requestDevice that succeeds on it, so the one
+            // that built the lost device can never build another - Dawn rejects it as "consumed",
+            // and with nothing re-requesting an adapter the renderer stayed unavailable for good.
+            adapter = instance.requestAdapter(
+                GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility)
+            )
             device = adapter.requestDevice(deviceDescriptor())
             initialized = true
             deviceLost = false
             initError = null
             deviceGeneration++
-            Log.i("WebGpuRenderer", "recreated the device (generation $deviceGeneration)")
+            // A fresh adapter can report different limits, and this is read live by the upload
+            // paths, so it has to move with the device rather than keep the previous one's value.
+            maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+            Log.i(
+                "WebGpuRenderer",
+                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D)"
+            )
             true
         } catch (e: CancellationException) {
             throw e
