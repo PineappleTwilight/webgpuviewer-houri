@@ -24,10 +24,24 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 - Generation runs on the render thread but outside the render mutex, a few tiles at a time with a suspend between batches; pending tiles pull on-screen-first, centre-out.
 - One grid per whole `ImagePage.ImageSingle`, not per image: a spread's seam bakes into whichever tile straddles it.
 - Rescaler applies only when `factor > 1 && supported && appliesAt(scale) && fits(tileSize)`; what it declines resolves in one step.
-- Tile cache budget 16-64 MB; `cacheScreens` coerced to 0.5-3.0; `onLowMemory()` drops to 0.8 and evicts.
+- Tile cache budget 16-64 MB; `cacheScreens` coerced to 0.5-3.0; `onLowMemory()` shrinks and
+  evicts, `restoreMemoryBudget()` puts the pre-shrink value back.
+- **`cacheByteBudget` (host-set, 0 = derive from `cacheScreens`) overrides the screens path
+  entirely.** At or above ~1440p the 16-64 MB `coerceIn` is what actually sized the atlas, so
+  tuning `cacheScreens` there did nothing — which is why a host that knows its memory class now
+  supplies bytes instead.
+- **A shrink applies immediately, a grow re-cuts the atlas.** `maxTileBytes` takes
+  `minOf(allocated, budgetTiles())` so eviction honours a lowered budget without reallocating; the
+  atlas itself is one fixed allocation latched in `atlasSide`, so growth arms
+  `atlasGrowthPending` and `newFrame` tears it down and re-cuts — the only point in a frame where
+  no caller holds a grid.
+- **`onLowMemory` scales whichever budget is in force**, not just `cacheScreens` — `budgetTiles`
+  ignores screens once a host sets bytes, so shrinking screens there would silently shed nothing.
 
 ## ANTI-PATTERNS
 - Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.
+- **Do not return `maxTileBytes` to `atlasBudgetTiles` alone.** That figure is the atlas's allocation, not the policy; a lowered `cacheByteBudget` would then only bind after a full surface rebuild.
+- **`Display.registerHdrSdrRatioChangedListener` throws `IllegalStateException` unless `isHdrSdrRatioAvailable`.** Gate registration on that flag, not on a non-null display — otherwise every surface creation on an SDR-only panel logs a full stack trace for the display's own correct answer.
 - Prewarmed-never-drawn pages blit a stale clip rect: `prewarm`'s tiles leave the wanted range empty, and it once silently missed a step `drawCore`/`availableTileKeys` had. Keep one shared definition (`forEachTile`/`gridPlacement`); never fork a copy.
 - Stencil writes 1: `blitPipelineStencilWrite` writes 1 wherever it draws; `RenderPage.samplerVariant` tests `NotEqual` against 1 so a pixel the blit already wrote is skipped, not shaded twice.
 - Transition caches bypass stencil: the transition cache-seed pass has no stencil attachment at all. Use `plainVariant` (stencil-free) there; `plainVariantMasked` only declares a no-op stencil so it is valid inside a stencil-attached pass. A stencil-free pass cannot just gain one.

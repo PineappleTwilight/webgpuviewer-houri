@@ -195,6 +195,15 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         private const val MIN_CACHE_BYTES = 16 * 1024 * 1024
         private const val MAX_CACHE_BYTES = 64 * 1024 * 1024
 
+        /** What a session starts at, and what [restoreMemoryBudget] returns it to. */
+        private const val DEFAULT_CACHE_SCREENS = 1.5f
+
+        /** What [onLowMemory] shrinks to, until [restoreMemoryBudget] puts the saved value back. */
+        private const val LOW_MEMORY_CACHE_SCREENS = 0.8f
+
+        /** The same shrink for an explicit [cacheByteBudget], which is in bytes not screens. */
+        private const val LOW_MEMORY_BUDGET_RATIO = 0.5333f
+
         /**
          * Score threshold [nextRequest] uses to tell a genuinely on-screen tile request from one
          * outside a grid's wanted range (e.g. [prewarm]'s tiles, which leave that range empty).
@@ -226,13 +235,108 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
     /**
      * Screens' worth of tiles to cache - the count itself follows the viewport ([budgetTiles]).
-     * 1.5 is what a flat 192 came to at 1440p.
+     * 1.5 is what a flat 192 came to at 1440p. Ignored by [budgetTiles] once [cacheByteBudget]
+     * is set, and reasserted by [restoreMemoryBudget].
      */
-    var cacheScreens = 1.5f
+    var cacheScreens = DEFAULT_CACHE_SCREENS
         set(value) { field = value.coerceIn(0.5f, 3f) }
 
+    /**
+     * Explicit ceiling on the tile cache in bytes; 0 means "derive it from [cacheScreens]".
+     *
+     * The derived budget is [coerceIn]ed to [MIN_CACHE_BYTES]..[MAX_CACHE_BYTES], so on any
+     * viewport at or above ~1440p the clamp - not [cacheScreens] - is what actually sizes the
+     * atlas, and tuning screens there did nothing. A host that knows its own memory class can
+     * say so directly instead: the app derives this from `ActivityManager` plus the live heap.
+     *
+     * A **shrink applies immediately** - [maxTileBytes] takes the lower of the two, so the next
+     * [evict] works to the smaller number with no reallocation. A **grow** cannot, because the
+     * atlas is one fixed allocation latched at [atlasSide]; it arms [atlasGrowthPending] and
+     * [newFrame] does the reallocation at the one point in a frame no caller holds a grid.
+     */
+    @Volatile
+    var cacheByteBudget: Long = 0L
+        set(value) {
+            val requested = value.coerceAtLeast(0L)
+            // While an onLowMemory shrink is outstanding, a host re-pushing its nominal budget
+            // must not undo it. The host cannot know the library shrank - it just republishes
+            // what it last computed - so a host that polls every few seconds re-cut the whole
+            // atlas once per trim callback, undoing the shed each time. Clamped to the saved
+            // value until restoreMemoryBudget clears it; a genuinely *lower* request still wins,
+            // because that is the host noticing something we did not.
+            val saved = byteBudgetBeforeLowMemory
+            val wanted = when {
+                saved == null -> requested
+                requested == 0L -> saved
+                else -> saved.coerceAtMost(requested)
+            }
+            val previous = field
+            if (wanted == previous) return
+            field = wanted
+            if (wanted < previous) {
+                // Shrinking is the urgent direction, and [maxTileBytes] already reads the new
+                // number. Evict here rather than waiting for the next generateTile, which at a
+                // low zoom can be many frames away.
+                try { evict() } catch (_: Exception) {}
+            } else if (atlasOrNull != null && budgetTiles() > atlasBudgetTiles) {
+                // Growing cannot reuse the atlas - it is one fixed allocation latched at
+                // atlasSide(). newFrame does the reallocation at the only safe point.
+                atlasGrowthPending = true
+            }
+        }
+
+    /** Set when the budget now exceeds what the live atlas was allocated for. */
+    @Volatile
+    private var atlasGrowthPending = false
+
+    /**
+     * Undo the [onLowMemory] shrink.
+     *
+     * [onLowMemory] used to assign [LOW_MEMORY_CACHE_SCREENS] to [cacheScreens] outright, so one
+     * callback - a single transient trim signal - cost the rest of the session a permanently
+     * smaller tile budget and a full rebuild with nothing to bring it back. It remembers the
+     * pre-shrink value instead, and the app calls this once headroom returns.
+     */
+    fun restoreMemoryBudget() {
+        var restored = false
+        // Cleared before the assignment, not after: cacheByteBudget's setter consults the saved
+        // value to decide whether a host push is trying to undo the shrink, so leaving it set for
+        // the duration of the restore would make the restore look like a host push.
+        screensBeforeLowMemory?.let {
+            screensBeforeLowMemory = null
+            cacheScreens = it
+            restored = true
+        }
+        byteBudgetBeforeLowMemory?.let {
+            byteBudgetBeforeLowMemory = null
+            cacheByteBudget = it
+            restored = true
+        }
+        if (!restored) return
+        if (atlasOrNull != null && budgetTiles() > atlasBudgetTiles) atlasGrowthPending = true
+        try { evict() } catch (_: Exception) {}
+    }
+
+    /** Null unless [onLowMemory] has fired without a [restoreMemoryBudget] since. */
+    @Volatile
+    private var screensBeforeLowMemory: Float? = null
+
+    @Volatile
+    private var byteBudgetBeforeLowMemory: Long? = null
+
     fun onLowMemory() {
-        cacheScreens = 0.8f
+        // Whichever budget is in force gets scaled, not just cacheScreens: budgetTiles ignores
+        // screens entirely once the host has set an explicit byte budget, so shrinking screens
+        // there would silently do nothing and a trim callback would stop shedding anything.
+        // Recorded rather than assigned - clobbering it on a second callback would ratchet the
+        // value to itself and leave restoreMemoryBudget with nothing to put back.
+        if (cacheByteBudget > 0L) {
+            if (byteBudgetBeforeLowMemory == null) byteBudgetBeforeLowMemory = cacheByteBudget
+            cacheByteBudget = (cacheByteBudget * LOW_MEMORY_BUDGET_RATIO).toLong()
+        } else {
+            if (screensBeforeLowMemory == null) screensBeforeLowMemory = cacheScreens
+            cacheScreens = LOW_MEMORY_CACHE_SCREENS
+        }
         // Best-effort evict now; next generateTile will also call evict()
         try { evict() } catch (_: Exception) {}
         // Rebuild atlas smaller on next acquire if we still overshoot
@@ -254,6 +358,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
     /** [cacheScreens] screens at [TILE_SIZE], ring included, within the cache byte range. */
     private fun budgetTiles(): Int {
+        val explicit = cacheByteBudget
+        if (explicit > 0L) return (explicit / TILE_BYTES).toInt().coerceAtLeast(1)
         if (viewportWidth <= 0 || viewportHeight <= 0) return MIN_CACHE_BYTES / TILE_BYTES
         val cols = ceil(viewportWidth / TILE_SIZE.toFloat()).toInt() + 2
         val rows = ceil(viewportHeight / TILE_SIZE.toFloat()).toInt() + 2
@@ -839,6 +945,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         RETAIN_TRIM,
         /** The app dropped the page ([newFrame]) or the surface is going away ([cleanup]). */
         PAGE_DESTROY,
+        /**
+         * [newFrame]: the atlas was re-cut because the byte budget grew. Not a page event - every
+         * grid went at once, because the allocation they share is the thing that moved.
+         */
+        ATLAS_REGROW,
     }
 
     /** One lifecycle event: which grid lost its tiles (or a trim ran) and why. */
@@ -1108,13 +1219,17 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         // Every cached tile is at the old format, so an HDR change takes the whole atlas. Here
         // only: this is the one point in a frame where no caller holds a grid, and tearing one
         // down mid-draw leaves the caller writing a destroyed uniform buffer - a segfault.
-        atlasOrNull?.let { existing ->
-            if (existing.format != Hdr.frameFormat) {
-                pages.values.forEach { it.destroyAll(existing) }
-                pages.clear()
-                existing.destroy()
-                atlasOrNull = null
-            }
+        // A raised cacheByteBudget lands here for the same reason: the atlas is one fixed
+        // allocation and cannot be grown in place, so it has to be torn down and re-cut.
+        val existing = atlasOrNull
+        if (existing != null && (existing.format != Hdr.frameFormat || atlasGrowthPending)) {
+            val regrown = atlasGrowthPending
+            atlasGrowthPending = false
+            pages.values.forEach { it.destroyAll(existing) }
+            pages.clear()
+            existing.destroy()
+            atlasOrNull = null
+            if (regrown) traceChange(GridChangeReason.ATLAS_REGROW, "-", "budget=$maxTileBytes")
         }
 
         if (pages.isEmpty()) return
@@ -2445,8 +2560,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     }
 
     /** What the budgeted tiles come to - the area every tile size is held to, whatever its own. */
-    private val maxTileBytes
-        get() = (if (atlasOrNull != null) atlasBudgetTiles else budgetTiles()).toLong() * TILE_BYTES
+    private val maxTileBytes: Long
+        get() {
+            // minOf, not the atlas's own figure alone: the atlas is allocated once and cannot be
+            // shrunk in place, but a lowered budget still has to bound eviction immediately or a
+            // cacheByteBudget drop would only take effect the next time the surface is rebuilt.
+            val allocated = if (atlasOrNull != null) atlasBudgetTiles else budgetTiles()
+            return minOf(allocated, budgetTiles()).toLong() * TILE_BYTES
+        }
 
     private fun tileBytes(st: PageTiles) = st.tileSize.toLong() * st.tileSize * 4
 

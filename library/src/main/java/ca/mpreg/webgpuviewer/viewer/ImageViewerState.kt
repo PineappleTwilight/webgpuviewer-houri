@@ -634,6 +634,29 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         filters.onLowMemory()
     }
 
+    /**
+     * Ceiling on the tile cache in bytes; 0 restores the viewport-derived default.
+     *
+     * The host sets this from its own memory class and live headroom rather than leaving the
+     * cache at a fixed 16-64 MB. Shrinking takes effect at once; growing re-cuts the atlas on the
+     * next frame, which costs a rebuild, so only raise it when headroom genuinely returned.
+     */
+    fun setCacheByteBudget(bytes: Long) {
+        tiles.cacheByteBudget = bytes
+    }
+
+    /**
+     * Put back whatever [onLowMemory] gave up.
+     *
+     * [onLowMemory] is one-way by design within a frame - the atlas and the filter pool are torn
+     * down, and nothing should ask for them back mid-frame - but across a session it was one-way
+     * in fact too, so a single trim callback cost the reader a permanently smaller cache. The host
+     * calls this once headroom is back.
+     */
+    fun restoreMemoryBudget() {
+        tiles.restoreMemoryBudget()
+    }
+
     fun cleanup() {
         animationJob?.cancel()
         onScreenPages = emptyList()
