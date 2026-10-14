@@ -431,17 +431,28 @@ class WebGpuRenderer {
         return try {
             withContext(dispatcher) {
                 mutex.withLock {
-                    if (!recreateDeviceLocked()) return@withLock false
-                    try {
-                        filters.cleanup()
-                    } catch (e: Throwable) {
-                        Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
-                    }
+                    // Drop the swapchain and the native window BEFORE the new device exists.
+                    // Dawn can defer vkDestroySurfaceKHR past close(), and a second createSurface
+                    // on the same window while the old swapchain is still connected to it fails
+                    // with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR - which loses the device again.
                     val previous = surface
                     surface = null
                     try {
                         previous?.close()
                     } catch (_: Throwable) {
+                    }
+                    // cleanup() releases this after closing the surface, for the same reason: the
+                    // window reference is ours, so ours has to be the one that goes.
+                    if (window != 0L) {
+                        NativeWindow.release(window)
+                        window = 0L
+                    }
+
+                    if (!recreateDeviceLocked()) return@withLock false
+                    try {
+                        filters.cleanup()
+                    } catch (e: Throwable) {
+                        Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
                     }
                     val platform = platformSurface
                     if (platform == null || !platform.isValid) {
