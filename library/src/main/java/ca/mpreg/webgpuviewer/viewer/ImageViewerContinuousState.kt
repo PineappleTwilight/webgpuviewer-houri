@@ -885,6 +885,33 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     drawable.add(DrawablePage(page, vp, placed))
                 }
 
+                // A Render page gets its background here too, for the same reason, and it matters
+                // more for it: its own render() fills that background, but it runs *after* this
+                // pass, in a pass of its own, so whatever it paints lands on top of a decoded
+                // neighbour's real pixels rather than under them. Every boundary between a
+                // placeholder and a real page therefore has to be painted by this loop, or a
+                // fractional disagreement about where that boundary is shows as a line.
+                //
+                // The extent is the *slot* the document reserved - getPageHeight is what the walk
+                // laid the following page out from - not the page's own height. A Render page draws
+                // at `scale * height` (see fillPage), so the two agree only while its own scale is 1.
+                s.pages.forEach { vp ->
+                    val page = vp.page as? ImagePage.Render ?: return@forEach
+                    if (page.destroyed) return@forEach
+                    val color = page.backgroundColor ?: return@forEach
+                    val slotTop = anchorY + s.scale * vp.docTop
+                    val slotBottom = slotTop + s.scale * vp.pageHeight
+                    RenderPage.drawMaskedRect(
+                        pass,
+                        texture.format,
+                        -1f / dstW,
+                        (slotTop - 1f) / dstH,
+                        1f + 1f / dstW,
+                        (slotBottom + 1f + pageGapPx * s.scale) / dstH,
+                        color,
+                    )
+                }
+
                 drawable.forEach { d ->
                     val page = d.page
                     val crop = d.vp.crop
@@ -941,13 +968,29 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val page = vp.page as ImagePage.Render
             if (page.destroyed) return@forEach
 
-            val renderScale = s.scale * page.scale
+            // The scale is derived from the SLOT, not from the page's own scale.
+            //
+            // A Render page paints `scale * page.height` tall (fillPage), while the document laid
+            // the following page out from getPageHeight(page) * s.scale. Those agree only while
+            // page.scale is 1 - and a Render page deliberately gets its own live pan/zoom (see
+            // ImagePage.Render.drawLive), so a pinch or fling running while a segment is still
+            // decoding is enough to move it off 1. At anything but 1 the placeholder's background
+            // is a different height from the slot it occupies: taller, it repaints over the last
+            // row of both neighbours' real pixels (this loop runs after all of them); shorter, it
+            // leaves the difference unpainted. Either way it reads as a thin line at every
+            // boundary it touches, which is the seam the background-first ordering exists to stop.
+            //
+            // So the slot wins. It is the only size continuous mode lays pages out from, and for a
+            // page whose own scale already is 1 this is the same expression as before.
+            val ownHeight = page.height.toFloat()
+            val slotScale =
+                if (ownHeight > 0f) s.scale * (vp.pageHeight / ownHeight) else s.scale
             val targetX = anchorX
             val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.pageHeight)
 
-            val x = (targetX - dstW / 2f) / (renderScale * dstW)
-            val y = (targetY - dstH / 2f) / (renderScale * dstH)
-            page.renderLoaded(encoder, x, y, renderScale, texture)
+            val x = (targetX - dstW / 2f) / (slotScale * dstW)
+            val y = (targetY - dstH / 2f) / (slotScale * dstH)
+            page.renderLoaded(encoder, x, y, slotScale, texture)
         }
 
         // Idle decode-ahead: only once everything on screen is sharp, so this never steals
