@@ -301,7 +301,22 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
      * resolves as a single tap immediately instead of waiting out the pair window.
      * Default true preserves built-in behavior.
      */
+    // KMK --> Fork wiring for upstream 34fb12b's gestures switch: the host has ONE setting
+    // (WebGpuConfig.resolveDoubleTapZoom), so [doubleTapGesturesEnabled] is tied to
+    // [doubleTapZoomEnabled] instead of left for every host to keep coherent. Setting the
+    // gestures flag directly keeps them independent for hosts that want exactly 34fb12b.
     var doubleTapZoomEnabled: Boolean = true
+        set(value) {
+            field = value
+            doubleTapGesturesEnabled = value
+        }
+
+    /**
+     * Off, a tap fires on lift instead of after the double tap timeout; no double tap or its drag.
+     */
+    @Volatile
+    var doubleTapGesturesEnabled: Boolean = true
+    // KMK <--
 
     /** Whether two fingers scale the page. Off leaves the page at whatever scale it is on. */
     var pinchZoomEnabled: Boolean = true

@@ -235,8 +235,10 @@ fun ImageViewerContinuous(
                     longPressJob?.cancel()
                     // Tap - wait for a double tap. A touch that only stopped motion waits
                     // too: no single tap below, but it can still be the first of a pair.
-                    // Opt-out skips the pair window entirely: single tap fires now.
-                    if (!state.doubleTapZoomEnabled) {
+                    // Opt-out skips the pair window entirely: single tap fires now. Gated
+                    // on the gestures switch (upstream 34fb12b) so a host that turns the
+                    // gestures off alone still answers taps on lift.
+                    if (!state.doubleTapGesturesEnabled || !state.doubleTapZoomEnabled) {
                         if (!stoppedMotion) {
                             state.onTap?.invoke(
                                 Offset(
@@ -381,6 +383,13 @@ fun ImageViewerContinuous(
                     var multiZoomed = false
 
                     var canceled = false
+                    // KMK --> (upstream 92be54d) A single-finger drag is real panning: mark it
+                    // so read-through can tell it from a frame whose geometry merely moved.
+                    // Cleared when the gesture ends below, and when a second pointer turns
+                    // this drag into a pinch (pinch can move the seam between read and
+                    // not-read without scrolling anything - upstream's same intent).
+                    // KMK <--
+                    state.isPanning = true
                     try {
                         do {
                             val event = awaitPointerEvent()
@@ -395,6 +404,11 @@ fun ImageViewerContinuous(
                                         velocityTracker.resetTracking()
                                     }
                                     single = false
+                                    // KMK --> (upstream 92be54d) Two fingers: this is a pinch
+                                    // now, not a pan - read-through must not advance on what
+                                    // its zoom does.
+                                    // KMK <--
+                                    state.isPanning = false
                                     val pressed = event.changes.filter { it.pressed }
                                     multiPointers = pressed.size
                                     multiDownTime = change.uptimeMillis
@@ -464,6 +478,10 @@ fun ImageViewerContinuous(
                         } while (!canceled && event.changes.any { it.pressed })
                     } finally {
                         state.isScaleAnimating = false
+                        // KMK --> (upstream 92be54d) The drag ended; frames after this are
+                        // not panning anything.
+                        // KMK <--
+                        state.isPanning = false
                         state.invalidate()
                     }
 

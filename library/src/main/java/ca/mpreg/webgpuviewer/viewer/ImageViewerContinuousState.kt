@@ -99,6 +99,15 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     @Volatile
     var isFlinging: Boolean = false
 
+    // KMK --> (upstream 92be54d) True while a one-or-two-finger plain drag is actively panning
+    // content - set for the single-finger drag only, and cleared the moment a second pointer
+    // joins or the gesture ends. Along with [isFlinging], marks real scroll so read-through
+    // only advances for camera moves: a pinch zoom-out or a placeholder shrinking changes the
+    // walk's geometry without scrolling anything, and must not record pages as read.
+    // KMK <--
+    @Volatile
+    var isPanning: Boolean = false
+
     @Volatile
     private var isRestoring: Boolean = false
 
@@ -559,14 +568,24 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         if (!deltaPixels.isFinite()) return
         animationJob?.cancel()
         animationJob = scope?.launch {
-            var lastValue = 0f
-            animate(
-                0f, deltaPixels, animationSpec = spring(
-                    stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
-                )
-            ) { value, _ ->
-                scrollBy(value - lastValue)
-                lastValue = value
+            // KMK --> (upstream 92be54d) A tap navigation's own scroll animation is real
+            // scrolling: mark it as such so the frames it drives count towards read-through,
+            // and so tile generation is held off like during a fling.
+            // KMK <--
+            isFlinging = true
+            try {
+                var lastValue = 0f
+                animate(
+                    0f, deltaPixels, animationSpec = spring(
+                        stiffness = Spring.StiffnessMediumLow, visibilityThreshold = 0.002f
+                    )
+                ) { value, _ ->
+                    scrollBy(value - lastValue)
+                    lastValue = value
+                    invalidate()
+                }
+            } finally {
+                isFlinging = false
                 invalidate()
             }
         }
@@ -679,6 +698,12 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val cameraDocY = (anchorDocYInternal - y0 + 0.5 * screenH).toFloat()
 
         val pages = mutableListOf<VisiblePage>()
+        // KMK --> (upstream 27f3f6c + 92be54d) The on-screen set is every page in the walked
+        // band, decoded or not. [pages] (what gets drawn) stays decoded-only: an undecoded page
+        // has no pixels, but publishing it is what wakes a parked loop when its decode lands -
+        // and it is what [ImagePage.isOnScreen] answers for them.
+        // KMK <--
+        val visible = mutableListOf<ImagePage>()
         val visTop = 0.5f * screenH - screenH / (2f * scale)
         val screenBot = 0.5f * screenH + screenH / (2f * scale)
         val visBot = screenBot + tiles.preferredTileSize / scale
@@ -719,6 +744,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             docTopBack -= slotHeight.toDouble()
             yTop -= slotHeight
             if (scrolledThrough == null && isScrolledThrough(yTop, pageHeight)) scrolledThrough = page
+            // KMK --> (upstream 27f3f6c) Undecoded ones join the on-screen set too.
+            // KMK <--
+            visible.add(page)
+            // Walked upward, so each goes in front of the last - top to bottom, as the
+            // forward walk appends.
             if (page.isDecoded) {
                 pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight, cropFor(page)))
             }
@@ -739,8 +769,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             hasPrev = true
             val pageHeight = getPageHeight(page)
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
-            if (y + pageHeight > visTopTiles && page.isDecoded) {
-                pages.add(VisiblePage(page, docTop.toFloat(), pageHeight, cropFor(page)))
+            if (y + pageHeight > visTopTiles) {
+                // KMK --> (upstream 27f3f6c) Undecoded ones join the on-screen set; [pages]
+                // (what gets drawn) still skips them.
+                // KMK <--
+                visible.add(page)
+                if (page.isDecoded) {
+                    pages.add(VisiblePage(page, docTop.toFloat(), pageHeight, cropFor(page)))
+                }
             }
             if (pageHeight <= 0f) break
             prevSlot = pageHeight + pageGapPx
@@ -777,15 +813,28 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             }
         }
 
-        onScreenPages = pages.map { it.page }
+        // KMK --> (upstream 27f3f6c + 92be54d) Publish, don't bare-assign: [publishOnScreen]
+        // keeps the join-wake only the paged path used to have - a page that invalidated while
+        // off screen dropped that redraw, and this is what tells it the drawn set caught up.
+        // KMK <--
+        publishOnScreen(visible)
         pagesBelow = below
         pagesAbove = above
         if (smallestSlot != Float.MAX_VALUE) smallestSlotSeen = smallestSlot
 
-        scrolledThrough?.takeIf { it !== lastScrolledThrough }?.let {
-            lastScrolledThrough = it
-            try { onPageScrolledThrough?.invoke(it) } catch (_: Throwable) {}
-            emitReaderState(force = true)
+        // KMK --> (upstream 92be54d, fork equivalent) Only advance read-through while real
+        // scrolling happens. The ratchet's own geometry can move for the camera, not the
+        // content: a pinch zoom-out, a placeholder slot shrinking, or any frame invalidated
+        // while parked would otherwise mark pages read that no scroll touched. [animateScroll]
+        // sets [isFlinging], the single-finger drag sets [isPanning]; both cover the same
+        // shapes upstream reports [onViewport] while those are true.
+        // KMK <--
+        if (isFlinging || isPanning) {
+            scrolledThrough?.takeIf { it !== lastScrolledThrough }?.let {
+                lastScrolledThrough = it
+                try { onPageScrolledThrough?.invoke(it) } catch (_: Throwable) {}
+                emitReaderState(force = true)
+            }
         }
 
         ContinuousRenderSnapshot(
@@ -849,7 +898,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         ?: 0f
                     val placed = ArrayList<PlacedImage>(1)
                     page.forEachImage { image, srcOffsetX, sideScale ->
-                        if (image.mipmaps.isEmpty()) return@forEachImage
                         val imageScale = pageScale * s.scale * sideScale
                         val docCenterX =
                             shiftX + pageScale * (srcOffsetX + sideScale * image.x)
@@ -860,15 +908,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         val (x, y) = solveImagePlacement(
                             targetX, targetY, imageScale, image, dstW, dstH
                         )
-                        placed += PlacedImage(
-                            image, x, y, imageScale,
-                            crop?.let { cropInImage(it, page, image, srcOffsetX, sideScale) },
-                        )
-                        // The slot is the page plus its trailing gap (getPageSlotHeight), and
-                        // the pass cleared to transparent black - so a gap left unpainted reads
-                        // as a hard black line between every page. Carry this image's own
-                        // background down through the gap: document-space pageGapPx becomes
-                        // device pixels once scaled.
+                        // KMK --> The underlay runs for a decoded-but-not-yet-uploaded image too:
+                        // between the image object existing (isDecoded) and its first mip level
+                        // landing (hasUploadedImage), the slot's whole footprint was skipped here,
+                        // and the pass cleared to transparent - so that page showed as a black
+                        // region bounded by two hard edges until upload caught up. Everything the
+                        // underlay math needs (width/height offsets and the page's own background)
+                        // is set at Image construction, before either upload.
                         val halfW = image.width * imageScale / 2f
                         val halfH = image.height * imageScale / 2f
                         val gapPad = pageGapPx * s.scale
@@ -881,6 +927,17 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                             (targetY + halfH + 1f + gapPad) / dstH,
                             image.backgroundColor,
                         )
+                        // KMK <--
+                        if (image.mipmaps.isEmpty()) return@forEachImage
+                        placed += PlacedImage(
+                            image, x, y, imageScale,
+                            crop?.let { cropInImage(it, page, image, srcOffsetX, sideScale) },
+                        )
+                        // The slot is the page plus its trailing gap (getPageSlotHeight), and
+                        // the pass cleared to transparent black - so a gap left unpainted reads
+                        // as a hard black line between every page. Carry this image's own
+                        // background down through the gap: document-space pageGapPx becomes
+                        // device pixels once scaled.
                     }
                     drawable.add(DrawablePage(page, vp, placed))
                 }
