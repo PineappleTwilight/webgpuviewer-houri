@@ -6,10 +6,12 @@ import androidx.webgpu.BlendFactor
 import androidx.webgpu.BlendOperation
 import androidx.webgpu.BufferUsage
 import androidx.webgpu.CompareFunction
+import androidx.webgpu.GPUBindGroup
 import androidx.webgpu.GPUBindGroupDescriptor
 import androidx.webgpu.GPUBindGroupEntry
 import androidx.webgpu.GPUBlendComponent
 import androidx.webgpu.GPUBlendState
+import androidx.webgpu.GPUBuffer
 import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUColorTargetState
 import androidx.webgpu.GPUDepthStencilState
@@ -283,6 +285,62 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder())
     }
 
+    /**
+     * One ring slot: the 32-byte uniform buffer a draw reads its params from, plus the bind group
+     * that binds it per colour format.
+     *
+     * [drawMaskedRect] runs once per background rect per page per frame - on a long strip the
+     * continuous underlay makes that the reader's most frequent allocation site - and the fresh
+     * buffer + bind group it used to build per call (the shape [ca.mpreg.webgpuviewer.draw.Draw.rect]
+     * has to keep, because its rects can outgrow any ring) is four native objects a rect, every
+     * frame, for as long as the reader is open. [Mipmap.tileUniformFor] is the precedent being
+     * followed: a persistent buffer, rewritten every draw it serves.
+     *
+     * The hazard [ca.mpreg.webgpuviewer.draw.Draw.rect]'s comment documents is why it cannot share
+     * *one* buffer: two `queue.writeBuffer` calls before a submit make every draw that buffer
+     * serves read the last colour. Writes land on the queue in call order rather than between a
+     * submitted frame's commands, so slots only have to be distinct *within one frame* - [beginFrame] resets the
+     * count at the top of every encoded frame, and a frame whose rect volume would wrap the ring
+     * falls back to the old one-shot pair instead of reusing a slot it has already filled.
+     */
+    private class MaskedRectSlot(val buffer: GPUBuffer, val bindGroups: HashMap<Int, GPUBindGroup>)
+
+    private const val MASKED_RECT_RING = 16
+
+    private val maskedRectSlots = arrayOfNulls<MaskedRectSlot>(MASKED_RECT_RING)
+
+    /** Rects served this frame; reset by [beginFrame]. Past the ring, draws allocate one-shot. */
+    private var maskedRectCount = 0
+
+    /** The [WebGpuRenderer.deviceGeneration] the ring's buffers were made on. */
+    private var maskedRectGeneration: Long = -1L
+
+    /**
+     * One per encoded frame - [WebGpuRenderer.render] calls it just before encoding, so every
+     * pass of that frame draws after the count reset. Also the one place the ring notices its
+     * device was replaced: buffers and bind groups outlive the device they were made on, and a
+     * device loss hands out a new one, so stale ring contents are dropped wholesale rather than
+     * getting a write that names a dead handle. [WebGpuRenderer.deviceGeneration] exists for
+     * exactly this: it is bumped on every successful device creation, and device-bound caches
+     * compare against it to detect a recreation (see its own doc).
+     */
+    internal fun beginFrame() {
+        maskedRectCount = 0
+        if (maskedRectGeneration != WebGpuRenderer.deviceGeneration) {
+            dropMaskedRectRing()
+            maskedRectGeneration = WebGpuRenderer.deviceGeneration
+        }
+    }
+
+    /** Closes every slot. Render thread only, like everything that owns these handles. */
+    private fun dropMaskedRectRing() {
+        for (slot in maskedRectSlots) {
+            slot?.bindGroups?.values?.forEach { try { it.close() } catch (_: Throwable) {} }
+            try { slot?.buffer?.destroyAndRelease() } catch (_: Throwable) {}
+        }
+        maskedRectSlots.fill(null)
+    }
+
     internal fun drawMaskedRect(
         pass: GPURenderPassEncoder,
         /** Format of [pass]'s colour attachment - see [Variant]. */
@@ -310,24 +368,56 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         byteBuffer.putFloat(a)
         byteBuffer.flip()
 
-        val uniformBuffer = device.createBuffer(
-            GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
-        )
-        device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
+        val pipeline = maskedRectPipelines[format]
+        val ringIndex = maskedRectCount
+        val useRing = ringIndex < MASKED_RECT_RING
+        if (useRing) maskedRectCount = ringIndex + 1
 
-        val maskedRectPipeline = maskedRectPipelines[format]
-        pass.setPipeline(maskedRectPipeline)
-        pass.setTransientBindGroup(
-            0, device.createBindGroup(
-                GPUBindGroupDescriptor(
-                    layout = maskedRectPipeline.groupLayout(), entries = arrayOf(
-                        GPUBindGroupEntry(0, buffer = uniformBuffer)
+        var transientBuffer: GPUBuffer? = null
+        val uniformBuffer: GPUBuffer
+        val bindGroup: GPUBindGroup
+        if (useRing) {
+            val slot = maskedRectSlots[ringIndex] ?: MaskedRectSlot(
+                device.createBuffer(
+                    GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
+                ),
+                HashMap(2),
+            ).also { maskedRectSlots[ringIndex] = it }
+            uniformBuffer = slot.buffer
+            bindGroup = slot.bindGroups.getOrPut(format) {
+                device.createBindGroup(
+                    GPUBindGroupDescriptor(
+                        layout = pipeline.groupLayout(),
+                        entries = arrayOf(GPUBindGroupEntry(0, buffer = uniformBuffer)),
                     )
                 )
+            }
+        } else {
+            val buffer = device.createBuffer(
+                GPUBufferDescriptor(size = 32L, usage = BufferUsage.Uniform or BufferUsage.CopyDst)
             )
-        )
+            transientBuffer = buffer
+            uniformBuffer = buffer
+            bindGroup = device.createBindGroup(
+                GPUBindGroupDescriptor(
+                    layout = pipeline.groupLayout(),
+                    entries = arrayOf(GPUBindGroupEntry(0, buffer = buffer)),
+                )
+            )
+        }
+        device.queue.writeBuffer(uniformBuffer, 0, byteBuffer)
+
+        pass.setPipeline(pipeline)
+        if (useRing) {
+            // The pass keeps its own reference to whatever is set on it (see Release.kt), and the
+            // ring's bind group outlives this draw - so unlike the one-shot path below, our own
+            // reference is kept alive and nothing is closed here.
+            pass.setBindGroup(0, bindGroup)
+        } else {
+            pass.setTransientBindGroup(0, bindGroup)
+        }
         pass.draw(6)
-        uniformBuffer.close()
+        transientBuffer?.close()
     }
 
     /**

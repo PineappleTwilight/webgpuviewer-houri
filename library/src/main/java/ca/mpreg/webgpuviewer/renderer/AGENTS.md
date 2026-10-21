@@ -37,6 +37,15 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   no caller holds a grid.
 - **`onLowMemory` scales whichever budget is in force**, not just `cacheScreens` — `budgetTiles`
   ignores screens once a host sets bytes, so shrinking screens there would silently shed nothing.
+- **`drawMaskedRect` draws from a frame-counted ring, and `WebGpuRenderer.render()` feeds it.**
+  Every background rect per page per frame (the continuous underlay is the reader's most frequent
+  one) used to build a fresh `GPUBuffer` + bind group; the ring (`maskedRectSlots`) serves them
+  with `Mipmap.tileUniformFor`'s persistent-buffer precedent instead. `RenderPage.beginFrame()`
+  is called once per encoded frame — the count resets there, slots are distinct only *within
+  one frame* (two `writeBuffer` calls before a submit make every draw the buffer serves read the
+  last colour), draws past `MASKED_RECT_RING` fall back to the one-shot pair, and the ring is
+  dropped when `deviceGeneration` moves. A second render entry point must call
+  `RenderPage.beginFrame()` too.
 
 ## ANTI-PATTERNS
 - Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.
@@ -48,3 +57,11 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 - `TimestampQuery` absent means `generate()` returns null: `timestampsSupported` gates measurement, so `generate(req, scope): Job?` yields null and callers must handle it (`blitAvailableTiles` falls back to `workerScope`, fire-and-forget). Never assume a Job came back.
 - `CompareFunction.Always` is code, not a marker: it is the real depth/stencil compare in pipeline descriptors (RenderPage.kt, TileRenderer.kt). Grep false positive, not a TODO.
 - Never reuse a single stencil texture across frames; never add a stencil attachment to a pass that has none (transitions).
+- **Never let the `drawMaskedRect` ring wrap inside one frame.** Distinct slots only hold between two
+  writes to one buffer when a submit separates them, and `writeBuffer` never lands between a
+  submitted frame's commands — so the per-frame count (`RenderPage.beginFrame`) is the load-bearing
+  reset. A frame that would exceed `MASKED_RECT_RING` already falls back to one-shot
+  allocate-and-close; keep that fallback rather than rotating modulo the ring size.
+- **`Draw.rect`/`Draw.circle` allocate a buffer per call by design** — their rect count per frame is
+  unbounded (transitions, procedural placeholder pages), so they cannot adopt the guard-free ring.
+  Transient paths first; only move them onto persistent slots once a per-frame ceiling exists.

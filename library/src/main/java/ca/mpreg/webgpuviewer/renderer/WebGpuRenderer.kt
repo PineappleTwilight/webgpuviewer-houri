@@ -667,6 +667,9 @@ class WebGpuRenderer {
             var encoder: GPUCommandEncoder? = null
             try {
                 encoder = device.createCommandEncoder()
+                // RenderPage's masked-rect slot ring needs this frame's start to reset its count -
+                // see the ring's note for why slots must be distinct within one frame.
+                RenderPage.beginFrame()
                 // Draws into an offscreen texture when filters are enabled; endFrame runs them
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))
