@@ -674,6 +674,22 @@ class WebGpuRenderer {
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))
                 filters.endFrame(encoder, texture)
+                // A device loss landing while [fn] above suspends (tile generation waits inside
+                // it) invalidates the native queue before this submit. The Kotlin deviceLost flag
+                // only flips when the loss callback runs, so the entry isAvailable gate cannot
+                // cover the gap - and submitting on the dead handle is a null-deref SEGV inside
+                // libwebgpu_c_bundled (Java_androidx_webgpu_GPUQueue_submit) that kills the
+                // process with no exception to catch. cleanup() holds the same rule: once the
+                // device is lost there is nothing to drive. Drop the frame; the app-side loss
+                // listener rebuilds and re-drives. UNVERIFIED: the residual window between this
+                // recheck and the JNI call cannot be closed from Kotlin.
+                if (!isAvailable) {
+                    Log.w("WebGpuRenderer", "Device lost mid-frame; dropping frame")
+                    // Non-local return, like the other FrameResult exits above: the withLock
+                    // block's own value is discarded, so a return@withLock would fall through
+                    // to the FrameResult.Drawn tail.
+                    return FrameResult.Unavailable
+                }
                 device.queue.submitAndRelease(encoder)
                 encoder = null
                 surface.present()
