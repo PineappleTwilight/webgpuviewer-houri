@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.round
 
 class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     companion object {
@@ -870,8 +871,37 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
         val dstW = texture.width.toFloat()
         val dstH = texture.height.toFloat()
-        val anchorX = dstW / 2f + s.scale * (s.offsetX * dstW + WebGpuRenderer.offsetX * dstW)
-        val anchorY = dstH / 2f - s.scale * s.cameraDocY + s.scale * WebGpuRenderer.offsetY * dstH
+        // KMK --> Snap the shared camera anchor to whole device pixels before anything in this
+        // snapshot hangs off it - the same `round` TileRenderer's continuous placement applies to
+        // its own snapX/snapY, computed from the same expression over the same inputs, so the
+        // snapped values are bit-identical to the ones the tile grids hang off.
+        //
+        // This is the page-boundary seam's actual root cause, and it is intermittent for a
+        // structural reason: the boundary between two adjacent pages was derived through TWO
+        // different anchors. The tiled path draws from `round(anchor)`, while everything laid
+        // out in this function - the underlay rect, `renderFast`'s image quad, a placeholder's
+        // slot fill, the fade veil - drew from the raw, unrounded anchor. The two disagree by
+        // (anchor - round(anchor)), up to half a pixel, and the pixel-center rasterization rule
+        // then hands the boundary row to *neither* page whenever a pixel centre falls inside the
+        // disagreement window: the page above clips its content at the snapped boundary while the
+        // page below starts its content at the unsnapped one (or the mirror image). The row then
+        // shows only the underlay, whose colour is the reader's background wherever the reader
+        // did not pick "automatic background" - a thin black line between two white pages.
+        //
+        // It needed a *mixed* pair at the boundary to show - tiles against fast content while a
+        // neighbour was still decoding, or a decoded page against a placeholder - which is why
+        // every earlier fix (background-first ordering, slot-sized placeholders, the
+        // before-early-return underlay) only made it rarer. Drawing every path from the one
+        // snapped anchor removes the window entirely: both neighbours now claim the same
+        // boundary value, and the rasterizer's own pixel-center rule gives the row to exactly
+        // one of them.
+        //
+        // The step this introduces into the fast path is not a new artefact: the tiles already
+        // stepped in whole pixels, and the fast content "swam" against them by the snap delta
+        // whenever a page's tiles arrived. After this, both step together.
+        // KMK <--
+        val anchorX = round(dstW / 2f + s.scale * (s.offsetX * dstW + WebGpuRenderer.offsetX * dstW))
+        val anchorY = round(dstH / 2f - s.scale * s.cameraDocY + s.scale * WebGpuRenderer.offsetY * dstH)
 
         var allCovered = true
         if (hasImagePage) {

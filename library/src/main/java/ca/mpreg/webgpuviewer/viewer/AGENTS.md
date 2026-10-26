@@ -28,6 +28,19 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   the page's slot, which showed as a dark seam for exactly the frames the first upload takes. Rule:
   keep the background pass before the has-content checks; the background's extent is the *slot*
   (`vp.docTop` + `vp.pageHeight`), never the page's own height.
+- **Every extent in `renderSnapshot` must hang off the same SNAPPED camera anchor the tiles do**
+  (KMK island in `ImageViewerContinuousState.renderSnapshot`). TileRenderer's continuous placement
+  rounds the shared anchor (`snapX/snapY`) and hangs each grid's clip rect off it; the underlay,
+  `renderFast`'s quad, a `Render` page's slot fill and the fade veil all used to hang off the raw,
+  unrounded anchor instead. Two paths deriving the *same page boundary* from *two anchors that
+  differ by up to half a pixel* is the page-boundary seam itself: the pixel-center rule hands the
+  boundary row to neither page whenever a pixel centre falls in the disagreement window, and the
+  underlay's colour (the reader background, whenever "automatic background" is not selected) shows
+  as a thin line. It only appeared for a *mixed* boundary pair — tiled against fast content while a
+  neighbour was still decoding, or decoded against placeholder — which is why each earlier fix
+  only made it rarer. Rule: round the anchor once at the top of `renderSnapshot`, with the same
+  `kotlin.math.round` over the same expression `continuousAnchor` uses, and never place continuous
+  content from the raw anchor.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and
