@@ -762,16 +762,29 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             ?: TileAtlas(atlasSide(), Hdr.frameFormat).also { atlasOrNull = it }
 
     /**
-     * Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE]. Uncapped: the
-     * budget is already byte-bounded, and capping the side truncated the atlas under its own
-     * budget once the viewport (times [cacheScreens]) asked for more than 64 slabs.
+     * Square, whole slabs, big enough for [budgetTiles] tiles of [TILE_SIZE].
+     *
+     * Once deliberately uncapped - the budget is already byte-bounded, and capping the side
+     * truncated the atlas under its own budget once the viewport (times [cacheScreens]) asked
+     * for more than 64 slabs. What still has to cap it is the device's texture-size ceiling:
+     * a side past [WebGpuRenderer.maxTextureDimension2D] is not a bigger atlas, it is a rejected
+     * one - `createTexture` throws from wherever the atlas was first touched, and every tile
+     * request after that fails for as long as the budget outruns the device, instead of the
+     * cache merely holding less than its budget. Flooring whole slabs keeps the atlas on its
+     * own allocation grain; a budget the capped side cannot fit degrades through the path a
+     * merely-full atlas already takes - [TileAtlas.acquire] returns -1 and that tile is
+     * dropped for now.
      */
     private fun atlasSide(): Int {
         val budget = budgetTiles()
         atlasBudgetTiles = budget
         val perSlab = (SLAB_SIZE / TILE_SIZE) * (SLAB_SIZE / TILE_SIZE)
         val slabs = (budget + perSlab - 1) / perSlab
-        return ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1) * SLAB_SIZE
+        val side = ceil(sqrt(slabs.toFloat())).toInt().coerceAtLeast(1) * SLAB_SIZE
+        // Recorded even when it is about to be capped: atlasBudgetTiles is what the budget now
+        // is, not what the atlas holds, so the capped case cannot loop regrow-through-newFrame.
+        val maxSlabs = (WebGpuRenderer.maxTextureDimension2D / SLAB_SIZE).coerceAtLeast(1)
+        return (side / SLAB_SIZE).coerceAtMost(maxSlabs) * SLAB_SIZE
     }
 
     private fun newGrid(page: ImagePage.ImageSingle, pageScale: Float) = PageTiles(

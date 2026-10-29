@@ -232,8 +232,13 @@ class FilterChain {
     private fun acquire(width: Int, height: Int, format: Int, storage: Boolean): Slot {
         require(width > 0 && height > 0) { "acquire: invalid size ${width}x$height" }
         require(width <= 16384 && height <= 16384) { "acquire: size too large ${width}x$height" }
-        val w = width.coerceIn(8, 8192)
-        val h = height.coerceIn(8, 8192)
+        // Same ceiling as everything else that sizes a texture off the surface: a pool entry
+        // past [WebGpuRenderer.maxTextureDimension2D] is rejected outright, where the clamp
+        // leaves the chain running (cropped past the cap on a display larger than it) rather
+        // than beginFrame's catch silently disabling filters for every frame of that session.
+        val cap = minOf(8192, WebGpuRenderer.maxTextureDimension2D)
+        val w = width.coerceIn(8, cap)
+        val h = height.coerceIn(8, cap)
         if (w != width || h != height) {
             android.util.Log.w("FilterChain", "acquire clamped ${width}x$height -> ${w}x$h")
         }

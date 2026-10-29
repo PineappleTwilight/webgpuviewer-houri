@@ -380,8 +380,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Recreate if the size changed, or if HDR came or went under us - these are
             // composited onto the swapchain, so they have to match it.
             val format = Hdr.frameFormat
-            val w = width.coerceIn(8, 8192)
-            val h = height.coerceIn(8, 8192)
+            // The device's texture ceiling binds before any size does: a cache texture the
+            // device cannot create makes every page turn open with "ensureTextures create
+            // failed" - a per-frame rejection for the whole session on that surface, not just
+            // the rows past the limit. A surface larger than the ceiling is rare (a >4096px
+            // display) and clamping it costs that fallback's blit only the rows past the cap.
+            val cap = minOf(8192, WebGpuRenderer.maxTextureDimension2D)
+            val w = width.coerceIn(8, cap)
+            val h = height.coerceIn(8, cap)
             if (w != width || h != height) {
                 android.util.Log.w("Transition", "ensureTextures clamped ${width}x$height -> ${w}x$h")
             }

@@ -62,6 +62,15 @@ import kotlin.math.sqrt
 private val device get() = WebGpuRenderer.device
 
 /**
+ * Ceiling on the on-device font atlas, in one dimension: the device's own texture-size limit
+ * narrowed by the historical 8192 the rest of the renderer clamps at. [Font.addGlyph] builds the
+ * atlas texture at its grown size, so growth past this is a device *rejection* mid-draw - every
+ * subsequent glyph request fails - rather than a bigger atlas. Glyphs that cannot land inside the
+ * cap are drawn advance-only (see [Font.Glyph.hasQuad]) instead, like a space.
+ */
+private fun atlasGrowthCap(): Int = minOf(8192, WebGpuRenderer.maxTextureDimension2D)
+
+/**
  * A signed distance field font atlas - either a true multi-channel one, as produced by
  * msdf-atlas-gen's `-json` output alongside its atlas image
  * (https://github.com/Chlumsky/msdf-atlas-gen), or a single-channel one built on-device from a
@@ -142,6 +151,10 @@ class Font private constructor(
 
     private fun addGlyph(r: Rasterizer, raster: GlyphRaster): Glyph {
         if (!raster.hasQuad) return Glyph(advance = raster.advanceEm)
+        val cap = atlasGrowthCap()
+        // A raster past the atlas cap cannot land on any atlas the device will create - the
+        // growth below would break against it forever. Advance-only, like a space.
+        if (raster.width > cap || raster.height > cap) return Glyph(advance = raster.advanceEm)
 
         if (r.shelfX + raster.width > atlasWidth) {
             r.shelfY += r.shelfHeight
@@ -152,6 +165,12 @@ class Font private constructor(
         val neededHeight = max(atlasHeight, r.shelfY + raster.height)
         if (neededWidth > atlasWidth || neededHeight > atlasHeight) {
             growAtlas(r, neededWidth, max(neededHeight, atlasHeight * 2))
+        }
+        // growAtlas clamps at [atlasGrowthCap]; once there, this glyph may still not fit the
+        // remaining shelf. Skip it rather than blit past the texture (or the CPU mirror) it
+        // needs - the session keeps every glyph that does fit.
+        if (r.shelfX + raster.width > atlasWidth || r.shelfY + raster.height > atlasHeight) {
+            return Glyph(advance = raster.advanceEm)
         }
 
         val originX = r.shelfX
@@ -186,28 +205,39 @@ class Font private constructor(
         )
     }
 
-    /** Grows the atlas to at least [newWidth] x [newHeight] - existing glyphs keep their pixel offsets, so nothing about them needs recomputing. */
+    /**
+     * Grows the atlas to at least [newWidth] x [newHeight] - existing glyphs keep their pixel
+     * offsets, so nothing about them needs recomputing.
+     *
+     * Both dimensions clamp to [atlasGrowthCap]: the created texture must be one the device can
+     * build, and the CPU mirror is sized with it. A request past the cap leaves an atlas smaller
+     * than wanted - [addGlyph] re-checks fit after this returns and skips what cannot land.
+     */
     private fun growAtlas(r: Rasterizer, newWidth: Int, newHeight: Int) {
-        val newPixels = ByteArray(newWidth * newHeight * 4)
+        val cap = atlasGrowthCap()
+        val width = minOf(newWidth, cap)
+        val height = minOf(newHeight, cap)
+        if (width == atlasWidth && height == atlasHeight) return
+        val newPixels = ByteArray(width * height * 4)
         for (row in 0 until atlasHeight) {
             System.arraycopy(
                 r.pixels,
                 row * atlasWidth * 4,
                 newPixels,
-                row * newWidth * 4,
+                row * width * 4,
                 atlasWidth * 4
             )
         }
         r.pixels = newPixels
-        atlasWidth = newWidth
-        atlasHeight = newHeight
+        atlasWidth = width
+        atlasHeight = height
 
         // Closed, not destroyed: this frame may have recorded it.
         atlasView.close()
         atlasTexture.close()
         atlasTexture = device.createTexture(
             GPUTextureDescriptor(
-                size = GPUExtent3D(newWidth, newHeight),
+                size = GPUExtent3D(width, height),
                 format = TextureFormat.RGBA8Unorm,
                 usage = TextureUsage.TextureBinding or TextureUsage.CopyDst,
             )
@@ -215,12 +245,12 @@ class Font private constructor(
         device.queue.writeTexture(
             dataLayout = GPUTexelCopyBufferLayout(
                 offset = 0L,
-                bytesPerRow = newWidth * 4,
-                rowsPerImage = newHeight
+                bytesPerRow = width * 4,
+                rowsPerImage = height
             ),
             data = r.pixels.toDirectBuffer(),
             destination = GPUTexelCopyTextureInfo(texture = atlasTexture),
-            writeSize = GPUExtent3D(newWidth, newHeight),
+            writeSize = GPUExtent3D(width, height),
         )
         atlasView = atlasTexture.createView()
     }

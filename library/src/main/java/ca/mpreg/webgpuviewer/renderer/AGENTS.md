@@ -65,3 +65,28 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 - **`Draw.rect`/`Draw.circle` allocate a buffer per call by design** — their rect count per frame is
   unbounded (transitions, procedural placeholder pages), so they cannot adopt the guard-free ring.
   Transient paths first; only move them onto persistent slots once a per-frame ceiling exists.
+- **Clamp every texture dimension the code chooses to `WebGpuRenderer.maxTextureDimension2D` — a
+  hardcoded 8192 is a per-frame rejection on a cap device, not a conservative bound.** Observed
+  case: a PowerVR Rogue in Compatibility mode reports `maxTextureDimension2D = 4096`, and every
+  texture the renderer sized itself at 8192 failed `createTexture`: the *surface* (`init`/`resize`
+  now clamp through `surfaceDimensionCap()` — the swapchain's canvas reads back as a texture of
+  exactly the configured size), the transition caches (per-page-turn `ensureTextures create failed`
+  for the whole session), the filter pool (`acquire`, whose `beginFrame` catch then silently
+  disabled filters for the session), the tile atlas (`atlasSide`) and the font atlas
+  (`growAtlas`/`addGlyph`). All five now clamp at
+  `minOf(8192, WebGpuRenderer.maxTextureDimension2D)`. The limit is re-queried from
+  `device.getLimits()` in companion init and on every `recreateDeviceLocked`, so it tracks
+  whichever adapter is live — read it per call, never cache it (a fresh adapter after recovery can
+  report different limits).
+- **A capped tile atlas degrades exactly like a full one: `TileAtlas.acquire` returns -1 and the
+  tile is dropped for now.** `atlasSide()` floors the device-capped side to whole `SLAB_SIZE`
+  slabs, so a budget the capped side cannot fit takes the same path a merely-full atlas takes
+  instead of making every tile request fail. `atlasBudgetTiles` still records the *requested*
+  budget even when the side is capped — it is what the budget now is, not what the atlas holds —
+  so a cap cannot loop a grow-through-`newFrame` regen.
+- **A glyph past the font-atlas cap renders advance-only, and that result is cached for the
+  session.** `addGlyph` returns a bare-advance `Glyph` (`hasQuad = false`, exactly like a space)
+  when the raster exceeds the cap *or* no longer fits the shelf after `growAtlas` clamped — the
+  post-grow re-check is what stops it blitting past the (smaller) texture and CPU mirror.
+  `growAtlas` returns early when the cap leaves the requested size unchanged, rather than
+  re-creating the same texture again.

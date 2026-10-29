@@ -52,6 +52,18 @@ class WebGpuRenderer {
 
         const val MAX_SURFACE_DIMENSION = 8192
 
+        /**
+         * The ceiling a *surface* dimension may be configured at: the historical [MAX_SURFACE_DIMENSION]
+         * constant narrowed by [maxTextureDimension2D], because the swapchain's canvas reads back as a
+         * texture of exactly that size. Before the device exists so does the Compatibility 4096 floor;
+         * everywhere else [maxTextureDimension2D] tracks whichever device is live - a fresh adapter can
+         * report different limits (see [recreateDeviceLocked]) - so this is read per call, not cached.
+         *
+         * [init]/[resize] clamp through here: a display whose dimension exceeds what the device can
+         * texture must configure at the device's own limit instead of throwing out of `configure`.
+         */
+        fun surfaceDimensionCap(): Int = minOf(MAX_SURFACE_DIMENSION, maxTextureDimension2D)
+
         lateinit var instance: GPUInstance
         lateinit var adapter: GPUAdapter
         lateinit var device: GPUDevice
@@ -398,16 +410,16 @@ class WebGpuRenderer {
         this.scope = scope
         this.pendingSurface = surface
         this.platformSurface = surface
-        this.width = width.coerceIn(0, MAX_SURFACE_DIMENSION)
-        this.height = height.coerceIn(0, MAX_SURFACE_DIMENSION)
+        this.width = width.coerceIn(0, surfaceDimensionCap())
+        this.height = height.coerceIn(0, surfaceDimensionCap())
         createSurface()
     }
 
     @Synchronized
     fun resize(width: Int, height: Int) {
         if (!isAvailable) return
-        val w = width.coerceIn(0, MAX_SURFACE_DIMENSION)
-        val h = height.coerceIn(0, MAX_SURFACE_DIMENSION)
+        val w = width.coerceIn(0, surfaceDimensionCap())
+        val h = height.coerceIn(0, surfaceDimensionCap())
         if (w == this.width && h == this.height && surface != null) return
         this.width = w
         this.height = h
