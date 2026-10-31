@@ -6,6 +6,7 @@ import androidx.webgpu.GPUBuffer
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUComputePassEncoder
 import androidx.webgpu.GPUComputePipeline
+import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUQueue
 import androidx.webgpu.GPURenderPassEncoder
 import androidx.webgpu.GPURenderPipeline
@@ -53,6 +54,12 @@ internal fun GPUComputePassEncoder.setTransientBindGroup(index: Int, group: GPUB
 
 /** Frees the memory behind a buffer we own for good, then drops the handle to it. */
 internal fun GPUBuffer.destroyAndRelease() {
+    destroy()
+    close()
+}
+
+/** Frees the memory behind a device we own for good, then drops the handle to it. */
+internal fun GPUDevice.destroyAndRelease() {
     destroy()
     close()
 }

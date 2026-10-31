@@ -1,6 +1,7 @@
 package ca.mpreg.webgpuviewer.renderer
 
 import android.annotation.SuppressLint
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.webgpu.DeviceLostCallback
@@ -31,6 +32,7 @@ import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.withContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -39,6 +41,7 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class FrameResult {
     Drawn,
@@ -51,6 +54,23 @@ class WebGpuRenderer {
         const val MIN_SURFACE_DIMENSION = 8
 
         const val MAX_SURFACE_DIMENSION = 8192
+
+        /**
+         * The surface-teardown pump: see [pumpSurfaceTeardown]. Eight short pumps cover a
+         * driver that defers the `vkDestroySurfaceKHR` disconnect by a frame or three; the
+         * alternative is the replacement surface failing with
+         * `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` and losing the device built to recover onto.
+         */
+        private const val SURFACE_TEARDOWN_PUMPS = 8
+        private const val SURFACE_TEARDOWN_PUMP_MS = 2L
+
+        /**
+         * The recovery ladder: see [recoverFromDeviceLoss]. A recovery must have produced a
+         * device that stayed alive this long before consecutive-failure counting resets, and
+         * this many consecutive failures stop the self-retries until a fresh loss event.
+         */
+        private const val RECOVERY_STABLE_MS = 15_000L
+        private const val RECOVERY_GIVE_UP_ATTEMPTS = 12
 
         /**
          * The ceiling a *surface* dimension may be configured at: the historical [MAX_SURFACE_DIMENSION]
@@ -126,6 +146,38 @@ class WebGpuRenderer {
             deviceLostListeners.remove(listener)
         }
 
+        /**
+         * Called on the render thread when a recovery produced a live device - including the
+         * self-healing retries a loss callback never announces (the loss event fires once, on
+         * the loss itself; the retries that later succeed are silent). A host rebuilds
+         * everything device-bound here: a page decoded before the loss was reset by the loss
+         * handling, but a page that failed to decode *while the device was dead* carries an
+         * ErrorPage and a latched `wantedByRender` that only a fresh reset clears.
+         */
+        fun interface DeviceRecoveredListener {
+            fun onDeviceRecovered()
+        }
+
+        private val deviceRecoveredListeners = CopyOnWriteArrayList<DeviceRecoveredListener>()
+
+        fun addDeviceRecoveredListener(listener: DeviceRecoveredListener) {
+            deviceRecoveredListeners.add(listener)
+        }
+
+        fun removeDeviceRecoveredListener(listener: DeviceRecoveredListener) {
+            deviceRecoveredListeners.remove(listener)
+        }
+
+        private fun notifyDeviceRecovered() {
+            for (listener in deviceRecoveredListeners) {
+                try {
+                    listener.onDeviceRecovered()
+                } catch (e: Throwable) {
+                    Log.w("WebGpuRenderer", "device-recovered listener failed", e)
+                }
+            }
+        }
+
         private fun notifyDeviceLost(reason: Int, message: String) {
             for (listener in deviceLostListeners) {
                 try {
@@ -137,6 +189,12 @@ class WebGpuRenderer {
         }
 
         fun isOnRenderThread() = Thread.currentThread().name == "WebGPU-Render-Thread"
+
+        /** The companion's device object, or null before first init - teardown paths use this. */
+        fun deviceOrNull(): GPUDevice? = if (::device.isInitialized) device else null
+
+        /** The companion's adapter object, or null before first init - teardown paths use this. */
+        fun adapterOrNull(): GPUAdapter? = if (::adapter.isInitialized) adapter else null
 
         val isAvailable: Boolean
             get() = initError == null && !deviceLost &&
@@ -398,6 +456,34 @@ class WebGpuRenderer {
      */
     private var platformSurface: Surface? = null
 
+    /**
+     * The device and adapter retired by the previous recovery, freed at the start of the next
+     * one - see [destroyRetired] in [recoverFromDeviceLoss] for why the wait, and why the free.
+     */
+    private var retiredDevice: GPUDevice? = null
+    private var retiredAdapter: GPUAdapter? = null
+
+    /** Consecutive failed recoveries - the escalation dial of the recovery ladder. */
+    @Volatile
+    private var recoveryFailures = 0
+
+    /**
+     * Uptime before which [recoverFromDeviceLoss] fast-fails without building a device; each
+     * failure pushes it out, up to the ladder's ceiling - see [recoveryBackoffMs].
+     */
+    @Volatile
+    private var recoveryCooldownUntil = 0L
+
+    /**
+     * When the last recovery that produced a device happened - a device that survives
+     * [RECOVERY_STABLE_MS] resets the failure dial in [noteRecoverySuccess].
+     */
+    @Volatile
+    private var lastRecoverySuccessAt = 0L
+
+    /** Guards [scheduleRecoveryRetry]: one self-healing retry in flight at a time. */
+    private val recoveryRetryScheduled = AtomicBoolean(false)
+
     @Volatile
     private var resizePending = false
 
@@ -438,11 +524,39 @@ class WebGpuRenderer {
      * instance's device-bound caches (filter pool, stale swapchain) and rebuilds the swapchain
      * from the retained platform surface. True when the device is usable afterwards; a missing
      * surface waits for the next surface callback.
+     *
+     * Failures are laddered, not retried at the caller's pace. A recovery that fails at surface
+     * creation has lost the device it just built, whose own loss callback starts the next
+     * recovery - unthrottled, that loop recreated a device every second for the rest of the
+     * session (90 generations in the field log, one whole leaked device each). Early failures
+     * run at the caller's own pace; each further one buys a longer cooldown; enough consecutive
+     * failures stop the self-retries until a fresh loss event. A recovery only resets the dial
+     * once its device has stayed alive [RECOVERY_STABLE_MS] - a device that dies again
+     * immediately belongs to the same pressure era, not to a new one.
      */
     suspend fun recoverFromDeviceLoss(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now < recoveryCooldownUntil) {
+            Log.i(
+                "WebGpuRenderer",
+                "recovery deferred ${(recoveryCooldownUntil - now) / 1000.0}s (consecutive failures: $recoveryFailures)"
+            )
+            return false
+        }
         return try {
             withContext(dispatcher) {
                 mutex.withLock {
+                    // The device retired by the previous recovery is a full recovery cycle old
+                    // by now: continuations that were mid-flight when it died read `device`
+                    // from the companion when they resume (see [onDispatcher]), so nothing
+                    // references the retired handles any more and this is the safe point to
+                    // free them. Reassigning instead leaked a whole Dawn device per recovery -
+                    // the wrapper has no finalizer (see Release.kt) - and the loss loop was
+                    // compounding the very memory pressure that had started it.
+                    destroyRetired()
+                    val deadDevice = deviceOrNull()
+                    val deadAdapter = adapterOrNull()
+
                     // Drop the swapchain and the native window BEFORE the new device exists.
                     // Dawn can defer vkDestroySurfaceKHR past close(), and a second createSurface
                     // on the same window while the old swapchain is still connected to it fails
@@ -459,8 +573,22 @@ class WebGpuRenderer {
                         NativeWindow.release(window)
                         window = 0L
                     }
+                    // Releasing our references does not disconnect the window - the deferred
+                    // vkDestroySurfaceKHR does, and it runs only when the instance's event
+                    // loop is pumped. Nothing here had pumped it, so the old surface was
+                    // still connected when createSurface() built the replacement: the fresh
+                    // device was lost at birth and its loss callback started the next
+                    // recovery. Give the deferred work wall-clock time to run.
+                    pumpSurfaceTeardown()
 
-                    if (!recreateDeviceLocked()) return@withLock false
+                    if (!recreateDeviceLocked()) {
+                        noteRecoveryFailure()
+                        return@withLock false
+                    }
+                    // The companion no longer names the dead device, so nothing drives it
+                    // after this lock ends; free it one recovery cycle from now (above).
+                    retiredDevice = deadDevice
+                    retiredAdapter = deadAdapter
                     try {
                         filters.cleanup()
                     } catch (e: Throwable) {
@@ -470,9 +598,19 @@ class WebGpuRenderer {
                     if (platform == null || !platform.isValid) {
                         platformSurface = null
                         Log.w("WebGpuRenderer", "recovery has no live platform surface; next init() rebuilds it")
+                        noteRecoverySuccess()
                         return@withLock true
                     }
                     createSurface()
+                    // A failed surface build loses the device it was created on - synchronously,
+                    // on the loss-callback executor - so a fresh `deviceLost` here means this
+                    // recovery never produced a usable device. Reporting success would have
+                    // reset the ladder and hidden the loop for the rest of the session.
+                    if (deviceLost) {
+                        noteRecoveryFailure()
+                        return@withLock false
+                    }
+                    noteRecoverySuccess()
                     true
                 }
             }
@@ -480,7 +618,102 @@ class WebGpuRenderer {
             throw e
         } catch (e: Throwable) {
             Log.e("WebGpuRenderer", "recoverFromDeviceLoss failed", e)
+            noteRecoveryFailure()
             false
+        }
+    }
+
+    /**
+     * Gives Dawn's deferred surface destruction wall-clock time to run: [GPUSurface.close] only
+     * drops our reference, and the `vkDestroySurfaceKHR` that actually disconnects the window is
+     * dispatched onto the instance's event loop. Called wherever a surface has just been closed
+     * and a new one may be built on the same window; a failed build loses the device it was
+     * created on, so this pump is what stands between recovery and the loop it used to feed.
+     */
+    private suspend fun pumpSurfaceTeardown() {
+        repeat(SURFACE_TEARDOWN_PUMPS) {
+            instance.processEvents()
+            delay(SURFACE_TEARDOWN_PUMP_MS)
+        }
+    }
+
+    /**
+     * Frees the device and adapter retired by the previous recovery. Holds [mutex]; runs on the
+     * render thread.
+     */
+    private fun destroyRetired() {
+        retiredDevice?.let { d ->
+            try {
+                d.destroyAndRelease()
+            } catch (_: Throwable) {
+            }
+        }
+        retiredDevice = null
+        retiredAdapter?.let { a ->
+            try {
+                a.close()
+            } catch (_: Throwable) {
+            }
+        }
+        retiredAdapter = null
+    }
+
+    /** Cooldown bought by [failures] consecutive failed recoveries - see [recoverFromDeviceLoss]. */
+    private fun recoveryBackoffMs(failures: Int): Long =
+        if (failures <= 3) {
+            // Inside one loss-driven chain's own pacing (250/500/750 ms), so a chain's later
+            // attempts still get through.
+            300L * failures
+        } else {
+            minOf(1_500L shl (failures - 4), 30_000L)
+        }
+
+    /** Called under [mutex] when a recovery attempt did not produce a usable device. */
+    private fun noteRecoveryFailure() {
+        recoveryFailures++
+        val backoff = recoveryBackoffMs(recoveryFailures)
+        recoveryCooldownUntil = SystemClock.uptimeMillis() + backoff
+        Log.w("WebGpuRenderer", "recovery failed (consecutive: $recoveryFailures, next attempt in ${backoff}ms)")
+        if (recoveryFailures < RECOVERY_GIVE_UP_ATTEMPTS) {
+            scheduleRecoveryRetry(backoff)
+        } else if (recoveryFailures == RECOVERY_GIVE_UP_ATTEMPTS) {
+            Log.e(
+                "WebGpuRenderer",
+                "recovery gave up after $recoveryFailures consecutive failures; a later device-loss " +
+                    "event restarts the ladder"
+            )
+        }
+    }
+
+    /** Called under [mutex] when a recovery attempt produced a device that is alive at return. */
+    private fun noteRecoverySuccess() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastRecoverySuccessAt >= RECOVERY_STABLE_MS) {
+            recoveryFailures = 0
+        }
+        lastRecoverySuccessAt = now
+        notifyDeviceRecovered()
+    }
+
+    /**
+     * One self-healing retry after a failed recovery. The loss-driven chain that started the
+     * recovery gives up after its own attempts, and a failure inside the cooldown produces no
+     * new loss callback - without this the reader stayed dead until the user recreated it, even
+     * once the pressure that broke it had passed. The cooldown gate in [recoverFromDeviceLoss]
+     * keeps overlapping chains and retries from piling up; the ladder's give-up stops them.
+     */
+    private fun scheduleRecoveryRetry(delayMs: Long) {
+        if (!recoveryRetryScheduled.compareAndSet(false, true)) return
+        CoroutineScope(dispatcher).launch {
+            try {
+                delay(delayMs)
+                if (deviceLost || initError != null) recoverFromDeviceLoss()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+            } finally {
+                recoveryRetryScheduled.set(false)
+            }
         }
     }
 
@@ -768,6 +1001,10 @@ class WebGpuRenderer {
                 }
                 pendingSurface = null
                 resizePending = false
+                // The same deferral as in [recoverFromDeviceLoss]: a viewer recreated right
+                // after this one (a reading-mode switch) inits on a window the closed
+                // surface may still own until the deferred destroy actually runs.
+                pumpSurfaceTeardown()
             }
         }
 

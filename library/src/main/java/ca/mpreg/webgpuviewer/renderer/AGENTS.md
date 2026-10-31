@@ -90,3 +90,34 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   post-grow re-check is what stops it blitting past the (smaller) texture and CPU mirror.
   `growAtlas` returns early when the cap leaves the requested size unchanged, rather than
   re-creating the same texture again.
+- **Never build a surface on a window whose old surface was closed without pumping
+  `instance.processEvents()` first.** `GPUSurface.close()` drops only our reference; Dawn
+  defers the `vkDestroySurfaceKHR` that disconnects the window onto the instance event loop,
+  and `createSurface()` on a still-connected window fails `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` —
+  which loses the *fresh* device at birth, fires its loss callback, and (before the recovery
+  ladder existed) looped: one new device per second, 90 generations in the field log. Both
+  `recoverFromDeviceLoss` and `cleanup()` now call `pumpSurfaceTeardown()` after dropping the
+  surface and window. Any new path that closes a surface and may later build one on the same
+  window needs the pump too.
+- **Retired devices are freed one recovery cycle later, not at reassignment.** The
+  `GPUDevice`/`GPUAdapter` wrappers hold native references with no finalizer behind them (see
+  `Release.kt`), so `recreateDeviceLocked`'s bare reassignment leaked a whole Dawn device per
+  recovery — the loss loop's memory pressure fed itself. `recoverFromDeviceLoss` parks the dead
+  handles in `retiredDevice`/`retiredAdapter` and `destroyRetired()` frees them at the start of
+  the *next* recovery: mid-flight continuations read `device` from the companion when they
+  resume (see `onDispatcher`), so the safe free point is a full cycle later, under the render
+  mutex. `GPUDevice.destroyAndRelease()` lives in `Release.kt` beside the buffer/texture ones.
+- **`::device.isInitialized` is prohibited from the instance class.** The companion's lateinit
+  vars cannot be checked with a `::`-reference from outside the companion ("backing field is
+  not accessible at this point" — the field belongs to the companion instance). Use the
+  companion helpers `deviceOrNull()` / `adapterOrNull()` instead; the same rule is why
+  `isAvailable`'s getter lives inside the companion.
+- **A recovery that lost its device at birth must report failure.** After `createSurface()` the
+  recovery re-reads `deviceLost`: a failed surface build loses the fresh device synchronously on
+  the loss-callback executor, and returning `true` for that case reset the app-side failure
+  counting and hid the loop. The recovery ladder itself (`recoveryFailures` /
+  `recoveryCooldownUntil` / `scheduleRecoveryRetry` / `RECOVERY_GIVE_UP_ATTEMPTS`) lives in
+  `WebGpuRenderer`; hosts hear about silent successes through `DeviceRecoveredListener` — the
+  loss callback fires once, but the self-healing retries that later succeed are silent, and a
+  host that only listens for losses keeps pages that failed to decode while the device was dead
+  on their `ErrorPage`.
