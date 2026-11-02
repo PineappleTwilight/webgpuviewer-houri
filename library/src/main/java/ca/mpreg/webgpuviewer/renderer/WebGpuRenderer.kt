@@ -38,6 +38,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -63,6 +64,14 @@ class WebGpuRenderer {
          */
         private const val SURFACE_TEARDOWN_PUMPS = 8
         private const val SURFACE_TEARDOWN_PUMP_MS = 2L
+
+        /**
+         * How long [detachSurface] waits for the frame in flight before giving up and letting the
+         * teardown proceed: the common case is a few milliseconds, since the frame only has to
+         * run out its last native calls, but a frame wedged past every deadline must not turn the
+         * crash this prevents into a hang of the surface callback.
+         */
+        private const val FRAME_DRAIN_TIMEOUT_MS = 250L
 
         /**
          * The recovery ladder: see [recoverFromDeviceLoss]. A recovery must have produced a
@@ -487,6 +496,16 @@ class WebGpuRenderer {
     @Volatile
     private var resizePending = false
 
+    /**
+     * Set by [detachSurface] when the platform surface is going away. The device is fine and the
+     * [GPUSurface] still exists, but the framework dismantles the window - its BufferQueue and
+     * every gralloc buffer behind the swapchain images - as soon as the surfaceDestroyed
+     * callbacks return, so a frame that starts or resumes into this flag drops instead of
+     * driving a window that is being torn out from under it.
+     */
+    @Volatile
+    private var surfaceDetached = false
+
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         if (!isAvailable) {
@@ -496,6 +515,10 @@ class WebGpuRenderer {
         this.scope = scope
         this.pendingSurface = surface
         this.platformSurface = surface
+        // A surface the framework destroyed between its create callback and this call (the
+        // surface block may have suspended before init ran) must not clear the detach that its
+        // own destroy callback set.
+        if (surface.isValid) surfaceDetached = false
         this.width = width.coerceIn(0, surfaceDimensionCap())
         this.height = height.coerceIn(0, surfaceDimensionCap())
         createSurface()
@@ -503,7 +526,7 @@ class WebGpuRenderer {
 
     @Synchronized
     fun resize(width: Int, height: Int) {
-        if (!isAvailable) return
+        if (!isAvailable || surfaceDetached) return
         val w = width.coerceIn(0, surfaceDimensionCap())
         val h = height.coerceIn(0, surfaceDimensionCap())
         if (w == this.width && h == this.height && surface != null) return
@@ -516,6 +539,36 @@ class WebGpuRenderer {
             // Not here: [render] holds [mutex] across a suspending draw, so blocking on it from
             // this thread deadlocks against the frame that owns it.
             resizePending = true
+        }
+    }
+
+    /**
+     * The platform surface is going away: stop driving it and drain the frame in flight.
+     *
+     * Called from the surface-destroyed callback, on the main thread. That callback is the
+     * framework's last wait before teardown: a SurfaceView's window - its BufferQueue and the
+     * gralloc buffers behind the swapchain images - is dismantled only once the surfaceDestroyed
+     * callbacks return. Compose cancels the render job there but does not wait for it, and a
+     * cancellation only lands at a suspension point, so a frame that is already past its last
+     * suspension (the fast tile path suspends only while generating) would run its whole
+     * [render] tail - submit and present - against a window whose buffers are being freed
+     * underneath it. That is the rotation crash: a barrage of gralloc allocation failures as the
+     * BufferQueue goes down, then an abort inside `GPUQueue_submit`. Waiting here keeps the
+     * teardown behind the last frame, and the [surfaceDetached] gate makes every frame that
+     * starts or resumes after this drop instead of touching the dying window.
+     */
+    fun detachSurface() {
+        surfaceDetached = true
+        if (isOnRenderThread()) return
+        try {
+            runBlocking {
+                withTimeoutOrNull(FRAME_DRAIN_TIMEOUT_MS) {
+                    mutex.withLock { }
+                }
+            }
+        } catch (_: Throwable) {
+            // A drain that cannot run must not take the surface callback (and with it the
+            // framework's teardown wait) down with it.
         }
     }
 
@@ -595,7 +648,7 @@ class WebGpuRenderer {
                         Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
                     }
                     val platform = platformSurface
-                    if (platform == null || !platform.isValid) {
+                    if (platform == null || !platform.isValid || surfaceDetached) {
                         platformSurface = null
                         Log.w("WebGpuRenderer", "recovery has no live platform surface; next init() rebuilds it")
                         noteRecoverySuccess()
@@ -854,6 +907,9 @@ class WebGpuRenderer {
         mutex.withLock {
             // Only [init]/[resize] can build one, so a redraw alone accomplishes nothing.
             val surface = surface ?: return FrameResult.Unavailable
+            // [detachSurface] ran: the platform window is going away, so nothing may start a
+            // frame against it - the framework tears it down once the destroy callbacks return.
+            if (surfaceDetached) return FrameResult.Unavailable
             // A stale surface from before a resize shrunk below this would otherwise still reach
             // getCurrentTexture - [createSurface]/[reconfigure] refuse to configure one this small.
             if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) {
@@ -928,8 +984,20 @@ class WebGpuRenderer {
                 // device is lost there is nothing to drive. Drop the frame; the app-side loss
                 // listener rebuilds and re-drives. UNVERIFIED: the residual window between this
                 // recheck and the JNI call cannot be closed from Kotlin.
-                if (!isAvailable) {
-                    Log.w("WebGpuRenderer", "Device lost mid-frame; dropping frame")
+                //
+                // The platform surface has the same exposure, with one difference: [detachSurface]
+                // sets [surfaceDetached] from the surface-destroyed callback and then drains this
+                // very frame before returning - the framework holds the teardown until that
+                // callback returns - so this check, not the drain, is what actually stops a frame
+                // that was mid-draw when the surface went away. The isValid probe is a last
+                // backstop for teardowns that bypass the callback.
+                if (!isAvailable || surfaceDetached || platformSurface?.isValid == false) {
+                    val why = when {
+                        surfaceDetached -> "Surface detached mid-frame"
+                        platformSurface?.isValid == false -> "Platform surface invalid mid-frame"
+                        else -> "Device lost mid-frame"
+                    }
+                    Log.w("WebGpuRenderer", "$why; dropping frame")
                     // Non-local return, like the other FrameResult exits above: the withLock
                     // block's own value is discarded, so a return@withLock would fall through
                     // to the FrameResult.Drawn tail.

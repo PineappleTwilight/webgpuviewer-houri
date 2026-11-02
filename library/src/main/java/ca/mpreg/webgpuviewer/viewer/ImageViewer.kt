@@ -552,23 +552,27 @@ fun ImageViewer(
             }
         }
 
-    ViewerSurface(surfaceModifier) { surface, width, height ->
-        try {
-            // Before init: whether the panel does HDR at all gates the decode path, which can
-            // reach an image before the first frame is drawn.
-            attachHdrDisplay(view)
-            state.prepareForSurface()
-            state.init(scope, surface, width, height)
-            surface.onChanged { w, h -> state.resize(w, h) }
-            // After init, so Hdr.resolve has run and the surface's capability is known too.
-            attachHdrSurface(view)
-            state.invalidate()
-            state.collect()
-        } finally {
-            attachHdrSurface(null)
-            state.cleanup()
-        }
-    }
+    ViewerSurface(
+        surfaceModifier,
+        onSurfaceReady = { surface, width, height ->
+            try {
+                // Before init: whether the panel does HDR at all gates the decode path, which can
+                // reach an image before the first frame is drawn.
+                attachHdrDisplay(view)
+                state.prepareForSurface()
+                state.init(scope, surface, width, height)
+                surface.onChanged { w, h -> state.resize(w, h) }
+                // After init, so Hdr.resolve has run and the surface's capability is known too.
+                attachHdrSurface(view)
+                state.invalidate()
+                state.collect()
+            } finally {
+                attachHdrSurface(null)
+                state.cleanup()
+            }
+        },
+        onSurfaceDestroyed = { state.onSurfaceDestroyed() },
+    )
 }
 
 /**

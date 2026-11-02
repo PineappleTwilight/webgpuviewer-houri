@@ -672,6 +672,17 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         tiles.restoreMemoryBudget()
     }
 
+    /**
+     * The platform surface is going away (surfaceDestroyed). Runs on the main thread while the
+     * framework is still holding the teardown off: gates new frames and drains the one in flight,
+     * so the render thread never submits or presents into a window whose BufferQueue is being
+     * dismantled - see [WebGpuRenderer.detachSurface]. [cleanup] still owns releasing the surface
+     * and the window; this only stops driving them.
+     */
+    fun onSurfaceDestroyed() {
+        renderer.detachSurface()
+    }
+
     fun cleanup() {
         animationJob?.cancel()
         onScreenPages = emptyList()

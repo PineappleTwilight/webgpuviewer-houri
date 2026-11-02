@@ -24,14 +24,26 @@ import ca.mpreg.webgpuviewer.renderer.Hdr
 internal fun ViewerSurface(
     modifier: Modifier,
     onSurfaceReady: suspend SurfaceCoroutineScope.(Surface, Int, Int) -> Unit,
+    onSurfaceDestroyed: () -> Unit = {},
 ) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
         AndroidExternalSurface(modifier = modifier, isOpaque = false) {
-            onSurface(onSurfaceReady)
+            onSurface { surface, width, height ->
+                // Registered before [onSurfaceReady], so it is in place before the block's first
+                // suspension: the framework dismantles the window once the surfaceDestroyed
+                // callbacks return, and this hook - which runs on the main thread before Compose
+                // cancels the render job - is the last chance to keep the frame in flight off
+                // that window. See [WebGpuRenderer.detachSurface].
+                surface.onDestroyed { onSurfaceDestroyed() }
+                onSurfaceReady(surface, width, height)
+            }
         }
     } else {
         AndroidEmbeddedExternalSurface(modifier = modifier, isOpaque = false) {
-            onSurface(onSurfaceReady)
+            onSurface { surface, width, height ->
+                surface.onDestroyed { onSurfaceDestroyed() }
+                onSurfaceReady(surface, width, height)
+            }
         }
     }
 }
