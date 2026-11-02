@@ -65,6 +65,14 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   (`containsKey`-gated `visible` logic in `TileRenderer`) saw them as off screen. Keep the
   published set through `publishOnScreen(visible)`; bare-assigning silently drops the wake.
 - `pageOffset` setter clamps NaN/Inf and walks whole-page deltas with a 20-iteration guard.
+- **`ViewerSurface` owns the `Surface.onDestroyed` registration** (before the host block's first
+  suspension, so nothing can destroy a surface ahead of it) and forwards it to
+  `ImageViewerState.onSurfaceDestroyed` → `WebGpuRenderer.detachSurface`: the framework
+  dismantles the window once the surfaceDestroyed callbacks return, so the in-flight frame is
+  drained and gated *inside* that callback, on the main thread, before Compose cancels the
+  render job. Do not add a surface consumer that bypasses `ViewerSurface` or drops the
+  `onSurfaceDestroyed` wiring - see `WebGpuRenderer.detachSurface` for the rotation crash it
+  prevents.
 
 ## ANTI-PATTERNS
 - Do NOT clear inside `renderLoaded` (shared continuous texture) - clear once up front in `ImageViewerContinuousState` instead.

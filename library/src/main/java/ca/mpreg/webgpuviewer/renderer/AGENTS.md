@@ -99,6 +99,24 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   `recoverFromDeviceLoss` and `cleanup()` now call `pumpSurfaceTeardown()` after dropping the
   surface and window. Any new path that closes a surface and may later build one on the same
   window needs the pump too.
+- **The surfaceDestroyed callback is the framework's last wait before the window dies — drain
+  the frame in flight there (`detachSurface`).** Compose's `dispatchSurfaceDestroyed` runs the
+  `Surface.onDestroyed` hooks first and then cancels the render job without waiting for it, and
+  the framework dismantles the window - its BufferQueue and every gralloc buffer behind the
+  swapchain images - as soon as the callbacks return. A cancellation only lands at a suspension
+  point, so a frame already past its last one (the fast tile path suspends only while
+  generating) ran its whole `render` tail - submit and present - into that teardown: a barrage
+  of `GraphicBufferAllocator: Failed to allocate (4 x 4) format 59` failures, then a SIGABRT
+  inside `GPUQueue_submit` on device rotation. `detachSurface` (wired through
+  `ViewerSurface`'s `Surface.onDestroyed`, registered before the host block's first suspension
+  so nothing can destroy a surface ahead of it) sets the `surfaceDetached` gate and drains the
+  in-flight frame on the render mutex under a timeout before returning; `render()` refuses new
+  frames at entry and re-checks at the submit. `init()` clears the gate only for a surface the
+  framework has not already invalidated (`surface.isValid`), so a surface destroyed between its
+  create callback and the block's first resume cannot clear its own detach. Rule: any new
+  surface entry point must keep that registration and these two gates; the submit-side gate is
+  what actually stops the frame that was mid-draw, because the drain is the thing waiting on
+  it.
 - **Retired devices are freed one recovery cycle later, and freed with `destroy()` alone — never
   `close()`.** The `GPUDevice`/`GPUAdapter` wrappers hold native references with no finalizer
   behind them (see `Release.kt`), so `recreateDeviceLocked`'s bare reassignment leaked a whole
