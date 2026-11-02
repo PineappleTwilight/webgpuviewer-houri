@@ -99,14 +99,27 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   `recoverFromDeviceLoss` and `cleanup()` now call `pumpSurfaceTeardown()` after dropping the
   surface and window. Any new path that closes a surface and may later build one on the same
   window needs the pump too.
-- **Retired devices are freed one recovery cycle later, not at reassignment.** The
-  `GPUDevice`/`GPUAdapter` wrappers hold native references with no finalizer behind them (see
-  `Release.kt`), so `recreateDeviceLocked`'s bare reassignment leaked a whole Dawn device per
-  recovery — the loss loop's memory pressure fed itself. `recoverFromDeviceLoss` parks the dead
-  handles in `retiredDevice`/`retiredAdapter` and `destroyRetired()` frees them at the start of
-  the *next* recovery: mid-flight continuations read `device` from the companion when they
-  resume (see `onDispatcher`), so the safe free point is a full cycle later, under the render
-  mutex. `GPUDevice.destroyAndRelease()` lives in `Release.kt` beside the buffer/texture ones.
+- **Retired devices are freed one recovery cycle later, and freed with `destroy()` alone — never
+  `close()`.** The `GPUDevice`/`GPUAdapter` wrappers hold native references with no finalizer
+  behind them (see `Release.kt`), so `recreateDeviceLocked`'s bare reassignment leaked a whole
+  Dawn device per recovery — the loss loop's memory pressure fed itself. `recoverFromDeviceLoss`
+  parks the dead handles in `retiredDevice`/`retiredAdapter` and `destroyRetired()` frees them at
+  the start of the *next* recovery: mid-flight continuations read `device` from the companion when
+  they resume (see `onDispatcher`), so the safe free point is a full cycle later, under the render
+  mutex. But `close()` is also the only thing that deletes the global refs the androidx.webgpu
+  glue holds for a wrapper, and the glue constructs its callback runnables **at dispatch time**
+  from those refs — `DeviceLostCallbackRunnable` is built with `(callback, GPUDevice, …)` when
+  Dawn flushes a pending record, which can be long after we parked the device, because a loss
+  record queued but never dispatched (nothing drives a parked device) rides until a later
+  command's processing flushes it. `destroyAndRelease()` on a retired device deleted those
+  globals out from under a still-pending record, and the next frame's `finish()` — which pumps
+  the callback queue — aborted the process inside `NewObjectV` with ART's
+  `JNI ERROR (app bug): accessed deleted Global` (field: double device loss in one pressure era,
+  Multilaser M8_4G / Android 11). So `destroyRetired()` calls `destroy()` — which frees the GPU
+  memory that fed the loss loop — while the wrapper's global stays alive for any late dispatch;
+  `deviceDescriptor()`'s stale-fire guard (ignore a loss callback whose device is not the
+  companion's current one) keeps that dispatch from reaching the recovery ladder. `Release.kt`
+  deliberately defines no `GPUDevice.destroyAndRelease()`.
 - **`::device.isInitialized` is prohibited from the instance class.** The companion's lateinit
   vars cannot be checked with a `::`-reference from outside the companion ("backing field is
   not accessible at this point" — the field belongs to the companion instance). Use the

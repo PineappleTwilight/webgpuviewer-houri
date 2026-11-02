@@ -58,11 +58,13 @@ internal fun GPUBuffer.destroyAndRelease() {
     close()
 }
 
-/** Frees the memory behind a device we own for good, then drops the handle to it. */
-internal fun GPUDevice.destroyAndRelease() {
-    destroy()
-    close()
-}
+/*
+ * Deliberately NO GPUDevice.destroyAndRelease(): close() is the only thing that deletes the
+ * global refs the androidx.webgpu glue holds for a wrapper, and the glue constructs its callback
+ * runnables at dispatch time from those refs - so a device whose loss record is still pending can
+ * have those globals marshalled after close(). See destroyRetired() in WebGpuRenderer.kt, the one
+ * place a device is ever freed, and it calls destroy() alone.
+ */
 
 /** Frees the memory behind a texture we own for good, then drops the handle to it. */
 internal fun GPUTexture.destroyAndRelease() {

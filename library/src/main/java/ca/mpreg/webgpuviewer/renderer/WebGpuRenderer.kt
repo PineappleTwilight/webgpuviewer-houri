@@ -280,6 +280,17 @@ class WebGpuRenderer {
 
         private fun deviceDescriptor() = GPUDeviceDescriptor(
             deviceLostCallback = DeviceLostCallback { lost, reason, message ->
+                // A retired device's still-pending loss record can dispatch long after recovery
+                // parked it (see [destroyRetired] for why its wrapper must stay alive for that).
+                // Firing the ladder for a device the companion no longer names would churn
+                // generations: every such dispatch would start another recovery. Ignore them.
+                if (lost !== deviceOrNull()) {
+                    Log.w(
+                        "WebGpuRenderer",
+                        "stale device-lost callback for a retired device (reason=$reason: $message)"
+                    )
+                    return@DeviceLostCallback
+                }
                 val first = !deviceLost
                 if (first) {
                     deviceLostDetail = " (reason=$reason: $message" +
@@ -640,11 +651,28 @@ class WebGpuRenderer {
     /**
      * Frees the device and adapter retired by the previous recovery. Holds [mutex]; runs on the
      * render thread.
+     *
+     * The device gets [GPUDevice.destroy] and **never [GPUDevice.close]**. `close()` is the only
+     * thing in the whole pipeline that deletes the global refs the androidx.webgpu glue holds for
+     * a wrapper, and the glue constructs its callback runnables *at dispatch time* from those
+     * refs: `DeviceLostCallbackRunnable` / `UncapturedErrorCallbackRunnable` are built with
+     * `(callback, GPUDevice, …)` when Dawn flushes a pending record - which can be long after we
+     * parked the device, because a loss record queued but never dispatched (nothing drives a
+     * parked device) rides until some later command's processing flushes it. `close()` on a
+     * retired device deleted those globals out from under a still-pending record, and the next
+     * frame's `finish()` - which pumps the callback queue - aborted the process inside
+     * `NewObjectV` with ART's `JNI ERROR (app bug): accessed deleted Global`. Field evidence:
+     * Multilaser M8_4G, Android 11, double device loss in one pressure era (tombstone:
+     * `finish$default` → `submitAndRelease` → `NewObjectV`). So `destroy()` frees the GPU memory
+     * - the part that fed the loss loop - while the wrapper's global stays alive and any late
+     * record dispatches harmlessly (the stale-fire guard in [deviceDescriptor] keeps it from
+     * reaching the recovery ladder). The residue is the destroyed device's shell plus one Java
+     * wrapper per recovery: kilobytes, and recoveries are rare.
      */
     private fun destroyRetired() {
         retiredDevice?.let { d ->
             try {
-                d.destroyAndRelease()
+                d.destroy()
             } catch (_: Throwable) {
             }
         }
