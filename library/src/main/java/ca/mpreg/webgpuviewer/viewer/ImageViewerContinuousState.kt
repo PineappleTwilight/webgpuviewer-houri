@@ -15,6 +15,7 @@ import ca.mpreg.webgpuviewer.draw.clear
 import ca.mpreg.webgpuviewer.reader.PageAnchor
 import ca.mpreg.webgpuviewer.renderer.Image
 import ca.mpreg.webgpuviewer.renderer.RenderPage
+import ca.mpreg.webgpuviewer.renderer.TileRenderer
 import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
 import ca.mpreg.webgpuviewer.renderer.solveImagePlacement
 import kotlinx.coroutines.Job
@@ -601,6 +602,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val pageHeight: Float,
         /** As [getPageHeight] measured it, so the draw places what the layout sized. */
         val crop: Rect?,
+        // KMK --> The page's content extent in device pixels, chained through the walked band -
+        // see [captureRenderState]'s chain note for why these exist alongside [docTop].
+        val clipTopY: Float,
+        val clipBottomY: Float,
+        // KMK <--
     )
 
     private fun cropFor(page: ImagePage) = (page as? ImagePage.ImageSingle)?.let(::cropOf)
@@ -630,6 +636,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val docTop: Float,
         val pageHeight: Float,
         val crop: Rect?,
+        // KMK --> The same chained device edges the draw path will use - see [VisiblePage].
+        val clipTopY: Float,
+        val clipBottomY: Float,
+        // KMK <--
     )
 
     private class ContinuousRenderSnapshot(
@@ -698,6 +708,24 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         val y0 = if (page0 != null) (-scrollYInternal + slideOffset).toFloat() else 0f
         val cameraDocY = (anchorDocYInternal - y0 + 0.5 * screenH).toFloat()
 
+        // KMK --> The device-space base the page-boundary chain hangs off: the same snapped
+        // anchor renderSnapshot derives from the same expression over the same inputs (height ==
+        // the swapchain texture's height - the surface is configured at this size), so the clip
+        // edges chained below sit exactly on the base the tile grids snap to. Every page's
+        // content extent is then ONE float chained through the band - a page's top edge is the
+        // previous page's bottom edge plus the device-space gap - instead of each page re-deriving
+        // the shared boundary through its own float expression. Two derivations of one boundary
+        // agree only to a few ULPs, and whenever the boundary lands within that window of a pixel
+        // centre, the blit shader's pixel-centre rule hands the row to neither page: the residual
+        // page-boundary seam (the 2026-10 root cause removed the half-pixel part; this removes the
+        // ULP part by construction). Chained values are bit-identical across a boundary, so every
+        // row goes to exactly one page and nothing is left for the underlay to paint.
+        val chainAnchorY =
+            if (height > 0) round(height / 2f - scale * cameraDocY + scale * WebGpuRenderer.offsetY * height) else 0f
+        val deviceGap = pageGapPx * scale
+        val chainTopPage0 = chainAnchorY + scale * anchorDocYInternal.toFloat()
+        // KMK <--
+
         val pages = mutableListOf<VisiblePage>()
         // KMK --> (upstream 27f3f6c + 92be54d) The on-screen set is every page in the walked
         // band, decoded or not. [pages] (what gets drawn) stays decoded-only: an undecoded page
@@ -732,6 +760,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
 
         var scrolledThrough: ImagePage? = null
 
+        // KMK --> The device-space boundary chain. `chainTopNext` is the device Y of the next
+        // page's content top: walking upward, each page's bottom edge is that value minus the
+        // device gap, its own top edge follows from its height, and the walk continues from there.
+        // The forward walk mirrors it downward from the same base, so the boundary between any two
+        // adjacent pages is ONE float - assigned, never re-derived.
+        var chainTopNext = chainTopPage0
+        // KMK <--
         var yTop = y0
         var iBack = -1
         var docTopBack = anchorDocYInternal
@@ -748,10 +783,20 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             // KMK --> (upstream 27f3f6c) Undecoded ones join the on-screen set too.
             // KMK <--
             visible.add(page)
+            // KMK --> The chain advances for every walked page - an undecoded placeholder still
+            // occupies document space the next page's edges chain through.
+            // KMK <--
+            val clipBottomY = chainTopNext - deviceGap
+            val clipTopY = clipBottomY - scale * pageHeight
+            chainTopNext = clipTopY
             // Walked upward, so each goes in front of the last - top to bottom, as the
             // forward walk appends.
             if (page.isDecoded) {
-                pages.add(0, VisiblePage(page, docTopBack.toFloat(), pageHeight, cropFor(page)))
+                pages.add(
+                    0, VisiblePage(
+                        page, docTopBack.toFloat(), pageHeight, cropFor(page), clipTopY, clipBottomY
+                    )
+                )
             }
             if (pageHeight <= 0f) break
             iBack--
@@ -763,6 +808,11 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         var prevSlot = 0f
         var hasPrev = false
         var below = 0
+        // KMK --> The chain's downward twin, re-anchored on page 0's own top edge - the same
+        // `chainTopPage0` the upward walk started from, so the boundary above page 0 is one float
+        // for both walks.
+        var chainBottomPrev = chainTopPage0
+        // KMK <--
         while (y < visBot && i <= reachLimit(visBot - y)) {
             val page = getPage(i) ?: break
             below = i
@@ -770,13 +820,22 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             hasPrev = true
             val pageHeight = getPageHeight(page)
             if (isScrolledThrough(y, pageHeight)) scrolledThrough = page
+            // KMK --> Page 0 reuses the shared base as its top edge; every later page's top is
+            // the previous page's bottom plus the device gap. One float per boundary.
+            // KMK <--
+            val clipTopY = if (i == 0) chainBottomPrev else chainBottomPrev + deviceGap
+            val clipBottomY = clipTopY + scale * pageHeight
+            chainBottomPrev = clipBottomY
             if (y + pageHeight > visTopTiles) {
                 // KMK --> (upstream 27f3f6c) Undecoded ones join the on-screen set; [pages]
                 // (what gets drawn) still skips them.
                 // KMK <--
                 visible.add(page)
                 if (page.isDecoded) {
-                    pages.add(VisiblePage(page, docTop.toFloat(), pageHeight, cropFor(page)))
+                    pages.add(
+                        VisiblePage(page, docTop.toFloat(), pageHeight, cropFor(page),
+                            clipTopY, clipBottomY)
+                    )
                 }
             }
             if (pageHeight <= 0f) break
@@ -801,10 +860,17 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 hasPrev = true
                 val pageHeight = getPageHeight(page)
                 if (pageHeight <= 0f) break
+                // KMK --> The chain continues through the prewarm band, so a prewarmed grid's
+                // clip matches what drawing will clamp at (same frame, same chain).
+                // KMK <--
+                val clipTopY = chainBottomPrev + deviceGap
+                val clipBottomY = clipTopY + scale * pageHeight
+                chainBottomPrev = clipBottomY
                 val single = page as? ImagePage.ImageSingle
                 if (single != null && single.isDecoded && !single.destroyed) {
                     prewarmTargets.add(
-                        PrewarmTarget(single, docTop.toFloat(), pageHeight, cropFor(single))
+                        PrewarmTarget(single, docTop.toFloat(), pageHeight, cropFor(single),
+                            clipTopY, clipBottomY)
                     )
                 }
                 prevSlot = pageHeight + pageGapPx
@@ -986,8 +1052,13 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     val page = vp.page as? ImagePage.Render ?: return@forEach
                     if (page.destroyed) return@forEach
                     val color = page.backgroundColor ?: return@forEach
-                    val slotTop = anchorY + s.scale * vp.docTop
-                    val slotBottom = slotTop + s.scale * vp.pageHeight
+                    // KMK --> The chained slot edges, not a fresh derivation: a placeholder's
+                    // slot boundary is a page boundary like any other, and this fill is the one
+                    // painter for it while the neighbours are placeholders or still decoding.
+                    // clipBottomY is the content bottom; the rect below adds the +1 and the gap.
+                    // KMK <--
+                    val slotTop = vp.clipTopY
+                    val slotBottom = vp.clipBottomY
                     RenderPage.drawMaskedRect(
                         pass,
                         texture.format,
@@ -1002,6 +1073,12 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 drawable.forEach { d ->
                     val page = d.page
                     val crop = d.vp.crop
+                    // KMK --> The chained slot edges are the authoritative clip for an uncropped
+                    // page: both neighbours of a boundary clamp at the same float, so the
+                    // pixel-centre rule always gives the boundary row to exactly one of them
+                    // (see captureRenderState's chain note). A cropped page keeps the derived
+                    // inset - its content edge is mid-slot and shares no boundary.
+                    // KMK <--
                     val covered = !page.isAnimated && tiles.draw(
                         pass,
                         page,
@@ -1013,6 +1090,9 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         s.scale,
                         s.suppressGeneration,
                         crop,
+                        clipEdges = if (crop == null) {
+                            TileRenderer.ClipEdges(d.vp.clipTopY, d.vp.clipBottomY)
+                        } else null,
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
                     if (!covered) {
@@ -1073,7 +1153,14 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             val slotScale =
                 if (ownHeight > 0f) s.scale * (vp.pageHeight / ownHeight) else s.scale
             val targetX = anchorX
-            val targetY = anchorY + s.scale * (vp.docTop + 0.5f * vp.pageHeight)
+            // KMK --> The centre from the chained edges, not a fresh derivation: the fill paints
+            // `slotScale * ownHeight` tall, which equals `clipBottomY - clipTopY`, so centring on
+            // their midpoint puts the fill's edges exactly on the chained boundary - the same
+            // floats the neighbours clamp at. Deriving from docTop instead would make this the
+            // last remaining second derivation of the boundary, and its fill runs after every
+            // other painter: a ULP-wide overreach here repaints a neighbour's last row.
+            // KMK <--
+            val targetY = (vp.clipTopY + vp.clipBottomY) * 0.5f
 
             val x = (targetX - dstW / 2f) / (slotScale * dstW)
             val y = (targetY - dstH / 2f) / (slotScale * dstH)
@@ -1087,7 +1174,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
             s.prewarmTargets.forEach { target ->
                 tiles.prewarmContinuous(
                     target.page, texture, s.cameraDocY, target.docTop,
-                    target.pageHeight, s.offsetX, s.scale, target.crop
+                    target.pageHeight, s.offsetX, s.scale, target.crop,
+                    clipEdges = if (target.crop == null) {
+                        TileRenderer.ClipEdges(target.clipTopY, target.clipBottomY)
+                    } else null,
                 )
             }
         }

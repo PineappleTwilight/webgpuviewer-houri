@@ -1331,6 +1331,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pageScale: Float,
         tileSize: Int,
         crop: Rect? = null,
+        clipEdges: ClipEdges? = null,
     ): GridPlacement? {
         val ts = tileSize.toFloat()
         // Drawn extent from the page's centre, narrowed to [crop].
@@ -1353,9 +1354,20 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         val snapX = round(anchorX)
         val snapY = round(anchorY)
         val clipL = snapX - leftHalf
-        val clipT = snapY + centerYOffset - halfT
+        var clipT = snapY + centerYOffset - halfT
         val clipR = snapX + rightHalf
-        val clipB = snapY + centerYOffset + halfB
+        var clipB = snapY + centerYOffset + halfB
+        // KMK --> The caller's authoritative vertical edges replace the derived ones: the derived
+        // pair is this page's own float expression over the shared document boundary, and two
+        // adjacent pages' expressions agree only to a few ULPs - which, at a boundary that lands
+        // within that window of a pixel centre, leaves the row to neither page (the residual
+        // page-boundary seam). Only for an uncropped page, whose content edge IS the slot edge; a
+        // crop keeps its derived inset, which sits mid-slot and shares no boundary with a neighbour.
+        // KMK <--
+        if (clipEdges != null && crop == null) {
+            clipT = clipEdges.top
+            clipB = clipEdges.bottom
+        }
 
         return GridPlacement(
             ts, snapX, snapY, clipL, clipT, clipR, clipB, wantL, wantR, wantT, wantB
@@ -1414,6 +1426,22 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
     private class ContinuousAnchor(
         val pageScale: Float, val anchorX: Float, val anchorY: Float, val centerYOffset: Float
     )
+
+    /**
+     * KMK --> Authoritative vertical clip edges for a continuous draw, in device pixels.
+     *
+     * The continuous caller derives each page's content extent by chaining one float through the
+     * walked band - a page's top edge *is* the previous page's bottom edge (plus the device-space
+     * gap) - and hands the pair here so both sides of a page boundary clamp at bit-identical
+     * values. The edges [gridPlacement] derives on its own are each page's separate float
+     * expression over the same document boundary (`centerYOffset + halfB` vs the next page's
+     * `centerYOffset - halfT`), which agree only to a few ULPs; whenever the boundary value falls
+     * within that window of a pixel CENTRE, the blit shader's pixel-centre rule hands the row to
+     * neither page and the underlay shows through - the residual page-boundary seam. Chained
+     * values remove the window entirely. See [ImageViewerContinuousState.renderSnapshot].
+     * KMK <--
+     */
+    internal class ClipEdges(val top: Float, val bottom: Float)
 
     private fun continuousAnchor(
         page: ImagePage.ImageSingle,
@@ -1577,6 +1605,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         viewerOffsetX: Float,
         scale: Float,
         crop: Rect? = null,
+        clipEdges: ClipEdges? = null,
     ) {
         if (page.destroyed || !page.highQuality || page.isAnimated) return
         if (!page.hasUploadedImage) return
@@ -1610,7 +1639,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         if (!st.stable) return
 
         val gp = gridPlacement(
-            page, dst, a.anchorX, a.anchorY, a.centerYOffset, a.pageScale, st.tileSize, crop
+            page, dst, a.anchorX, a.anchorY, a.centerYOffset, a.pageScale, st.tileSize, crop,
+            clipEdges
         ) ?: return
         if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) return
 
@@ -1692,6 +1722,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         scale: Float,
         suppressGeneration: Boolean,
         crop: Rect? = null,
+        clipEdges: ClipEdges? = null,
     ): Boolean {
         val a =
             continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale, crop)
@@ -1708,6 +1739,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             applyRetainWindow = false,
             useStencilMask = true,
             crop = crop,
+            clipEdges = clipEdges,
         )
     }
 
@@ -1730,6 +1762,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         applyRetainWindow: Boolean,
         useStencilMask: Boolean = false,
         crop: Rect? = null,
+        clipEdges: ClipEdges? = null,
     ): Boolean {
         if (page.destroyed || !page.highQuality || page.isAnimated) return false
         if (!page.hasUploadedImage) return false
@@ -1790,7 +1823,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.centerYOffset = centerYOffset
 
         val gp =
-            gridPlacement(page, dst, anchorX, anchorY, centerYOffset, pageScale, st.tileSize, crop)
+            gridPlacement(page, dst, anchorX, anchorY, centerYOffset, pageScale, st.tileSize, crop, clipEdges)
         if (gp == null) {
             st.pending.clear()
             return false
