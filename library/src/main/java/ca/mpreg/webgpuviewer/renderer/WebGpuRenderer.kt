@@ -81,6 +81,14 @@ class WebGpuRenderer {
         private const val RECOVERY_STABLE_MS = 15_000L
         private const val RECOVERY_GIVE_UP_ATTEMPTS = 12
 
+        // KMK --> Swapchain-error escalation thresholds - see the [surfaceErrorStreak] field.
+        // 30 failed frames is ~0.5s at 60fps: long enough that a genuinely transient present
+        // failure rides through, short enough that a wedged swapchain is noticed within a
+        // breath. 120 is the point where retrying has been proven futile four times over.
+        private const val SURFACE_ERROR_RECREATE_STREAK = 30
+        private const val SURFACE_ERROR_GIVE_UP_STREAK = 120
+        // KMK <--
+
         /**
          * The ceiling a *surface* dimension may be configured at: the historical [MAX_SURFACE_DIMENSION]
          * constant narrowed by [maxTextureDimension2D], because the swapchain's canvas reads back as a
@@ -517,6 +525,29 @@ class WebGpuRenderer {
     @Volatile
     private var surfaceDetached = false
 
+    /**
+     * KMK --> Consecutive [androidx.webgpu.SurfaceGetCurrentTextureStatus.Error] frames on the
+     * live surface. PowerVR field evidence (Multilaser M8_4G, Android 11): the swapchain can be
+     * born wedged - `getCurrentTexture` returns `Error` on every frame from the first one, while
+     * `configure` keeps succeeding - and [reconfigure] can never clear it, because configure only
+     * updates the descriptor on a surface whose WSI object is already broken. Counted here so the
+     * error path in [render] can escalate instead of retrying forever. Render-thread only.
+     *
+     * The escalation the field log asked for: ~0.5s of consecutive Errors tears the WebGPU surface
+     * down and builds a fresh one from the same window (the one reset that gives the driver a new
+     * swapchain); the worker's live tail saw 10s of Error spam and a black screen otherwise.
+     * KMK <--
+     */
+    private var surfaceErrorStreak = 0
+
+    /**
+     * KMK --> Whether a [scheduleSurfaceRecreate] pass is queued or running, so [render] treats a
+     * momentarily absent surface as Retry (the recreate finishes within a few frames) instead of
+     * reporting an outage for a reset it asked for itself.
+     * KMK <--
+     */
+    private val surfaceRecreateScheduled = AtomicBoolean(false)
+
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
         if (!isAvailable) {
@@ -530,6 +561,10 @@ class WebGpuRenderer {
         // surface block may have suspended before init ran) must not clear the detach that its
         // own destroy callback set.
         if (surface.isValid) surfaceDetached = false
+        // KMK --> A fresh attach is a fresh swapchain: whatever the previous surface was doing,
+        // its error streak says nothing about this one.
+        // KMK <--
+        surfaceErrorStreak = 0
         this.width = width.coerceIn(0, surfaceDimensionCap())
         this.height = height.coerceIn(0, surfaceDimensionCap())
         createSurface()
@@ -580,6 +615,49 @@ class WebGpuRenderer {
         } catch (_: Throwable) {
             // A drain that cannot run must not take the surface callback (and with it the
             // framework's teardown wait) down with it.
+        }
+    }
+
+    /**
+     * KMK --> Tear the WebGPU surface down and build a fresh one from the same window: the one
+     * reset that can clear a swapchain wedged in Dawn's error state, where [reconfigure] only
+     * rewrites the descriptor on a surface whose WSI object is already broken. Scheduled from
+     * [render]'s error-streak path rather than run inline, because the teardown pump suspends and
+     * the error path is inside the render mutex. Runs on the render dispatcher under the render
+     * mutex - the same discipline [recoverFromDeviceLoss]'s surface half follows - and no-ops
+     * when the surface detached (its own destroy callback and the next [init] own that case).
+     * KMK <--
+     */
+    private fun scheduleSurfaceRecreate() {
+        if (!surfaceRecreateScheduled.compareAndSet(false, true)) return
+        CoroutineScope(dispatcher).launch {
+            try {
+                mutex.withLock {
+                    if (surfaceDetached || deviceLost) return@withLock
+                    val previous = surface
+                    surface = null
+                    configuredFormat = 0
+                    try {
+                        previous?.close()
+                    } catch (_: Throwable) {
+                    }
+                    // The same leak discipline as the recovery path: the window reference is
+                    // ours, so ours has to go before createSurface() takes a fresh one.
+                    if (window != 0L) {
+                        NativeWindow.release(window)
+                        window = 0L
+                    }
+                    pumpSurfaceTeardown()
+                    createSurface()
+                    Log.i("WebGpuRenderer", "surface recreated after a swapchain error streak")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "surface recreation failed", e)
+            } finally {
+                surfaceRecreateScheduled.set(false)
+            }
         }
     }
 
@@ -934,7 +1012,15 @@ class WebGpuRenderer {
 
         mutex.withLock {
             // Only [init]/[resize] can build one, so a redraw alone accomplishes nothing.
-            val surface = surface ?: return FrameResult.Unavailable
+            // KMK --> A surface a scheduled recreation just closed is a pause, not an outage:
+            // the recreate lands within a few frames (it pumps the teardown and rebuilds on this
+            // dispatcher), so Retry keeps the walk alive without reporting a failure the viewer
+            // asked for itself. KMK <--
+            val surface = surface ?: if (surfaceRecreateScheduled.get()) {
+                return FrameResult.Retry
+            } else {
+                return FrameResult.Unavailable
+            }
             // [detachSurface] ran: the platform window is going away, so nothing may start a
             // frame against it - the framework tears it down once the destroy callbacks return.
             if (surfaceDetached) return FrameResult.Unavailable
@@ -987,11 +1073,40 @@ class WebGpuRenderer {
                 // Lost needs a new surface: park until one arrives.
                 if (texture.handle != 0L) texture.close()
                 if (current.status == SurfaceGetCurrentTextureStatus.Lost) {
+                    surfaceErrorStreak = 0
                     return FrameResult.Unavailable
+                }
+                // KMK --> A swapchain stuck in Dawn's error state never clears through
+                // [reconfigure] - configure only updates the descriptor on a surface whose WSI
+                // object is already broken. Escalate: ~half a second of consecutive Errors tears
+                // the surface down and rebuilds it (the one reset that gives the driver a fresh
+                // swapchain); twice that parks the loop with [FrameResult.Unavailable] so
+                // collect() reports once and the walk stops burning cycles against a surface
+                // that cannot draw. The park lasts until something else invalidates - a page
+                // decode, a resize, the user - at which point the ladder gets a fresh window.
+                // A Drawn frame resets everything.
+                // KMK <--
+                surfaceErrorStreak++
+                if (surfaceErrorStreak >= SURFACE_ERROR_GIVE_UP_STREAK) {
+                    Log.e(
+                        "WebGpuRenderer",
+                        "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
+                    )
+                    surfaceErrorStreak = 0
+                    scheduleSurfaceRecreate()
+                    return FrameResult.Unavailable
+                }
+                if (surfaceErrorStreak == SURFACE_ERROR_RECREATE_STREAK) {
+                    Log.w(
+                        "WebGpuRenderer",
+                        "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
+                    )
+                    scheduleSurfaceRecreate()
                 }
                 reconfigure(surface)
                 return FrameResult.Retry
             }
+            surfaceErrorStreak = 0
 
             var encoder: GPUCommandEncoder? = null
             try {
