@@ -46,6 +46,18 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   last colour), draws past `MASKED_RECT_RING` fall back to the one-shot pair, and the ring is
   dropped when `deviceGeneration` moves. A second render entry point must call
   `RenderPage.beginFrame()` too.
+- **A `getCurrentTexture` status of `Error` is a wedged swapchain, not a transient retry**
+  (KMK island in `WebGpuRenderer.render`). Field evidence (PowerVR/Android 11, Multilaser M8_4G):
+  the swapchain can be born wedged — `Error` on every frame from the first one, while `configure`
+  keeps succeeding — and `reconfigure` can never clear it, because configure only updates the
+  descriptor on a surface whose WSI object is already broken. `render` counts the consecutive
+  failed frames: at `SURFACE_ERROR_RECREATE_STREAK` (30) it schedules
+  `scheduleSurfaceRecreate()` (close the WGPU surface, release and re-acquire the window, pump the
+  deferred teardown, rebuild — the device and the tile grids stay valid, unlike a device-loss
+  recovery); at `SURFACE_ERROR_GIVE_UP_STREAK` (120) it returns `FrameResult.Unavailable` so
+  `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface that
+  cannot draw. Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never
+  "fix" an Error streak by reconfiguring harder — the surface object itself has to go away.
 
 ## ANTI-PATTERNS
 - Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.

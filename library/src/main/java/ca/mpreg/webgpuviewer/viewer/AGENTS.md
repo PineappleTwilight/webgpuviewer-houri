@@ -41,6 +41,24 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   only made it rarer. Rule: round the anchor once at the top of `renderSnapshot`, with the same
   `kotlin.math.round` over the same expression `continuousAnchor` uses, and never place continuous
   content from the raw anchor.
+- **A page boundary is ONE float, chained — never re-derived per page** (KMK island in
+  `ImageViewerContinuousState.captureRenderState` + `TileRenderer.ClipEdges`). Even with the snapped
+  anchor shared, each page's own clip edges were still that page's separate float expression over
+  the same document boundary (`snapY + centerYOffset + halfB` for the upper page vs the next page's
+  `snapY + centerYOffset - halfT`): mathematically one value, float-adjacent in practice — a few
+  ULPs apart. Whenever the boundary value landed within that window of a pixel CENTRE, the blit
+  shader's pixel-centre rule handed the row to neither grid and the underlay showed through — the
+  same thin line, now rare, which is exactly how it kept appearing after every earlier fix.
+  `captureRenderState` now chains the device-space edges through the walked band — each page's top
+  edge is the previous page's bottom edge plus the device-space gap, all walks anchored on one
+  shared `chainTopPage0` (the same snapped anchor expression `renderSnapshot` uses, over `height`,
+  which equals the swapchain texture's height) — and hands the pair to the tile path as
+  `TileRenderer.ClipEdges`, which replaces the derived clipT/clipB for uncropped pages (a crop
+  keeps its derived inset: its content edge is mid-slot and shares no boundary). The `Render` page
+  slot fill and its `renderLoaded` centre derive from the same chained edges. Rule: adjacent pages'
+  clip edges must be *assigned* from one another, not computed from neighbours' inputs twice —
+  `round(a) + b` isn't `round(a + b)` and `x + y + z` isn't `x + (y + z)`; the only value that
+  cannot disagree is the one both sides share.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and
