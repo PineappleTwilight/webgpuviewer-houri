@@ -82,7 +82,18 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   invalidate could go unanswered while parked, and the app's tile/prewarm visibility checks
   (`containsKey`-gated `visible` logic in `TileRenderer`) saw them as off screen. Keep the
   published set through `publishOnScreen(visible)`; bare-assigning silently drops the wake.
-- `pageOffset` setter clamps NaN/Inf and walks whole-page deltas with a 20-iteration guard.
+- **`pageOffset` setter clamps NaN/Inf and walks whole-page deltas with a 20-iteration guard.**
+- **A page attached while the surface is 0x0 defers its home init to a later `attach`, never
+  latches the 0.01 sentinel** (KMK islands in `ImagePage.kt`). The `parent` setter's
+  initialize-to-home block used to run unconditionally: `homeScale` for an unsized parent
+  answers 0.01, and a page attached in a teardown/relayout window (e-ink refresh-mode switches
+  are the field case) kept that scale for the life of the shell — "the page renders at a few
+  dozen pixels". The setter now leaves `homeInitPending` when `width`/`height` are 0, and
+  `attach` applies home the first time it sees real dimensions with the page still pristine
+  (x=0, y=0, scale=1). The pristine condition is what makes this safe against a user's own
+  zoom: once anything has positioned the page, the pending init does nothing. Never simplify
+  the two-site dance back into the setter — `attach` is idempotent (`this.parent !== parent`),
+  so a skipped init would otherwise never re-run.
 - **`ViewerSurface` owns the `Surface.onDestroyed` registration** (before the host block's first
   suspension, so nothing can destroy a surface ahead of it) and forwards it to
   `ImageViewerState.onSurfaceDestroyed` → `WebGpuRenderer.detachSurface`: the framework

@@ -1428,12 +1428,30 @@ open class ImagePage {
             val wasNull = field == null
             field = value
             // Initialize to home when parent first set
+            // KMK --> Only when the state is actually sized. A surface created before layout -
+            // or mid-teardown, which e-ink readers do on every refresh-mode switch - reports
+            // 0x0, and homeScale's degenerate branch then answers 0.01. Latching that into
+            // scale is the "page renders at a few dozen pixels" bug; leave the page pristine
+            // (homeInitPending) and let attach() apply home once real dimensions arrive.
+            // KMK <--
             if (wasNull && value != null && x == 0f && y == 0f && scale == 1f) {
-                x = homeX
-                y = homeY
-                scale = homeScale
+                if (value.width > 0 && value.height > 0) {
+                    x = homeX
+                    y = homeY
+                    scale = homeScale
+                } else {
+                    homeInitPending = true
+                }
             }
         }
+
+    /**
+     * Set by the [parent] setter when its home init was skipped for degenerate dimensions,
+     * cleared by [attach] once it can apply real ones. @Volatile: written by whichever thread
+     * first attaches the page, read by the render walk.
+     */
+    @Volatile
+    private var homeInitPending: Boolean = false
 
     var scope: CoroutineScope? = null
     var onInvalidate: (() -> Unit)? = null
@@ -1554,6 +1572,19 @@ open class ImagePage {
         if (this.parent !== parent) this.parent = parent
         if (this.scope !== scope) this.scope = scope
         if (this.onInvalidate !== onInvalidate) this.onInvalidate = onInvalidate
+        // KMK --> A page whose home init was skipped (parent attached while the surface was
+        // still 0x0) picks it up here instead: same pristine-page condition as the setter, now
+        // against dimensions the renderer has actually accepted. Without this the page would
+        // sit at the scale=1f default forever, since a second attach is a no-op.
+        // KMK <--
+        if (homeInitPending && parentWidth > 0f && parentHeight > 0f &&
+            x == 0f && y == 0f && scale == 1f
+        ) {
+            x = homeX
+            y = homeY
+            scale = homeScale
+            homeInitPending = false
+        }
         if (fadePending) startFade()
     }
 
