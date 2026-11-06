@@ -18,6 +18,28 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 | Fullscreen triangle | `Fullscreen.kt` | shared with `filter` package |
 
 ## CONVENTIONS (differs from parent)
+- **A 0x0 surface callback must not write the stored dimensions.** `init` and `resize` refuse
+  any size below `MIN_SURFACE_DIMENSION`: a surface created before its view is laid out, or
+  mid-teardown (e-ink readers do this on every refresh-mode switch), reported 0x0, and storing
+  that zero made every later `homeScale` computation take its degenerate 0.01 branch — pages
+  attached in the window latched a scale of 0.01 and drew at a few dozen pixels (field: e-ink
+  "swipe back, swipe forward, page is now tiny"). Keep the previous dimensions and let the real
+  resize callback move them. The same rule lives app-side (`WebGpuZoom.kt` must not latch
+  maxScale from a parentless page) and in `ImagePage`'s parent setter (the home init defers to
+  `attach` when the state is unsized). Sentinel fallbacks are returned, never stored.
+- **The device requests `core-features-and-limits` whenever the adapter exposes it** (KMK island
+  in `requiredFeaturesFor`). `FeatureLevel.Compatibility` is still requested - that is the
+  adapter's mode, not the device's - but the device itself then runs core WebGPU and the
+  compatibility restrictions stop applying: 128-invocation workgroups, 16384-byte uniform
+  buffers, 15 inter-stage variables, storage buffers barred from the vertex stage, and
+  16 texture+sampler combinations per stage. Field evidence (2026-11, Adreno 6xx and
+  Mali bifrost webgpureport exports) is that every shipping adapter in the field lists
+  `core-features-and-limits`, so compat mode was pure restriction with no benefit. A
+  pipeline that exceeds a compat limit fails validation with no exception on the draw
+  path - a frame that draws nothing. Devices without the feature (the compat plateau)
+  keep the old behaviour; check `core=true` in the init log line when comparing field
+  reports. Dawn reports the upgraded device's limits directly, so none of the
+  `maxTextureDimension2D` clamping work changes.
 - Everything here is touched only on the render thread; `cleanup` may be called from any thread and posts its work there.
 - Stencil is a ring buffer of 3 textures (`STENCIL_BUFFER_COUNT`), never one shared texture: a rotated stencil must not still be in flight from a prior frame.
 - Grid snaps to the nearest screen pixel so every blit is an exact 1:1 texel copy; tile bind groups/uniforms are created once at generation, only the anchor/clip uniform is rewritten.

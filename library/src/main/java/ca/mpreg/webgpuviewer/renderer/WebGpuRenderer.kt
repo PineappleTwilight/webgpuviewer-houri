@@ -295,7 +295,10 @@ class WebGpuRenderer {
             recentFrameTimes.fill(0)
         }
 
-        private fun deviceDescriptor() = GPUDeviceDescriptor(
+        private fun hasFeature(adapter: GPUAdapter, feature: Int): Boolean =
+            runCatching { adapter.hasFeature(feature) }.getOrDefault(false)
+
+        private fun deviceDescriptor(includeCore: Boolean = true) = GPUDeviceDescriptor(
             deviceLostCallback = DeviceLostCallback { lost, reason, message ->
                 // A retired device's still-pending loss record can dispatch long after recovery
                 // parked it (see [destroyRetired] for why its wrapper must stay alive for that).
@@ -329,7 +332,7 @@ class WebGpuRenderer {
                 )
             },
             uncapturedErrorCallbackExecutor = Executor(Runnable::run),
-            requiredFeatures = requiredFeaturesFor(adapter),
+            requiredFeatures = requiredFeaturesFor(adapter, includeCore),
             // Requested at creation, since Compatibility mode otherwise caps it at 4096
             // whatever the hardware can do.
             requiredLimits = GPULimits(
@@ -337,11 +340,45 @@ class WebGpuRenderer {
             ),
         )
 
-        private fun requiredFeaturesFor(adapter: GPUAdapter): IntArray =
-            if (runCatching { adapter.hasFeature(FeatureName.TimestampQuery) }.getOrDefault(false)) {
-                intArrayOf(FeatureName.TimestampQuery)
-            } else {
-                intArrayOf()
+        private fun requiredFeaturesFor(adapter: GPUAdapter, includeCore: Boolean): IntArray {
+            val features = mutableListOf<Int>()
+            // Both field-reported adapters (Adreno 6xx, Mali bifrost) expose
+            // core-features-and-limits. Requesting it upgrades the device from Compatibility
+            // mode to core WebGPU, lifting the compatibility-mode restrictions that are
+            // otherwise silently in effect (128-invocation compute workgroups, 16384-byte
+            // uniform buffers, 15 inter-stage variables, storage buffers barred from the
+            // vertex stage, storage textures barred from it too, 16 sampler combinations
+            // per stage). Without this a pipeline or filter that exceeds any of those
+            // fails validation with no exception on the draw path - a frame that draws
+            // nothing, i.e. a black screen. Devices without the feature keep the
+            // compatibility behaviour unchanged.
+            if (includeCore && hasFeature(adapter, FeatureName.CoreFeaturesAndLimits)) {
+                features += FeatureName.CoreFeaturesAndLimits
+            }
+            if (hasFeature(adapter, FeatureName.TimestampQuery)) {
+                features += FeatureName.TimestampQuery
+            }
+            return features.toIntArray()
+        }
+
+        /**
+         * Request the device from [adapter], upgrading it to core WebGPU when the adapter
+         * offers `core-features-and-limits` (see [requiredFeaturesFor]). A driver that lists
+         * the feature but then rejects the request loses nothing but the upgrade: the retry
+         * asks for the plain compatibility device instead of latching [initError] for the
+         * life of the process.
+         */
+        private suspend fun requestDeviceBestEffort(): GPUDevice =
+            try {
+                adapter.requestDevice(deviceDescriptor(includeCore = true))
+            } catch (e: Throwable) {
+                if (!hasFeature(adapter, FeatureName.CoreFeaturesAndLimits)) throw e
+                Log.w(
+                    "WebGpuRenderer",
+                    "requestDevice with core-features-and-limits failed; retrying compatibility-only",
+                    e
+                )
+                adapter.requestDevice(deviceDescriptor(includeCore = false))
             }
 
         internal fun recordFrameTime(timeNs: Long) {
@@ -406,13 +443,16 @@ class WebGpuRenderer {
 
                     val adapterLimits = adapter.getLimits()
 
-                    device = adapter.requestDevice(deviceDescriptor())
+                    device = requestDeviceBestEffort()
                     initialized = true
                     deviceLost = false
                     maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+                    val core = runCatching {
+                        device.getFeatures().features.contains(FeatureName.CoreFeaturesAndLimits)
+                    }.getOrDefault(false)
                     Log.i(
                         "WebGpuRenderer",
-                        "maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} device=$maxTextureDimension2D"
+                        "maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} device=$maxTextureDimension2D core=$core"
                     )
                 } catch (e: Throwable) {
                     // Fails soft via initError - a driver init failure shouldn't poison the whole class.
@@ -565,16 +605,29 @@ class WebGpuRenderer {
         // its error streak says nothing about this one.
         // KMK <--
         surfaceErrorStreak = 0
-        this.width = width.coerceIn(0, surfaceDimensionCap())
-        this.height = height.coerceIn(0, surfaceDimensionCap())
+        // KMK --> A surface can be created before its view is laid out, or mid-teardown, and
+        // report 0x0 (field: e-ink readers, which tear the surface down on refresh-mode
+        // switches). Storing those zeroes is what latches the degenerate 0.01 home scale into
+        // every page attached while they stand - the page then draws at a few dozen pixels
+        // until it is re-decoded. Keep the previous dimensions instead; a real resize callback
+        // follows and moves them. KMK <--
+        if (width >= MIN_SURFACE_DIMENSION && height >= MIN_SURFACE_DIMENSION) {
+            this.width = width.coerceAtMost(surfaceDimensionCap())
+            this.height = height.coerceAtMost(surfaceDimensionCap())
+        } else {
+            Log.w("WebGpuRenderer", "init called with degenerate size ${width}x$height - keeping ${this.width}x${this.height}")
+        }
         createSurface()
     }
 
     @Synchronized
     fun resize(width: Int, height: Int) {
         if (!isAvailable || surfaceDetached) return
-        val w = width.coerceIn(0, surfaceDimensionCap())
-        val h = height.coerceIn(0, surfaceDimensionCap())
+        // KMK --> Same degenerate-size rule as init: a relayout can report 0x0, and storing it
+        // zeroes the dims every home-scale computation reads. KMK <--
+        if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) return
+        val w = width.coerceAtMost(surfaceDimensionCap())
+        val h = height.coerceAtMost(surfaceDimensionCap())
         if (w == this.width && h == this.height && surface != null) return
         this.width = w
         this.height = h
@@ -907,7 +960,7 @@ class WebGpuRenderer {
             adapter = instance.requestAdapter(
                 GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility)
             )
-            device = adapter.requestDevice(deviceDescriptor())
+            device = requestDeviceBestEffort()
             initialized = true
             deviceLost = false
             initError = null
@@ -915,9 +968,12 @@ class WebGpuRenderer {
             // A fresh adapter can report different limits, and this is read live by the upload
             // paths, so it has to move with the device rather than keep the previous one's value.
             maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+            val core = runCatching {
+                device.getFeatures().features.contains(FeatureName.CoreFeaturesAndLimits)
+            }.getOrDefault(false)
             Log.i(
                 "WebGpuRenderer",
-                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D)"
+                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D core=$core)"
             )
             true
         } catch (e: CancellationException) {
