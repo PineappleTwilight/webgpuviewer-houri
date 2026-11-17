@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -36,7 +37,7 @@ import ca.mpreg.webgpuviewer.findActivity
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastForEach
 import ca.mpreg.webgpuviewer.NormalMotionDurationScale
-import ca.mpreg.webgpuviewer.RequestMaxRefreshRate
+import ca.mpreg.webgpuviewer.RequestMaxRefreshRateFor
 import ca.mpreg.webgpuviewer.orZero
 import ca.mpreg.webgpuviewer.waitForCleanUp
 import ca.mpreg.webgpuviewer.waitForDown
@@ -89,7 +90,14 @@ fun ImageViewer(
         state.cutoutTopPx = if (state.avoidCutout) cutoutPx else 0f
     }
 
-    RequestMaxRefreshRate()
+    // KMK --> Motion-driven, not unconditional. `preferredDisplayModeId` is what stops an LTPO
+    // panel dropping to 60Hz, so holding the top mode for a page the user is simply looking at
+    // spends the panel's most expensive state on pixels that are not changing. This viewer's
+    // animationJob is exactly "a page turn or zoom is in flight", which is the only window where
+    // the higher rate is visible - so it is the signal that decides.
+    val motion by remember { derivedStateOf { state.animationJob?.isActive == true } }
+    RequestMaxRefreshRateFor(motion)
+    // KMK <--
 
     // SurfaceView or TextureView depending on whether HDR is reachable - see [ViewerSurface],
     // which also carries the mihonapp/mihon#3773 history behind that choice.

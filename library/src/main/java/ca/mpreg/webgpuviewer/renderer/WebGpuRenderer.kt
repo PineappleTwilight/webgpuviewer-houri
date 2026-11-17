@@ -581,6 +581,21 @@ class WebGpuRenderer {
     private var surfaceErrorStreak = 0
 
     /**
+     * KMK --> How many times this surface has *parked*: hit [SURFACE_ERROR_GIVE_UP_STREAK]
+     * consecutive swapchain `Error`s and gone [FrameResult.Unavailable] until something else
+     * invalidates - the PowerVR black-screen shape where `isAvailable` stays true the whole
+     * time, so the device-loss path never fires. Written on the render thread only; hosts
+     * snapshot it at viewer construction and again at session end and diff the two reads to
+     * detect a session that spent its life parked. Monotonic per renderer instance, never
+     * reset - the caller's own snapshot scopes it to one session. Volatile: read from host
+     * threads.
+     * KMK <--
+     */
+    @Volatile
+    var surfaceParkCount = 0
+        private set
+
+    /**
      * KMK --> Whether a [scheduleSurfaceRecreate] pass is queued or running, so [render] treats a
      * momentarily absent surface as Retry (the recreate finishes within a few frames) instead of
      * reporting an outage for a reset it asked for itself.
@@ -1148,6 +1163,7 @@ class WebGpuRenderer {
                         "WebGpuRenderer",
                         "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
                     )
+                    surfaceParkCount++
                     surfaceErrorStreak = 0
                     scheduleSurfaceRecreate()
                     return FrameResult.Unavailable

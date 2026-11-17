@@ -80,6 +80,15 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface that
   cannot draw. Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never
   "fix" an Error streak by reconfiguring harder — the surface object itself has to go away.
+- **A park leaves a count behind: `surfaceParkCount` (instance-scoped, `@Volatile`, monotonic).**
+  The give-up path parks and then goes quiet, so a host watching only `isAvailable` saw a session
+  that spent its whole life parked close looking healthy (the PowerVR black-screen shape).
+  `render` increments the counter when it parks — render-thread only — and hosts snapshot it at
+  viewer construction and diff the two reads at teardown. Never reset it anywhere, `init()` and
+  recovery included: the caller's own snapshot is what scopes the count to one session, and a
+  reset would launder a parked lifetime into a healthy one. The `Lost` status and the
+  detach/dead-device `FrameResult.Unavailable` returns deliberately do not count: those are
+  device-loss shapes with strike paths of their own.
 
 ## ANTI-PATTERNS
 - Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.

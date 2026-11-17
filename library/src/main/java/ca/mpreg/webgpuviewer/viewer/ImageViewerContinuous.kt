@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -30,7 +32,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.util.fastCoerceIn
 import ca.mpreg.webgpuviewer.NormalMotionDurationScale
-import ca.mpreg.webgpuviewer.RequestMaxRefreshRate
+import ca.mpreg.webgpuviewer.RequestMaxRefreshRateFor
 import ca.mpreg.webgpuviewer.waitForCleanUp
 import ca.mpreg.webgpuviewer.waitForDown
 import kotlinx.coroutines.delay
@@ -63,7 +65,16 @@ fun ImageViewerContinuous(
         state.density = density
     }
 
-    RequestMaxRefreshRate()
+    // KMK --> Motion-driven, not unconditional. `preferredDisplayModeId` is what stops an LTPO
+    // panel dropping to 60Hz, so pinning the top mode while the reader looks at a settled page
+    // spends the panel's most expensive state on pixels that are not changing. The continuous
+    // viewer already tracks exactly the three things that make the higher rate visible - a fling,
+    // a plain drag, and a zoom animation - so those are the signal.
+    val motion by remember {
+        derivedStateOf { state.isFlinging || state.isPanning || state.isScaleAnimating }
+    }
+    RequestMaxRefreshRateFor(motion)
+    // KMK <--
 
     Box(modifier = modifier) {
         // See [ViewerSurface] for why the surface type depends on the API level.
