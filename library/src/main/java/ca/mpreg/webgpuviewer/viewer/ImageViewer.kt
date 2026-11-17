@@ -112,6 +112,12 @@ fun ImageViewer(
                 val wasScrolling = state.pageOffset != 0f
                 val pageTurnJob = state.animationJob
                 val page = state.getPage(0) ?: return@awaitEachGesture
+                // KMK --> Ported from upstream ec1d88b: a tap resumes where the interrupted
+                // animation was heading, instead of jumping to the page's home position.
+                val moving = page.animationJob?.isActive == true
+                val interruptedX = page.animationTargetX.takeIf { moving }
+                val interruptedY = page.animationTargetY.takeIf { moving }
+                // KMK <--
                 page.animationJob?.cancel()
 
                 view.parent?.requestDisallowInterceptTouchEvent(true)
@@ -166,7 +172,13 @@ fun ImageViewer(
                                 }
                             }
                         }
-                        page.animateTo(Offset(0.5f, 0.5f))
+                        // KMK --> Upstream ec1d88b: resume a cancelled navigation pan's target.
+                        if (interruptedX != null && interruptedY != null && !stoppedMotion) {
+                            page.animateTo(targetX = interruptedX, targetY = interruptedY)
+                        } else {
+                            page.animateTo(Offset(0.5f, 0.5f))
+                        }
+                        // KMK <--
                         if (!stoppedMotion) {
                             state.onTap?.invoke(
                                 Offset(

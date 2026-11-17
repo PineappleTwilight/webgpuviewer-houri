@@ -1,7 +1,10 @@
 package ca.mpreg.webgpuviewer.viewer
 
+import android.view.animation.AnimationUtils
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.DecayAnimation
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.animation.core.spring
@@ -19,6 +22,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -51,7 +55,6 @@ fun ImageViewerContinuous(
     val scope = rememberCoroutineScope()
     val view = LocalView.current
     val density = LocalDensity.current
-    val flingX = remember { Animatable(0f) }
     val decay = remember(density) { splineBasedDecay<Float>(density) }
 
     // What the platform considers a fling at all. A fixed figure here was three times this on a
@@ -177,7 +180,12 @@ fun ImageViewerContinuous(
                                 val newScale =
                                     startScale + (state.minScale - startScale) * t
                                 val diff = 1f / newScale - 1f / state.scale
-                                state.offsetX += anchorX * diff
+                                // KMK --> Ported from upstream 76780cf: no snap-back follows a
+                                // double-tap zoom, so the pan is clamped as it goes.
+                                val limit = max(0f, (newScale - 1f) / (2f * newScale))
+                                state.offsetX =
+                                    (state.offsetX + anchorX * diff).fastCoerceIn(-limit, limit)
+                                // KMK <--
                                 state.scale = newScale
                                 state.scrollBy(-py * diff * state.height)
                                 state.invalidate()
@@ -201,7 +209,11 @@ fun ImageViewerContinuous(
                                 val newScale =
                                     startScale + (state.doubleTapScale - startScale) * t
                                 val diff = 1f / newScale - 1f / state.scale
-                                state.offsetX += px * diff
+                                // KMK --> As above (upstream 76780cf).
+                                val limit = max(0f, (newScale - 1f) / (2f * newScale))
+                                state.offsetX =
+                                    (state.offsetX + px * diff).fastCoerceIn(-limit, limit)
+                                // KMK <--
                                 state.scale = newScale
                                 state.scrollBy(-py * diff * state.height)
                                 state.invalidate()
@@ -505,15 +517,23 @@ fun ImageViewerContinuous(
                         if ((lastEventTime - lastMoveTime) < 100 &&
                             (abs(velocity.y) > minFlingVelocity || abs(velocity.x) > minFlingVelocity)
                         ) {
-                            state.animationJob = scope.launch(NormalMotionDurationScale) {
+                            // KMK --> Ported from upstream d7f2af8: the decay is timed from the
+                            // lift, as RecyclerView's is. A decay timed from its own first frame
+                            // held the strip still for a frame or two after the finger left and
+                            // then jumped; this one keeps it moving with the finger.
+                            val liftNanos = AnimationUtils.currentAnimationTimeMillis() * 1_000_000
+                            state.animationJob = scope.launch {
                                 state.isFlinging = true
                                 try {
                                     val speed = hypot(velocity.x, velocity.y)
                                     val dirX = velocity.x / speed
                                     val dirY = velocity.y / speed
-                                    flingX.snapTo(0f)
+                                    val fling = DecayAnimation(decay, Float.VectorConverter, 0f, speed)
                                     var last = 0f
-                                    flingX.animateDecay(speed, decay) {
+                                    var playNanos: Long
+                                    do {
+                                        playNanos = (withFrameNanos { it } - liftNanos).coerceAtLeast(0)
+                                        val value = fling.getValueFromNanos(playNanos)
                                         val delta = value - last
                                         last = value
                                         val maxOffsetX =
@@ -526,15 +546,14 @@ fun ImageViewerContinuous(
                                             )
                                         state.scrollBy(-dirY * delta / state.scale)
                                         state.invalidate()
-                                        // Pinned on both axes: the decay would run on
-                                        // without moving, swallowing the next tap as
-                                        // "mid-fling". It never reverses, so one frame
-                                        // settles it - but only one that asked to move.
+                                        // Pinned on both axes: the decay would run on without
+                                        // moving, swallowing the next tap as "mid-fling". It
+                                        // never reverses, so one frame settles it - but only one
+                                        // that asked to move.
                                         if (delta != 0f && state.offsetX == prevOffsetX && state.scrollY == prevScrollY) {
-                                            throw FlingStalled()
+                                            break
                                         }
-                                    }
-                                } catch (_: FlingStalled) {
+                                    } while (!fling.isFinishedFromNanos(playNanos))
                                 } finally {
                                     // Invalidate so generation resumes without waiting on the
                                     // next gesture.
