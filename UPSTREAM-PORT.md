@@ -53,6 +53,7 @@ code it patches still exists here and the fix is portable; near 0 means the targ
 
 The app-side answer is in the app, not the library: `WebGpuHealth` records a strike when a
 session ends with the device dead, parked, or (added 2026-11) having decoded pages while never
-drawing one, and the provider stops offering WebGPU after two such sessions. The RAM gate stays
-(`AppMemoryMonitor.isWebGpuSupported` = MEDIUM or the About-screen bypass) because the renderer
-still SIGSEGVs on low-memory devices it has no headroom for.
+drawing one, and the provider stops offering WebGPU after two such sessions. The provider-level
+RAM gate was removed on 2026-11-19: the renderer is offered wherever `WebGpuRenderer.isAvailable`
+is true, and the reader's own memory budget sizes its decoded pages and tiles to the device. A
+device with no headroom for GPU-visible memory is caught by the health strikes at runtime.
