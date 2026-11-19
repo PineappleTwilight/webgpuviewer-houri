@@ -34,6 +34,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import ca.mpreg.webgpuviewer.findActivity
+import androidx.compose.ui.util.fastCoerceAtMost
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastForEach
 import ca.mpreg.webgpuviewer.NormalMotionDurationScale
@@ -245,7 +246,8 @@ fun ImageViewer(
                                         val py = secondDown.position.y / state.height - 0.5f
 
                                         val newScale =
-                                            originalScale * 10f.pow(2 * totalDeltaY / state.height)
+                                            (originalScale * 10f.pow(2 * totalDeltaY / state.height))
+                                                .fastCoerceAtMost(page.maxScale)
 
                                         val diff = 1 / newScale - 1 / originalScale
 
@@ -416,7 +418,13 @@ fun ImageViewer(
                                         if (state.pinchZoomEnabled) event.calculateZoom() else 1f
 
                                     if (zoom != 1f || pan != Offset.Zero) {
-                                        val newScale = page.scale * zoom
+                                        // maxScale is a ceiling for the gesture, not only for the
+                                        // release that follows it: the "disable zoom in" clamp is
+                                        // a maxScale of homeScale, and a pinch that is allowed to
+                                        // grow and then springs back reads as the setting doing
+                                        // nothing at all. Zoom-out stays free - only the top is
+                                        // clamped.
+                                        val newScale = (page.scale * zoom).fastCoerceAtMost(page.maxScale)
                                         val diff = 1 / newScale - 1 / page.scale
 
                                         var x = page.x + (pan.x / state.width) / page.scale

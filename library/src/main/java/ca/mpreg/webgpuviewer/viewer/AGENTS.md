@@ -65,6 +65,15 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   "a tap fires on release" — paged `waitForDown` (`ImageViewer.kt`) and the continuous
   early-return gate (`ImageViewerContinuous.kt`) both key on the pair. Setting
   `doubleTapGesturesEnabled` directly would desynchronise the pair; do not.
+- **"Disable zoom in" is `ImagePage.maxScaleAtHome`, and `maxScale` is enforced during gestures,
+  not only on release.** `maxScaleAtHome` makes the `maxScale` getter resolve `homeScale` against
+  the page's live parent, which is what lets a host request the clamp at decode time — before the
+  page is attached, `homeScale` is the parentless 0.01 sentinel, so storing it would freeze the
+  page. `ImageViewer.kt` clamps both the pinch scale and the double-tap-drag scale to
+  `page.maxScale` while the fingers are down; the old release-only clamp let a gesture zoom
+  visibly and spring back, which reads as the setting doing nothing. Do not fold double-tap zoom
+  into this clamp: it is a separate gate, and coupling them killed pinch zoom on hosts that only
+  wanted double-tap off.
 - **Continuous read-through only advances on real scrolling** (KMK islands; port of upstream
   `92be54d`). `onPageScrolledThrough`'s ratchet computes from walk geometry, and that geometry
   moves for the camera too, not just for content: a pinch zoom-out or a placeholder slot

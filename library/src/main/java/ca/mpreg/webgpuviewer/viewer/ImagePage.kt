@@ -1666,8 +1666,26 @@ open class ImagePage {
             return minOf(parentWidth / w, parentHeight / h).coerceAtLeast(0.01f)
         }
 
+    /**
+     * When true, [maxScale] follows [homeScale] - the page cannot be zoomed in past the scale
+     * it is laid out at.
+     *
+     * The host uses this for the paged "disable zoom in" preference. It cannot write [maxScale]
+     * directly at decode time: pages are built before they are attached, and [homeScale] is the
+     * parentless 0.01 sentinel then. Latching that value is the degenerate-scale bug this class
+     * already documents for the home init. A mode the getter resolves against the real fit is
+     * what makes the clamp take effect the moment the page has dimensions, without storing a
+     * sentinel. Read from the gesture thread, written from decode/main, hence volatile.
+     */
+    @Volatile
+    var maxScaleAtHome = false
+
     var maxScale = 0f
-        get() = if (field > 0) field else max(doubleTapScale * 2, 2f)
+        get() = when {
+            maxScaleAtHome -> homeScale
+            field > 0 -> field
+            else -> max(doubleTapScale * 2, 2f)
+        }
 
     var doubleTapScale: Float = 0f
         get() = if (field != 0f) field else max(minScale, homeScale) * 2
