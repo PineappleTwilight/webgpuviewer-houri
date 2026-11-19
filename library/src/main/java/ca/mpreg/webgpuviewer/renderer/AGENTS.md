@@ -44,6 +44,16 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 - Stencil is a ring buffer of 3 textures (`STENCIL_BUFFER_COUNT`), never one shared texture: a rotated stencil must not still be in flight from a prior frame.
 - Grid snaps to the nearest screen pixel so every blit is an exact 1:1 texel copy; tile bind groups/uniforms are created once at generation, only the anchor/clip uniform is rewritten.
 - Generation runs on the render thread but outside the render mutex, a few tiles at a time with a suspend between batches; pending tiles pull on-screen-first, centre-out.
+- **An incomplete grid at rest is held, not revealed progressively** (`drawCore`'s `holdIncomplete`).
+  Tiles pull centre-out, and blitting each one as it lands turns a page open into a ripple from
+  the middle of the screen — very visible on e-ink, where a partial refresh flashes its region.
+  When the camera is still (the placement is float-identical to the previous draw) and any visible
+  tile is missing or dropped for its filtered re-cut, the blit is skipped and `drawCore` returns
+  false so the caller's fast full-page path shows; once coverage is complete the whole grid is
+  blitted in one switch. While the camera moves, progressive blitting stays. The hold is bounded
+  by `HOLD_INCOMPLETE_MAX_FRAMES` so a budget too small for one viewport degrades instead of
+  pinning the fast path forever. `renderFullyTiled`/`blitAvailableTiles` deliberately pass
+  `holdIncomplete = false` — transitions need their progressive seed.
 - One grid per whole `ImagePage.ImageSingle`, not per image: a spread's seam bakes into whichever tile straddles it.
 - Rescaler applies only when `factor > 1 && supported && appliesAt(scale) && fits(tileSize)`; what it declines resolves in one step.
 - Tile cache budget 16-64 MB; `cacheScreens` coerced to 0.5-3.0; `onLowMemory()` shrinks and

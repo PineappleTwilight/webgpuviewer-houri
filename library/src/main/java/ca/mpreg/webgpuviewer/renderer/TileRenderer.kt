@@ -178,6 +178,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         /** Smallest [preferredTileSize] worth having - below this the per-tile pass dominates. */
         private const val MIN_TILE_SIZE = 128
 
+        /**
+         * How long a complete-at-rest reveal may be held back when the visible set never
+         * finishes. A budget too small to hold a viewport's worth of tiles would otherwise pin
+         * the page to the fast path forever; after this many frames the grid draws what exists
+         * and the fast path fills the rest, exactly as it did before the hold existed.
+         */
+        private const val HOLD_INCOMPLETE_MAX_FRAMES = 180
+
         /** The sizes [reconsiderTileSize] chooses between, smallest first. */
         private val TILE_SIZES = intArrayOf(MIN_TILE_SIZE, 256, SLAB_SIZE)
 
@@ -818,6 +826,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.tiles.clear()
         st.instancesDirty = true
         st.sweptRange = null
+        // A wipe is a new grid; the hold budget starts over with it.
+        st.heldFrames = 0
     }
 
     /**
@@ -910,6 +920,23 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
          * recording), replacing the stale `page.isOnScreen` check.
          */
         var lastDrawn = 0L
+
+        /**
+         * The placement the previous [drawCore] saw. Equality against the current one is the
+         * renderer's definition of "camera at rest" - a page that is being panned, zoomed or
+         * flung produces a different anchor/scale every frame, and a page nobody is touching
+         * produces the identical floats. Used to decide whether an incomplete grid may be shown
+         * progressively (moving) or must be held for a single reveal (at rest).
+         */
+        var lastAnchorX = Float.NaN
+        var lastAnchorY = Float.NaN
+        var lastPageScale = Float.NaN
+        var lastCenterY = Float.NaN
+        var lastDstW = 0
+        var lastDstH = 0
+
+        /** Consecutive rest frames an incomplete grid has been held; see [HOLD_INCOMPLETE_MAX_FRAMES]. */
+        var heldFrames = 0
 
         // The strictly visible tile range as of the last draw, in tile coordinates. The worker
         // prioritises against it at pull time, so a pan mid-fill redirects generation without
@@ -1692,7 +1719,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             a.pageScale,
             page.isScaleAnimating,
             applyRetainWindow = true,
-            useStencilMask = true
+            useStencilMask = true,
+            holdIncomplete = true,
         )
         // Never "covered" off a pinned grid: it sits at the animation's target, so the live draw
         // is the only thing showing the page where it is mid-animation.
@@ -1740,6 +1768,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             useStencilMask = true,
             crop = crop,
             clipEdges = clipEdges,
+            holdIncomplete = true,
         )
     }
 
@@ -1763,6 +1792,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         useStencilMask: Boolean = false,
         crop: Rect? = null,
         clipEdges: ClipEdges? = null,
+        holdIncomplete: Boolean = false,
     ): Boolean {
         if (page.destroyed || !page.highQuality || page.isAnimated) return false
         if (!page.hasUploadedImage) return false
@@ -1851,7 +1881,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
 
         // Bookkeeping only: the blit is one instanced draw below, and the shader clamps each tile
         // to the clip rect. Coverage still asks tileVisible - a missing tile nobody sees is fine.
-        var covered = true
+        var missingVisible = false
         forEachTile(wanted) { txi, tyi ->
             val tkey = key(txi, tyi)
             val tile = st.tiles[tkey]
@@ -1867,14 +1897,53 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                     st.tiles.remove(tkey)
                     st.instancesDirty = true
                     st.pending.add(tkey)
+                    // The visible tile was just dropped for its re-cut: a hole where the reader
+                    // is looking, which is exactly the kind of partial reveal the hold exists for.
+                    missingVisible = true
                 }
             } else {
                 if (st.stable) st.pending.add(tkey)
-                if (covered && tileVisible(gp, dst, txi, tyi)) covered = false
+                if (tileVisible(gp, dst, txi, tyi)) missingVisible = true
             }
         }
 
+        // A grid at rest is revealed all at once, not tile by tile.
+        //
+        // Tiles are pulled centre-out (see [nextRequest]) and blitted the moment each lands, so
+        // opening a page paints it as a ripple spreading from the middle of the screen. That is
+        // invisible on an LCD and very visible on e-ink, where every partial refresh flashes its
+        // own region. The fast path underneath is already a complete, correctly positioned page,
+        // so holding the blit costs sharpness until the visible set is cut - never content.
+        //
+        // While the camera moves the progressive blit stays: that is what makes a pan sharpen as
+        // the tiles for the newly revealed band arrive. "At rest" is exact float equality against
+        // the previous draw's placement; a gesture or animation produces a new anchor/scale every
+        // frame, so only a genuinely still camera qualifies. A grid's first draw counts as at
+        // rest, so prewarmed tiles that are only partly there cannot flash in either.
+        val atRest = st.lastAnchorX.isNaN() ||
+            (st.lastAnchorX == anchorX && st.lastAnchorY == anchorY &&
+                st.lastPageScale == pageScale && st.lastCenterY == centerYOffset &&
+                st.lastDstW == dst.width && st.lastDstH == dst.height)
+        st.lastAnchorX = anchorX
+        st.lastAnchorY = anchorY
+        st.lastPageScale = pageScale
+        st.lastCenterY = centerYOffset
+        st.lastDstW = dst.width
+        st.lastDstH = dst.height
+
         st.lastDrawn = frame
+
+        if (holdIncomplete && missingVisible && atRest && st.stable &&
+            st.heldFrames < HOLD_INCOMPLETE_MAX_FRAMES
+        ) {
+            st.heldFrames++
+            // The generator is not driven by this draw's pending pass any more, so kick it here;
+            // the worker invalidates when a tile lands and the next frame re-checks coverage.
+            if (st.pending.isNotEmpty()) schedule()
+            return false
+        }
+        st.heldFrames = 0
+
         drawInstanced(pass, dst.format, st, useStencilMask)
 
         // Drop what fell outside the wanted range, else a page scrolling past keeps accumulating
@@ -1896,7 +1965,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         if (st.pending.isNotEmpty()) schedule()
-        return covered
+        return !missingVisible
     }
 
     /**
