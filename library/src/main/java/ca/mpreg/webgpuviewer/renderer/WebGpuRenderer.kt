@@ -395,10 +395,28 @@ class WebGpuRenderer {
         }
 
         /**
-         * [initLibrary], falling back to reflection on the helper class: the wrapper artifact is
-         * not present in every packaging, and a missing one must not take the reader down.
+         * The soname Dawn's JNI entry points live in. `GPU.createInstance` and every other
+         * `Java_androidx_webgpu_*` symbol are bound to class/method names, so the library has to
+         * be resident in this process *before* the first native call.
+         */
+        private const val WEBGPU_NATIVE_LIBRARY = "webgpu_c_bundled"
+
+        /**
+         * Load the native library directly first, then through [initLibrary], then by reflection.
+         *
+         * Direct first is deliberate: the helper is a static method in an AAR class, and a minified
+         * consumer that loses that call leaves `createInstance` throwing "No implementation found"
+         * even though the `.so` is packaged. `System.loadLibrary` is idempotent, so doing it here
+         * costs nothing when the helper already loaded the same library. The other two paths stay
+         * as fallbacks for packaging that names the helper class differently.
          */
         private fun safeInitLibrary() {
+            try {
+                System.loadLibrary(WEBGPU_NATIVE_LIBRARY)
+                return
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Direct load of $WEBGPU_NATIVE_LIBRARY failed, trying helper", e)
+            }
             try {
                 initLibrary()
                 return
@@ -414,6 +432,26 @@ class WebGpuRenderer {
                 throw e
             }
         }
+
+        /**
+         * [createInstance] is a native method. If the library is not resident when it is first
+         * called, ART throws `UnsatisfiedLinkError: No implementation found` and the companion
+         * latches that as a permanent `initError` - the renderer is then "unavailable" for the
+         * rest of the process even though the `.so` is packaged. Load once and retry once; a
+         * second failure is a real load/driver problem and falls through to the caller's catch.
+         */
+        private fun createInstanceWithLibrary(): GPUInstance =
+            try {
+                createInstance(GPUInstanceDescriptor())
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(
+                    "WebGpuRenderer",
+                    "GPU.createInstance had no native implementation; loading $WEBGPU_NATIVE_LIBRARY and retrying",
+                    e,
+                )
+                System.loadLibrary(WEBGPU_NATIVE_LIBRARY)
+                createInstance(GPUInstanceDescriptor())
+            }
 
         private fun safeWindowFromSurface(surface: Surface): Long {
             try {
@@ -436,7 +474,7 @@ class WebGpuRenderer {
                 try {
                     safeInitLibrary()
 
-                    instance = createInstance(GPUInstanceDescriptor())
+                    instance = createInstanceWithLibrary()
 
                     adapter =
                         instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
