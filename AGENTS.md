@@ -36,7 +36,7 @@ Android library + sample app: WebGPU-accelerated image viewer (manga-reader styl
 | Filters | `filter/Filter*.kt` | chain ping-pongs buffers, never self-allocates |
 | Native trim/resize | `library/src/main/cpp/`, `TrimNative.kt` | `Java_ca_mpreg_webgpuviewer_TrimNative_*` |
 | Versions | `gradle/libs.versions.toml` | never hardcode; use `libs.*` aliases |
-| Publishing | `library/build.gradle.kts` (`MergeEmbeddedAarsTask`) | embeds androidx.webgpu AAR; version = tag or `{sha}-SNAPSHOT` |
+| Publishing | `library/build.gradle.kts` | `api(libs.androidx.webgpu)`; version = tag or `{sha}-SNAPSHOT` |
 
 ## CODE MAP
 | Symbol | Type | Location | Role |
@@ -67,8 +67,11 @@ Android library + sample app: WebGPU-accelerated image viewer (manga-reader styl
 ## UNIQUE STYLES
 - Module `:webgpuviewer` lives in `library/` dir (mapped in `settings.gradle.kts`).
 - Library Kotlin under `src/main/java/` (not `src/main/kotlin/`).
-- Custom Maven repo = raw GitHub URL (`mpreg-ca/androidx-webgpu-repo`).
-- `MergeEmbeddedAarsTask` fat-shades androidx.webgpu into published AAR.
+- **`androidx.webgpu` is resolved from `google()` as `1.0.0-alpha06` and exposed with `api`** —
+  the same coordinate and scope Mihon uses. There is no custom Maven repo and no AAR embedding:
+  the published POM carries the dependency, so consumers always run the classes the library was
+  compiled against. `mpreg-ca/androidx-webgpu-repo` must not be added back — its re-uploaded
+  `1.0.0-dev06` paired new JNI symbols with old classes and broke every GPU call.
 - NEVER/ALWAYS prose comments document invariants (TileRenderer.kt, ImagePage.kt densest) — read before touching pipeline.
 
 ## COMMANDS
@@ -83,6 +86,6 @@ Android library + sample app: WebGPU-accelerated image viewer (manga-reader styl
 ## NOTES
 - `sample/` is stale/broken: layout references nonexistent `WebGpuImageViewContinuous`, `MainActivity` opens missing `ref2.png`, `moe/grass/...` dir mismatches `ca.mpreg...` package, nested `defaultConfig` block. `sample/build/` absent (never built here). Fix these before building sample.
 - WSL gotcha: `local.properties` has Windows SDK path; use `/mnt/c/Users/Branden/AppData/Local/Android/Sdk`.
-- Toolchain is bleeding-edge (AGP 9.3.2, Kotlin 2.4.10, compileSdk 37, webgpu `1.0.0-dev05`).
+- Toolchain is bleeding-edge (AGP 9.3.2, Kotlin 2.4.10, compileSdk 37, webgpu `1.0.0-alpha06`).
 - Zero `TODO`/`FIXME`/`HACK` markers in source; `toDouble()` / `CompareFunction.Always` / `alwaysAvoidCutout` are grep false positives, not markers.
 - `.git` is a gitfile — submodule at `external/webgpuviewer-houri` of komikku-pineapple.

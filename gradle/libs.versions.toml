@@ -17,7 +17,10 @@ kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-c
 androidx-appcompat = { module = "androidx.appcompat:appcompat", version = "1.8.0" }
 androidx-viewpager = { module = "androidx.viewpager:viewpager", version = "1.1.0" }
 
-androidx-webgpu = { module = "androidx.webgpu:webgpu", version = "1.0.0-dev06" }
+# Same coordinate Mihon uses: the official alpha06 from google(). Its classes and JNI library
+# match, unlike the custom repo's mutable dev06 rebuild. The app must not redeclare it; it inherits
+# this version through the library's api dependency, so the two can no longer drift apart.
+androidx-webgpu = { module = "androidx.webgpu:webgpu", version = "1.0.0-alpha06" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version = "1.13.0" }
 androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version = "2026.08.00" }
 androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }

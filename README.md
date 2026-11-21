@@ -40,7 +40,7 @@ Fork of `mpreg-ca/webgpuviewer`, vendored as a submodule of `komikku-pineapple` 
 | minSdk | 24 | `library/build.gradle.kts` |
 | Java target | 17 | `library/build.gradle.kts` |
 | CMake | 3.22.1, C++17 | `library/build.gradle.kts`, `CMakeLists.txt` |
-| androidx.webgpu | 1.0.0-dev05 | `gradle/libs.versions.toml` |
+| androidx.webgpu | 1.0.0-alpha06 (`google()`) | `gradle/libs.versions.toml` |
 | Compose BOM | 2026.08.00 | `gradle/libs.versions.toml` |
 | compose-foundation / animation-core | 1.12.0 | `gradle/libs.versions.toml` |
 | activity-compose | 1.13.0 | `gradle/libs.versions.toml` |
@@ -64,7 +64,7 @@ This fork (`PineappleTwilight/webgpuviewer-houri`) is **not on Maven**. Use it l
 
 Notes (apply to both paths):
 
-- **No custom repo needed by consumers.** The build-only repo `https://raw.githubusercontent.com/mpreg-ca/androidx-webgpu-repo/main` (see `settings.gradle.kts`) resolves `androidx.webgpu` at build time, and `MergeEmbeddedAarsTask` fat-shades its `classes.jar`, `jni/` libs, and assets into the published AAR.
+- **No custom repo, no embedded AAR.** `androidx.webgpu:webgpu:1.0.0-alpha06` is resolved from `google()` like any other AndroidX artifact and exposed with `api`, exactly as Mihon does it. Consumers get the same version the library compiles against through the POM's compile-scope dependency, and there is no build-only repository to configure. Do not point at `mpreg-ca/androidx-webgpu-repo`: its re-uploaded `1.0.0-dev06` shipped a native library whose JNI entry points did not match its own classes, so every GPU call failed with `UnsatisfiedLinkError`.
 - **No manifest changes.** Library `AndroidManifest.xml` is empty (`<manifest />`) — no permissions, features, or activities.
 - `minSdk 24`. Consumer ProGuard rules keep `ca.mpreg.**` and `androidx.webgpu.**`.
 - Deps/plugins only via the version catalog (`libs.*`); modules declare no repos (`FAIL_ON_PROJECT_REPOS`).
