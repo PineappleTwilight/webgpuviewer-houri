@@ -1,0 +1,26 @@
+[versions]
+agp = "9.3.2"
+animationCore = "1.12.0"
+core = "1.19.0"
+kotlin = "2.4.10"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+
+[libraries]
+androidx-annotation = { module = "androidx.annotation:annotation", version = "1.11.0" }
+androidx-window = { module = "androidx.window:window", version = "1.5.1" }
+androidx-annotation-experimental = { module = "androidx.annotation:annotation-experimental", version = "1.6.0" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.11.0" }
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version = "1.8.0" }
+androidx-viewpager = { module = "androidx.viewpager:viewpager", version = "1.1.0" }
+
+androidx-webgpu = { module = "androidx.webgpu:webgpu", version = "1.0.0-dev06" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version = "1.13.0" }
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version = "2026.08.00" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation", version = "1.12.0" }
+androidx-compose-animation-core = { group = "androidx.compose.animation", name = "animation-core", version.ref = "animationCore" }
+androidx-core = { group = "androidx.core", name = "core", version.ref = "core" }

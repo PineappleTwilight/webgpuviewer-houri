@@ -1,0 +1,397 @@
+package ca.mpreg.webgpuviewer.filter
+
+import androidx.webgpu.AddressMode
+import androidx.webgpu.FilterMode
+import androidx.webgpu.GPUBindGroupEntry
+import androidx.webgpu.GPUCommandEncoder
+import androidx.webgpu.GPUExtent3D
+import androidx.webgpu.GPUSampler
+import androidx.webgpu.GPUSamplerDescriptor
+import androidx.webgpu.GPUTexture
+import androidx.webgpu.GPUTextureDescriptor
+import androidx.webgpu.GPUTextureView
+import androidx.webgpu.TextureFormat
+import androidx.webgpu.TextureUsage
+import ca.mpreg.webgpuviewer.renderer.Hdr
+import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer
+import ca.mpreg.webgpuviewer.renderer.destroyAndRelease
+
+/**
+ * The output filter chain: the viewer draws its frame into an offscreen texture, each enabled
+ * [Filter] runs over the result of the one before it, and the last one writes the swapchain.
+ *
+ * Held by [ca.mpreg.webgpuviewer.renderer.WebGpuRenderer] and reachable as
+ * [ca.mpreg.webgpuviewer.viewer.ImageViewerState.filters]. With nothing enabled the chain steps
+ * out of the way entirely - [beginFrame] hands back the swapchain texture itself, so a viewer
+ * with no filters draws exactly as it did before.
+ *
+ * Textures are pooled and recycled within the frame, so a chain of any length runs on two
+ * screen-sized textures rather than one per filter.
+ */
+class FilterChain {
+    private val device get() = WebGpuRenderer.device
+
+    /** Set by the viewer - a filter's settings change has to reach the screen somehow. */
+    var onInvalidate: (() -> Unit)? = null
+
+    private val invalidateCallback: () -> Unit = { onInvalidate?.invoke() }
+
+    /** The chain, in the order they run. Assign to change it. */
+    @Volatile
+    var filters: List<Filter> = emptyList()
+        set(value) {
+            field.forEach { it.onUpdate = null }
+            value.forEach { it.onUpdate = invalidateCallback }
+            field = value
+            invalidateCallback()
+        }
+
+    /** This frame's active filters, fixed at [beginFrame] so [endFrame] can't see a half-change. */
+    private val active = ArrayList<Filter>()
+
+    private var sceneSlot: Slot? = null
+
+    private var poolWidth = 0
+    private var poolHeight = 0
+
+    /**
+     * Where this frame should be drawn: an offscreen texture when any filter is enabled, and the
+     * swapchain texture itself when none is. [endFrame] must follow on either path.
+     */
+    fun beginFrame(surface: GPUTexture): GPUTexture {
+        // Harden: Adreno gralloc 0x3b - tiny surfaces (4x4) must bypass filtering entirely to avoid
+        // allocating intermediate textures that trigger format 59 failures. Also guard null/zero.
+        if (surface.width < 8 || surface.height < 8) {
+            active.clear()
+            sceneSlot = null
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        }
+        // First, and nothing before it: with no filters this is the whole of the chain's work
+        // per frame, and it should stay a list scan with no allocation and no GPU work at all.
+        active.clear()
+        val list = filters
+        for (i in list.indices) if (list[i].active) active.add(list[i])
+
+        if (active.isEmpty()) {
+            sceneSlot = null
+            // Two screen-sized textures is real memory to leave sitting behind a filter that is
+            // switched off; turning one back on is a settings change and can afford to reallocate.
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        }
+
+        // Slots a throwing frame never handed back - the pool only ever lives within one frame.
+        releaseAll()
+        frame++
+
+        if (poolWidth != surface.width || poolHeight != surface.height) {
+            destroyPool()
+            poolWidth = surface.width
+            poolHeight = surface.height
+        }
+
+        val slot = try {
+            acquire(surface.width, surface.height, surface.format, false)
+        } catch (e: OutOfMemoryError) {
+            System.gc()
+            active.clear()
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        } catch (e: Exception) {
+            active.clear()
+            if (pool.isNotEmpty()) destroyPool()
+            return surface
+        }
+        sceneSlot = slot
+        return slot.texture
+    }
+
+    /** Run the chain over what [beginFrame] handed out, ending on [surface]. */
+    fun endFrame(encoder: GPUCommandEncoder, surface: GPUTexture) {
+        val scene = sceneSlot ?: return
+        sceneSlot = null
+
+        var srcSlot: Slot? = scene
+        var src: GPUTextureView = scene.view
+        var width = surface.width
+        var height = surface.height
+        // Views over the frame's swapchain texture, made here rather than pooled. The pass each one is
+        // attached to keeps its own reference, so ours goes once the chain has recorded everything.
+        val surfaceViews = ArrayList<GPUTextureView>(2)
+
+        try {
+            for (i in active.indices) {
+                val filter = active[i]
+                val outWidth = filter.outputWidth(width, height)
+                val outHeight = filter.outputHeight(width, height)
+                val last = i == active.size - 1
+
+                // The swapchain is a render attachment of one fixed format - a compute filter, or
+                // one that resamples or wants headroom, has to land offscreen and be blitted.
+                val direct = last && !filter.usesCompute &&
+                        filter.outputFormat == surface.format &&
+                        outWidth == surface.width && outHeight == surface.height
+
+                val dstSlot = if (direct) null
+                else acquire(outWidth, outHeight, filter.outputFormat, filter.usesCompute)
+                // The swapchain texture rotates every frame, so a fresh view each frame would
+                // allocate and miss FilterFullscreen's bind-group cache forever - reuse one
+                // view per backing buffer instead.
+                val dst = dstSlot?.view ?: swapchainView(surface)
+
+                filter.run(this, encoder, src, width, height, dst, outWidth, outHeight)
+
+                // Only after run() - until it returns, this is the texture it reads from.
+                srcSlot?.let { it.inUse = false }
+                srcSlot = dstSlot
+                src = dst
+                width = outWidth
+                height = outHeight
+
+                if (last && !direct) tailBlit.run(
+                    this, encoder, src, width, height,
+                    swapchainView(surface), surface.width, surface.height
+                )
+            }
+        } finally {
+            // A throwing filter must not strand slots: the pool only ever lives within one
+            // frame, so hand everything back rather than just the current source.
+            releaseAll()
+            active.clear()
+        }
+    }
+
+    /**
+     * A pooled texture for a filter's own intermediate pass, free for the rest of this frame.
+     * The caller must hand it back with [release] before returning from [Filter.run].
+     */
+    fun scratch(
+        width: Int, height: Int, format: Int = Hdr.frameFormat, storage: Boolean = false
+    ): GPUTextureView = acquire(width, height, format, storage).view
+
+    /** Return a [scratch] texture to the pool. */
+    fun release(view: GPUTextureView) {
+        for (slots in pool.values) {
+            for (slot in slots) {
+                if (slot.view === view) {
+                    slot.inUse = false
+                    return
+                }
+            }
+        }
+    }
+
+    fun onLowMemory() {
+        destroyPool()
+        poolWidth = 0
+        poolHeight = 0
+    }
+
+    fun poolBytes(): Long {
+        var total = 0L
+        for (slots in pool.values) for (slot in slots) total += slot.texture.width.toLong() * slot.texture.height * 4L
+        return total
+    }
+
+    fun cleanup() {
+        filters.forEach { it.cleanup() }
+        tailBlit.cleanup()
+        destroyPool()
+    }
+
+    // ---- texture pool ----
+
+    private class Slot(val texture: GPUTexture, val view: GPUTextureView) {
+        var inUse = false
+        var lastFrame = Long.MIN_VALUE
+
+        /**
+         * Both handles are AutoCloseable over a Dawn object with no finalizer, so a dropped slot keeps its
+         * native texture and view until they are closed.
+         */
+        fun release() {
+            texture.destroyAndRelease()
+            view.close()
+        }
+    }
+
+    private val pool = HashMap<Long, ArrayList<Slot>>()
+
+    private var frame = 0L
+
+    // Sizes are screen-scale and the format is a short enum, so one long holds the whole key.
+    private fun key(width: Int, height: Int, format: Int, storage: Boolean): Long =
+        (width.toLong() shl 44) or (height.toLong() shl 24) or
+                (format.toLong() shl 1) or (if (storage) 1L else 0L)
+
+    @Volatile
+    private var poolTotalBytes: Long = 0L
+    private val maxPoolBytes: Long = 48L * 1024 * 1024
+
+    private fun acquire(width: Int, height: Int, format: Int, storage: Boolean): Slot {
+        require(width > 0 && height > 0) { "acquire: invalid size ${width}x$height" }
+        require(width <= 16384 && height <= 16384) { "acquire: size too large ${width}x$height" }
+        // Same ceiling as everything else that sizes a texture off the surface: a pool entry
+        // past [WebGpuRenderer.maxTextureDimension2D] is rejected outright, where the clamp
+        // leaves the chain running (cropped past the cap on a display larger than it) rather
+        // than beginFrame's catch silently disabling filters for every frame of that session.
+        val cap = minOf(8192, WebGpuRenderer.maxTextureDimension2D)
+        val w = width.coerceIn(8, cap)
+        val h = height.coerceIn(8, cap)
+        if (w != width || h != height) {
+            android.util.Log.w("FilterChain", "acquire clamped ${width}x$height -> ${w}x$h")
+        }
+        if (format != TextureFormat.RGBA8Unorm && format != TextureFormat.RGBA16Float) {
+            android.util.Log.w("FilterChain", "acquire unexpected format $format, clamping to RGBA8Unorm")
+        }
+        val safeFormat = if (format == TextureFormat.RGBA16Float) format else TextureFormat.RGBA8Unorm
+        val slots = pool.getOrPut(key(w, h, safeFormat, storage)) { ArrayList() }
+
+        var free: Slot? = null
+        for (slot in slots) {
+            if (!slot.inUse && (free == null || slot.lastFrame < free.lastFrame)) free = slot
+        }
+
+        if (free != null && (free.lastFrame != frame - 1 || slots.size >= RING)) {
+            free.inUse = true
+            free.lastFrame = frame
+            return free
+        }
+
+        if (poolTotalBytes > maxPoolBytes) {
+            android.util.Log.w("FilterChain", "pool over budget ${poolTotalBytes} > $maxPoolBytes, destroying oldest")
+            destroyOldestPoolEntries()
+        }
+
+        var usage = TextureUsage.TextureBinding or TextureUsage.RenderAttachment
+        if (storage) usage = usage or TextureUsage.StorageBinding
+
+        val texture = try {
+            device.createTexture(
+                GPUTextureDescriptor(
+                    size = GPUExtent3D(w, h), format = safeFormat, usage = usage
+                )
+            )
+        } catch (e: OutOfMemoryError) {
+            System.gc()
+            destroyOldestPoolEntries()
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.e("FilterChain", "acquire createTexture failed ${w}x$h", e)
+            throw e
+        }
+        val slot = Slot(texture, texture.createView())
+        slot.inUse = true
+        slot.lastFrame = frame
+        slots.add(slot)
+        poolTotalBytes += w.toLong() * h * 4L
+        return slot
+    }
+
+    private fun destroyOldestPoolEntries() {
+        var oldestKey: Long? = null
+        var oldestFrame = Long.MAX_VALUE
+        for ((k, slots) in pool) {
+            for (s in slots) if (!s.inUse && s.lastFrame < oldestFrame) {
+                oldestFrame = s.lastFrame
+                oldestKey = k
+            }
+        }
+        if (oldestKey != null) {
+            val list = pool[oldestKey]!!
+            val idx = list.indexOfFirst { !it.inUse && it.lastFrame == oldestFrame }
+            if (idx >= 0) {
+                val removed = list.removeAt(idx)
+                try { removed.texture.destroy() } catch (_: Throwable) {}
+                poolTotalBytes = (poolTotalBytes - removed.texture.width.toLong() * removed.texture.height * 4L).coerceAtLeast(0L)
+                if (list.isEmpty()) pool.remove(oldestKey)
+            }
+        } else {
+            destroyPool()
+        }
+    }
+
+    private fun releaseAll() {
+        sceneSlot = null
+        for (slots in pool.values) for (slot in slots) slot.inUse = false
+    }
+
+    private fun destroyPool() {
+        for (slots in pool.values) for (slot in slots) {
+            try { slot.texture.destroy() } catch (_: Throwable) {}
+        }
+        pool.clear()
+        poolTotalBytes = 0L
+        sceneSlot = null
+        for ((_, view) in swapchainViews) {
+            try { view.close() } catch (_: Throwable) {}
+        }
+        swapchainViews.clear()
+    }
+
+    private val swapchainViews = HashMap<Long, GPUTextureView>()
+
+    private fun swapchainView(surface: GPUTexture): GPUTextureView {
+        val handle = surface.handle
+        swapchainViews[handle]?.let { return it }
+        if (swapchainViews.size >= MAX_CACHED_SWAP_VIEWS) {
+            val itr = swapchainViews.entries.iterator()
+            while (itr.hasNext()) {
+                val entry = itr.next()
+                if (entry.key != handle) {
+                    try { entry.value.close() } catch (_: Throwable) {}
+                    itr.remove()
+                }
+            }
+        }
+        return surface.createView().also { swapchainViews[handle] = it }
+    }
+
+    // ---- tail blit ----
+
+    // Linear, not the default nearest: the only filters that reach this path are the ones that
+    // couldn't write the swapchain, which includes any that resampled to a different size.
+    private val blitSampler: GPUSampler by lazy {
+        device.createSampler(
+            GPUSamplerDescriptor(
+                magFilter = FilterMode.Linear,
+                minFilter = FilterMode.Linear,
+                addressModeU = AddressMode.ClampToEdge,
+                addressModeV = AddressMode.ClampToEdge,
+            )
+        )
+    }
+
+    /**
+     * Copies a filter's offscreen result to the swapchain - see [endFrame]'s `direct`. A filter
+     * itself, so it inherits the pipeline, pass and per-texture bind group caching rather than
+     * repeating them; it is never in [filters], and runs only when [endFrame] asks it to.
+     */
+    private val tailBlit = object : FilterFullscreen() {
+        override val label get() = "FilterChain blit"
+        override val code get() = BLIT_FS
+        override fun entries(src: GPUTextureView) = arrayOf(
+            GPUBindGroupEntry(0, textureView = src),
+            GPUBindGroupEntry(1, sampler = blitSampler),
+        )
+    }
+
+    private companion object {
+        /** Textures kept per size and format, so consecutive frames don't share one. */
+        const val RING = 3
+
+        /** Backing buffers a rotating swapchain ever holds at once - one cached view each. */
+        const val MAX_CACHED_SWAP_VIEWS = 4
+
+        const val BLIT_FS = """
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(src, src_sampler, in.uv);
+}
+"""
+    }
+}

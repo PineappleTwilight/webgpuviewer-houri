@@ -1,0 +1,1351 @@
+package ca.mpreg.webgpuviewer.renderer
+
+import android.annotation.SuppressLint
+import android.os.SystemClock
+import android.util.Log
+import android.view.Surface
+import androidx.webgpu.DeviceLostCallback
+import androidx.webgpu.FeatureLevel
+import androidx.webgpu.FeatureName
+import androidx.webgpu.GPU.createInstance
+import androidx.webgpu.GPUAdapter
+import androidx.webgpu.GPUCommandEncoder
+import androidx.webgpu.GPUDevice
+import androidx.webgpu.GPUDeviceDescriptor
+import androidx.webgpu.GPUInstance
+import androidx.webgpu.GPUInstanceDescriptor
+import androidx.webgpu.GPULimits
+import androidx.webgpu.GPURequestAdapterOptions
+import androidx.webgpu.GPUSurface
+import androidx.webgpu.GPUSurfaceConfiguration
+import androidx.webgpu.GPUSurfaceDescriptor
+import androidx.webgpu.GPUSurfaceSourceAndroidNativeWindow
+import androidx.webgpu.GPUTexture
+import androidx.webgpu.SurfaceGetCurrentTextureStatus
+import androidx.webgpu.TextureUsage
+import androidx.webgpu.UncapturedErrorCallback
+import androidx.webgpu.helper.Util.windowFromSurface
+import androidx.webgpu.helper.initLibrary
+import ca.mpreg.webgpuviewer.filter.FilterChain
+import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.mutex
+import ca.mpreg.webgpuviewer.renderer.WebGpuRenderer.Companion.withContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+enum class FrameResult {
+    Drawn,
+    Retry,
+    Unavailable,
+}
+
+class WebGpuRenderer {
+    companion object {
+        const val MIN_SURFACE_DIMENSION = 8
+
+        const val MAX_SURFACE_DIMENSION = 8192
+
+        /**
+         * The surface-teardown pump: see [pumpSurfaceTeardown]. Eight short pumps cover a
+         * driver that defers the `vkDestroySurfaceKHR` disconnect by a frame or three; the
+         * alternative is the replacement surface failing with
+         * `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` and losing the device built to recover onto.
+         */
+        private const val SURFACE_TEARDOWN_PUMPS = 8
+        private const val SURFACE_TEARDOWN_PUMP_MS = 2L
+
+        /**
+         * How long [detachSurface] waits for the frame in flight before giving up and letting the
+         * teardown proceed: the common case is a few milliseconds, since the frame only has to
+         * run out its last native calls, but a frame wedged past every deadline must not turn the
+         * crash this prevents into a hang of the surface callback.
+         */
+        private const val FRAME_DRAIN_TIMEOUT_MS = 250L
+
+        /**
+         * The recovery ladder: see [recoverFromDeviceLoss]. A recovery must have produced a
+         * device that stayed alive this long before consecutive-failure counting resets, and
+         * this many consecutive failures stop the self-retries until a fresh loss event.
+         */
+        private const val RECOVERY_STABLE_MS = 15_000L
+        private const val RECOVERY_GIVE_UP_ATTEMPTS = 12
+
+        // KMK --> Swapchain-error escalation thresholds - see the [surfaceErrorStreak] field.
+        // 30 failed frames is ~0.5s at 60fps: long enough that a genuinely transient present
+        // failure rides through, short enough that a wedged swapchain is noticed within a
+        // breath. 120 is the point where retrying has been proven futile four times over.
+        private const val SURFACE_ERROR_RECREATE_STREAK = 30
+        private const val SURFACE_ERROR_GIVE_UP_STREAK = 120
+        // KMK <--
+
+        /**
+         * The ceiling a *surface* dimension may be configured at: the historical [MAX_SURFACE_DIMENSION]
+         * constant narrowed by [maxTextureDimension2D], because the swapchain's canvas reads back as a
+         * texture of exactly that size. Before the device exists so does the Compatibility 4096 floor;
+         * everywhere else [maxTextureDimension2D] tracks whichever device is live - a fresh adapter can
+         * report different limits (see [recreateDeviceLocked]) - so this is read per call, not cached.
+         *
+         * [init]/[resize] clamp through here: a display whose dimension exceeds what the device can
+         * texture must configure at the device's own limit instead of throwing out of `configure`.
+         */
+        fun surfaceDimensionCap(): Int = minOf(MAX_SURFACE_DIMENSION, maxTextureDimension2D)
+
+        lateinit var instance: GPUInstance
+        lateinit var adapter: GPUAdapter
+        lateinit var device: GPUDevice
+
+        /**
+         * The device's real texture size ceiling - requested at creation, since Compatibility mode
+         * otherwise caps it at 4096 whatever the hardware can do.
+         */
+        var maxTextureDimension2D = 4096
+            private set
+        private val mutex = Mutex()
+
+        var offsetX: Float = 0f
+        var offsetY: Float = 0f
+
+        /** Set if [init]'s adapter/device request throws, so a callsite can fail soft instead. */
+        @Volatile
+        var initError: Throwable? = null
+            private set
+
+        @Volatile
+        private var initialized = false
+
+        @Volatile
+        private var deviceLost = false
+
+        /**
+         * Why the device was lost, plus the last uncaptured error before it. Carried in every
+         * later "device lost" message, since the log line from the loss itself is easily pruned.
+         */
+        @Volatile
+        private var deviceLostDetail = ""
+
+        @Volatile
+        private var lastUncapturedError: String? = null
+
+        /**
+         * Called once, on whichever thread the driver reports it from, when the device is lost.
+         * Nothing renders after that for the life of the process, so a host should move to a
+         * viewer that does not need WebGPU.
+         */
+        @Volatile
+        var onDeviceLost: (() -> Unit)? = null
+
+        /**
+         * Notified on the device-lost callback thread when the device is lost, with the reason -
+         * listeners typically call [recoverFromDeviceLoss] to try for a fresh device.
+         */
+        fun interface DeviceLostListener {
+            fun onDeviceLost(reason: Int, message: String)
+        }
+
+        private val deviceLostListeners = CopyOnWriteArrayList<DeviceLostListener>()
+
+        fun addDeviceLostListener(listener: DeviceLostListener) {
+            deviceLostListeners.add(listener)
+        }
+
+        fun removeDeviceLostListener(listener: DeviceLostListener) {
+            deviceLostListeners.remove(listener)
+        }
+
+        /**
+         * Called on the render thread when a recovery produced a live device - including the
+         * self-healing retries a loss callback never announces (the loss event fires once, on
+         * the loss itself; the retries that later succeed are silent). A host rebuilds
+         * everything device-bound here: a page decoded before the loss was reset by the loss
+         * handling, but a page that failed to decode *while the device was dead* carries an
+         * ErrorPage and a latched `wantedByRender` that only a fresh reset clears.
+         */
+        fun interface DeviceRecoveredListener {
+            fun onDeviceRecovered()
+        }
+
+        private val deviceRecoveredListeners = CopyOnWriteArrayList<DeviceRecoveredListener>()
+
+        fun addDeviceRecoveredListener(listener: DeviceRecoveredListener) {
+            deviceRecoveredListeners.add(listener)
+        }
+
+        fun removeDeviceRecoveredListener(listener: DeviceRecoveredListener) {
+            deviceRecoveredListeners.remove(listener)
+        }
+
+        private fun notifyDeviceRecovered() {
+            for (listener in deviceRecoveredListeners) {
+                try {
+                    listener.onDeviceRecovered()
+                } catch (e: Throwable) {
+                    Log.w("WebGpuRenderer", "device-recovered listener failed", e)
+                }
+            }
+        }
+
+        private fun notifyDeviceLost(reason: Int, message: String) {
+            for (listener in deviceLostListeners) {
+                try {
+                    listener.onDeviceLost(reason, message)
+                } catch (e: Throwable) {
+                    Log.w("WebGpuRenderer", "device-lost listener failed", e)
+                }
+            }
+        }
+
+        fun isOnRenderThread() = Thread.currentThread().name == "WebGPU-Render-Thread"
+
+        /** The companion's device object, or null before first init - teardown paths use this. */
+        fun deviceOrNull(): GPUDevice? = if (::device.isInitialized) device else null
+
+        /** The companion's adapter object, or null before first init - teardown paths use this. */
+        fun adapterOrNull(): GPUAdapter? = if (::adapter.isInitialized) adapter else null
+
+        val isAvailable: Boolean
+            get() = initError == null && !deviceLost &&
+                    ::instance.isInitialized && ::adapter.isInitialized && ::device.isInitialized
+
+        val unavailableReason: String?
+            get() = when {
+                initError != null -> "WebGPU failed to initialize: ${initError?.message}"
+                deviceLost -> "WebGPU device lost$deviceLostDetail"
+                !::instance.isInitialized || !::adapter.isInitialized ||
+                        !::device.isInitialized -> "WebGPU never initialized"
+
+                else -> null
+            }
+
+        fun requireAvailable() {
+            check(isAvailable) {
+                "WebGPU not available" + (initError?.let { ": ${it.message}" }
+                    ?: if (deviceLost) ": device lost$deviceLostDetail" else "")
+            }
+        }
+
+        val dispatcher = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "WebGPU-Render-Thread")
+        }.asCoroutineDispatcher()
+
+        // Frame time profiling
+        var profilingEnabled = false
+
+        /**
+         * Bumped on every successful device creation after the first: filters and other
+         * device-bound caches compare against it to detect a recreation and rebuild
+         * (see [ca.mpreg.webgpuviewer.filter.Filter.syncDevice]). Starts 0, so instances built
+         * before any loss never spuriously reset.
+         */
+        var deviceGeneration = 0L
+            private set
+
+        /** Guards every field below - written on the render thread, read from wherever polls them. */
+        private val profilingLock = Any()
+        private var frameCount = 0L
+        private var totalFrameTimeNs = 0L
+        private var minFrameTimeNs = Long.MAX_VALUE
+        private var maxFrameTimeNs = 0L
+        private var lastFrameTimeNs = 0L
+        private val recentFrameTimes = LongArray(60)
+        private var recentFrameIndex = 0
+
+        val lastFrameTimeMs: Float get() = synchronized(profilingLock) { lastFrameTimeNs / 1_000_000f }
+        val avgFrameTimeMs: Float
+            get() = synchronized(profilingLock) {
+                if (frameCount > 0) totalFrameTimeNs / frameCount / 1_000_000f else 0f
+            }
+        val minFrameTimeMs: Float
+            get() = synchronized(profilingLock) {
+                if (minFrameTimeNs == Long.MAX_VALUE) 0f else minFrameTimeNs / 1_000_000f
+            }
+        val maxFrameTimeMs: Float get() = synchronized(profilingLock) { maxFrameTimeNs / 1_000_000f }
+        val recentAvgFrameTimeMs: Float
+            get() = synchronized(profilingLock) {
+                val count = minOf(frameCount.toInt(), 60)
+                if (count == 0) return@synchronized 0f
+                var sum = 0L
+                for (i in 0 until count) {
+                    sum += recentFrameTimes[i]
+                }
+                sum.toFloat() / count / 1_000_000f
+            }
+        val estimatedFps: Float
+            get() = synchronized(profilingLock) {
+                if (lastFrameTimeNs > 0) 1_000_000_000f / lastFrameTimeNs else 0f
+            }
+
+        fun resetProfiling() = synchronized(profilingLock) {
+            frameCount = 0
+            totalFrameTimeNs = 0
+            minFrameTimeNs = Long.MAX_VALUE
+            maxFrameTimeNs = 0
+            lastFrameTimeNs = 0
+            recentFrameIndex = 0
+            recentFrameTimes.fill(0)
+        }
+
+        private fun hasFeature(adapter: GPUAdapter, feature: Int): Boolean =
+            runCatching { adapter.hasFeature(feature) }.getOrDefault(false)
+
+        private fun deviceDescriptor(includeCore: Boolean = true) = GPUDeviceDescriptor(
+            deviceLostCallback = DeviceLostCallback { lost, reason, message ->
+                // A retired device's still-pending loss record can dispatch long after recovery
+                // parked it (see [destroyRetired] for why its wrapper must stay alive for that).
+                // Firing the ladder for a device the companion no longer names would churn
+                // generations: every such dispatch would start another recovery. Ignore them.
+                if (lost !== deviceOrNull()) {
+                    Log.w(
+                        "WebGpuRenderer",
+                        "stale device-lost callback for a retired device (reason=$reason: $message)"
+                    )
+                    return@DeviceLostCallback
+                }
+                val first = !deviceLost
+                if (first) {
+                    deviceLostDetail = " (reason=$reason: $message" +
+                            (lastUncapturedError?.let { "; last error: $it" } ?: "") + ")"
+                }
+                deviceLost = true
+                Log.e(
+                    "WebGpuRenderer",
+                    "WebGPU device lost reason=$reason: $message device=$lost"
+                )
+                notifyDeviceLost(reason, message)
+            },
+            deviceLostCallbackExecutor = Executor(Runnable::run),
+            uncapturedErrorCallback = UncapturedErrorCallback { _, type, message ->
+                lastUncapturedError = "type=$type: $message"
+                Log.e(
+                    "WebGpuRenderer",
+                    "Uncaptured WebGPU error type=$type: $message"
+                )
+            },
+            uncapturedErrorCallbackExecutor = Executor(Runnable::run),
+            requiredFeatures = requiredFeaturesFor(adapter, includeCore),
+            // Requested at creation, since Compatibility mode otherwise caps it at 4096
+            // whatever the hardware can do.
+            requiredLimits = GPULimits(
+                maxTextureDimension2D = adapter.getLimits().maxTextureDimension2D,
+            ),
+        )
+
+        private fun requiredFeaturesFor(adapter: GPUAdapter, includeCore: Boolean): IntArray {
+            val features = mutableListOf<Int>()
+            // Both field-reported adapters (Adreno 6xx, Mali bifrost) expose
+            // core-features-and-limits. Requesting it upgrades the device from Compatibility
+            // mode to core WebGPU, lifting the compatibility-mode restrictions that are
+            // otherwise silently in effect (128-invocation compute workgroups, 16384-byte
+            // uniform buffers, 15 inter-stage variables, storage buffers barred from the
+            // vertex stage, storage textures barred from it too, 16 sampler combinations
+            // per stage). Without this a pipeline or filter that exceeds any of those
+            // fails validation with no exception on the draw path - a frame that draws
+            // nothing, i.e. a black screen. Devices without the feature keep the
+            // compatibility behaviour unchanged.
+            if (includeCore && hasFeature(adapter, FeatureName.CoreFeaturesAndLimits)) {
+                features += FeatureName.CoreFeaturesAndLimits
+            }
+            if (hasFeature(adapter, FeatureName.TimestampQuery)) {
+                features += FeatureName.TimestampQuery
+            }
+            return features.toIntArray()
+        }
+
+        /**
+         * Request the device from [adapter], upgrading it to core WebGPU when the adapter
+         * offers `core-features-and-limits` (see [requiredFeaturesFor]). A driver that lists
+         * the feature but then rejects the request loses nothing but the upgrade: the retry
+         * asks for the plain compatibility device instead of latching [initError] for the
+         * life of the process.
+         */
+        private suspend fun requestDeviceBestEffort(): GPUDevice =
+            try {
+                adapter.requestDevice(deviceDescriptor(includeCore = true))
+            } catch (e: Throwable) {
+                if (!hasFeature(adapter, FeatureName.CoreFeaturesAndLimits)) throw e
+                Log.w(
+                    "WebGpuRenderer",
+                    "requestDevice with core-features-and-limits failed; retrying compatibility-only",
+                    e
+                )
+                adapter.requestDevice(deviceDescriptor(includeCore = false))
+            }
+
+        internal fun recordFrameTime(timeNs: Long) {
+            if (!profilingEnabled) return
+            synchronized(profilingLock) {
+                frameCount++
+                totalFrameTimeNs += timeNs
+                lastFrameTimeNs = timeNs
+                if (timeNs < minFrameTimeNs) minFrameTimeNs = timeNs
+                if (timeNs > maxFrameTimeNs) maxFrameTimeNs = timeNs
+                recentFrameTimes[recentFrameIndex] = timeNs
+                recentFrameIndex = (recentFrameIndex + 1) % 60
+            }
+        }
+
+        /**
+         * The soname Dawn's JNI entry points live in. `GPU.createInstance` and every other
+         * `Java_androidx_webgpu_*` symbol are bound to class/method names, so the library has to
+         * be resident in this process *before* the first native call.
+         */
+        private const val WEBGPU_NATIVE_LIBRARY = "webgpu_c_bundled"
+
+        /**
+         * Load the native library directly first, then through [initLibrary], then by reflection.
+         *
+         * Direct first is deliberate: the helper is a static method in an AAR class, and a minified
+         * consumer that loses that call leaves `createInstance` throwing "No implementation found"
+         * even though the `.so` is packaged. `System.loadLibrary` is idempotent, so doing it here
+         * costs nothing when the helper already loaded the same library. The other two paths stay
+         * as fallbacks for packaging that names the helper class differently.
+         */
+        private fun safeInitLibrary() {
+            try {
+                System.loadLibrary(WEBGPU_NATIVE_LIBRARY)
+                return
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Direct load of $WEBGPU_NATIVE_LIBRARY failed, trying helper", e)
+            }
+            try {
+                initLibrary()
+                return
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.initLibrary failed, trying WebGpuUtils fallback", e)
+            }
+            try {
+                val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                val m = cls.getMethod("initLibrary")
+                m.invoke(null)
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "Fallback WebGpuUtils.initLibrary also failed", e)
+                throw e
+            }
+        }
+
+        /**
+         * [createInstance] is a native method. If the library is not resident when it is first
+         * called, ART throws `UnsatisfiedLinkError: No implementation found` and the companion
+         * latches that as a permanent `initError` - the renderer is then "unavailable" for the
+         * rest of the process even though the `.so` is packaged. Load once and retry once; a
+         * second failure is a real load/driver problem and falls through to the caller's catch.
+         */
+        private fun createInstanceWithLibrary(): GPUInstance =
+            try {
+                createInstance(GPUInstanceDescriptor())
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(
+                    "WebGpuRenderer",
+                    "GPU.createInstance had no native implementation; loading $WEBGPU_NATIVE_LIBRARY and retrying",
+                    e,
+                )
+                System.loadLibrary(WEBGPU_NATIVE_LIBRARY)
+                createInstance(GPUInstanceDescriptor())
+            }
+
+        private fun safeWindowFromSurface(surface: Surface): Long {
+            try {
+                return windowFromSurface(surface)
+            } catch (e: Throwable) {
+                Log.w("WebGpuRenderer", "Util.windowFromSurface failed, trying WebGpuUtils", e)
+                try {
+                    val cls = Class.forName("androidx.webgpu.helper.WebGpuUtils")
+                    val m = cls.getMethod("windowFromSurface", Surface::class.java)
+                    return m.invoke(null, surface) as Long
+                } catch (e2: Throwable) {
+                    Log.e("WebGpuRenderer", "Fallback windowFromSurface also failed", e2)
+                    throw e2
+                }
+            }
+        }
+
+        init {
+            runBlocking {
+                try {
+                    safeInitLibrary()
+
+                    instance = createInstanceWithLibrary()
+
+                    adapter =
+                        instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
+
+                    val adapterLimits = adapter.getLimits()
+
+                    device = requestDeviceBestEffort()
+                    initialized = true
+                    deviceLost = false
+                    maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+                    val core = runCatching {
+                        device.getFeatures().features.contains(FeatureName.CoreFeaturesAndLimits)
+                    }.getOrDefault(false)
+                    Log.i(
+                        "WebGpuRenderer",
+                        "maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} device=$maxTextureDimension2D core=$core"
+                    )
+                } catch (e: Throwable) {
+                    // Fails soft via initError - a driver init failure shouldn't poison the whole class.
+                    Log.e("WebGpuRenderer", "Failed to initialize WebGPU", e)
+                    initError = e
+                }
+            }
+        }
+
+        @JvmStatic
+        suspend fun <R> withContext(block: suspend CoroutineScope.(GPUDevice) -> R): R {
+            requireAvailable()
+            return withContext(dispatcher) {
+                mutex.withLock {
+                    block(this, device)
+                }
+            }
+        }
+
+        /**
+         * Run [block] on the GPU thread *without* taking the render mutex.
+         *
+         * For long resource work that yields as it goes. [withContext] would defeat that: a
+         * [render] call woken by the yield would just block on the mutex and hand the thread
+         * straight back, so the work would still run to completion before the next frame. Without
+         * the mutex the yield actually lets a frame through.
+         *
+         * Only safe for work that either owns its resources outright (an image still being built
+         * and not yet reachable from a page) or that cannot be observed mid-flight. Anything that
+         * has to appear atomically to the renderer belongs in [withContext].
+         */
+        @JvmStatic
+        suspend fun <R> onDispatcher(block: suspend CoroutineScope.(GPUDevice) -> R): R {
+            requireAvailable()
+            return withContext(dispatcher) {
+                block(this, device)
+            }
+        }
+    }
+
+    @Volatile
+    private var surface: GPUSurface? = null
+
+    /** The window reference [windowFromSurface] took for [surface], released in [cleanup]; see [NativeWindow]. */
+    private var window = 0L
+
+    /**
+     * The format the swapchain is currently configured as, so [render] can notice when
+     * [Hdr.frameFormat] has moved and rebuild it.
+     */
+    private var configuredFormat: Int = 0
+
+    /**
+     * Post-processing over the finished frame - see [FilterChain]. Empty by default, in which
+     * case [render] hands the swapchain texture straight to its caller as it always did.
+     */
+    val filters = FilterChain()
+
+    var width: Int = 0
+    var height: Int = 0
+
+    private var scope: CoroutineScope? = null
+
+    private var pendingSurface: Surface? = null
+
+    /**
+     * Retained so [recoverFromDeviceLoss] can rebuild the swapchain without waiting for the app
+     * to hand over a new surface (no new surface callback fires on device loss).
+     */
+    private var platformSurface: Surface? = null
+
+    /**
+     * The device and adapter retired by the previous recovery, freed at the start of the next
+     * one - see [destroyRetired] in [recoverFromDeviceLoss] for why the wait, and why the free.
+     */
+    private var retiredDevice: GPUDevice? = null
+    private var retiredAdapter: GPUAdapter? = null
+
+    /** Consecutive failed recoveries - the escalation dial of the recovery ladder. */
+    @Volatile
+    private var recoveryFailures = 0
+
+    /**
+     * Uptime before which [recoverFromDeviceLoss] fast-fails without building a device; each
+     * failure pushes it out, up to the ladder's ceiling - see [recoveryBackoffMs].
+     */
+    @Volatile
+    private var recoveryCooldownUntil = 0L
+
+    /**
+     * When the last recovery that produced a device happened - a device that survives
+     * [RECOVERY_STABLE_MS] resets the failure dial in [noteRecoverySuccess].
+     */
+    @Volatile
+    private var lastRecoverySuccessAt = 0L
+
+    /** Guards [scheduleRecoveryRetry]: one self-healing retry in flight at a time. */
+    private val recoveryRetryScheduled = AtomicBoolean(false)
+
+    @Volatile
+    private var resizePending = false
+
+    /**
+     * Set by [detachSurface] when the platform surface is going away. The device is fine and the
+     * [GPUSurface] still exists, but the framework dismantles the window - its BufferQueue and
+     * every gralloc buffer behind the swapchain images - as soon as the surfaceDestroyed
+     * callbacks return, so a frame that starts or resumes into this flag drops instead of
+     * driving a window that is being torn out from under it.
+     */
+    @Volatile
+    private var surfaceDetached = false
+
+    /**
+     * KMK --> Consecutive [androidx.webgpu.SurfaceGetCurrentTextureStatus.Error] frames on the
+     * live surface. PowerVR field evidence (Multilaser M8_4G, Android 11): the swapchain can be
+     * born wedged - `getCurrentTexture` returns `Error` on every frame from the first one, while
+     * `configure` keeps succeeding - and [reconfigure] can never clear it, because configure only
+     * updates the descriptor on a surface whose WSI object is already broken. Counted here so the
+     * error path in [render] can escalate instead of retrying forever. Render-thread only.
+     *
+     * The escalation the field log asked for: ~0.5s of consecutive Errors tears the WebGPU surface
+     * down and builds a fresh one from the same window (the one reset that gives the driver a new
+     * swapchain); the worker's live tail saw 10s of Error spam and a black screen otherwise.
+     * KMK <--
+     */
+    private var surfaceErrorStreak = 0
+
+    /**
+     * KMK --> How many times this surface has *parked*: hit [SURFACE_ERROR_GIVE_UP_STREAK]
+     * consecutive swapchain `Error`s and gone [FrameResult.Unavailable] until something else
+     * invalidates - the PowerVR black-screen shape where `isAvailable` stays true the whole
+     * time, so the device-loss path never fires. Written on the render thread only; hosts
+     * snapshot it at viewer construction and again at session end and diff the two reads to
+     * detect a session that spent its life parked. Monotonic per renderer instance, never
+     * reset - the caller's own snapshot scopes it to one session. Volatile: read from host
+     * threads.
+     * KMK <--
+     */
+    @Volatile
+    var surfaceParkCount = 0
+        private set
+
+    /**
+     * KMK --> Whether a [scheduleSurfaceRecreate] pass is queued or running, so [render] treats a
+     * momentarily absent surface as Retry (the recreate finishes within a few frames) instead of
+     * reporting an outage for a reset it asked for itself.
+     * KMK <--
+     */
+    private val surfaceRecreateScheduled = AtomicBoolean(false)
+
+    @Synchronized
+    fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
+        if (!isAvailable) {
+            Log.w("WebGpuRenderer", "init called but WebGPU not available: $unavailableReason")
+            return
+        }
+        this.scope = scope
+        this.pendingSurface = surface
+        this.platformSurface = surface
+        // A surface the framework destroyed between its create callback and this call (the
+        // surface block may have suspended before init ran) must not clear the detach that its
+        // own destroy callback set.
+        if (surface.isValid) surfaceDetached = false
+        // KMK --> A fresh attach is a fresh swapchain: whatever the previous surface was doing,
+        // its error streak says nothing about this one.
+        // KMK <--
+        surfaceErrorStreak = 0
+        // KMK --> A surface can be created before its view is laid out, or mid-teardown, and
+        // report 0x0 (field: e-ink readers, which tear the surface down on refresh-mode
+        // switches). Storing those zeroes is what latches the degenerate 0.01 home scale into
+        // every page attached while they stand - the page then draws at a few dozen pixels
+        // until it is re-decoded. Keep the previous dimensions instead; a real resize callback
+        // follows and moves them. KMK <--
+        if (width >= MIN_SURFACE_DIMENSION && height >= MIN_SURFACE_DIMENSION) {
+            this.width = width.coerceAtMost(surfaceDimensionCap())
+            this.height = height.coerceAtMost(surfaceDimensionCap())
+        } else {
+            Log.w("WebGpuRenderer", "init called with degenerate size ${width}x$height - keeping ${this.width}x${this.height}")
+        }
+        createSurface()
+    }
+
+    @Synchronized
+    fun resize(width: Int, height: Int) {
+        if (!isAvailable || surfaceDetached) return
+        // KMK --> Same degenerate-size rule as init: a relayout can report 0x0, and storing it
+        // zeroes the dims every home-scale computation reads. KMK <--
+        if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) return
+        val w = width.coerceAtMost(surfaceDimensionCap())
+        val h = height.coerceAtMost(surfaceDimensionCap())
+        if (w == this.width && h == this.height && surface != null) return
+        this.width = w
+        this.height = h
+
+        if (surface == null) {
+            createSurface()
+        } else {
+            // Not here: [render] holds [mutex] across a suspending draw, so blocking on it from
+            // this thread deadlocks against the frame that owns it.
+            resizePending = true
+        }
+    }
+
+    /**
+     * The platform surface is going away: stop driving it and drain the frame in flight.
+     *
+     * Called from the surface-destroyed callback, on the main thread. That callback is the
+     * framework's last wait before teardown: a SurfaceView's window - its BufferQueue and the
+     * gralloc buffers behind the swapchain images - is dismantled only once the surfaceDestroyed
+     * callbacks return. Compose cancels the render job there but does not wait for it, and a
+     * cancellation only lands at a suspension point, so a frame that is already past its last
+     * suspension (the fast tile path suspends only while generating) would run its whole
+     * [render] tail - submit and present - against a window whose buffers are being freed
+     * underneath it. That is the rotation crash: a barrage of gralloc allocation failures as the
+     * BufferQueue goes down, then an abort inside `GPUQueue_submit`. Waiting here keeps the
+     * teardown behind the last frame, and the [surfaceDetached] gate makes every frame that
+     * starts or resumes after this drop instead of touching the dying window.
+     */
+    fun detachSurface() {
+        surfaceDetached = true
+        if (isOnRenderThread()) return
+        try {
+            runBlocking {
+                withTimeoutOrNull(FRAME_DRAIN_TIMEOUT_MS) {
+                    mutex.withLock { }
+                }
+            }
+        } catch (_: Throwable) {
+            // A drain that cannot run must not take the surface callback (and with it the
+            // framework's teardown wait) down with it.
+        }
+    }
+
+    /**
+     * KMK --> Tear the WebGPU surface down and build a fresh one from the same window: the one
+     * reset that can clear a swapchain wedged in Dawn's error state, where [reconfigure] only
+     * rewrites the descriptor on a surface whose WSI object is already broken. Scheduled from
+     * [render]'s error-streak path rather than run inline, because the teardown pump suspends and
+     * the error path is inside the render mutex. Runs on the render dispatcher under the render
+     * mutex - the same discipline [recoverFromDeviceLoss]'s surface half follows - and no-ops
+     * when the surface detached (its own destroy callback and the next [init] own that case).
+     * KMK <--
+     */
+    private fun scheduleSurfaceRecreate() {
+        if (!surfaceRecreateScheduled.compareAndSet(false, true)) return
+        CoroutineScope(dispatcher).launch {
+            try {
+                mutex.withLock {
+                    if (surfaceDetached || deviceLost) return@withLock
+                    val previous = surface
+                    surface = null
+                    configuredFormat = 0
+                    try {
+                        previous?.close()
+                    } catch (_: Throwable) {
+                    }
+                    // The same leak discipline as the recovery path: the window reference is
+                    // ours, so ours has to go before createSurface() takes a fresh one.
+                    if (window != 0L) {
+                        NativeWindow.release(window)
+                        window = 0L
+                    }
+                    pumpSurfaceTeardown()
+                    createSurface()
+                    Log.i("WebGpuRenderer", "surface recreated after a swapchain error streak")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "surface recreation failed", e)
+            } finally {
+                surfaceRecreateScheduled.set(false)
+            }
+        }
+    }
+
+    /**
+     * Full per-instance recovery after a device loss: recreates the shared device, drops this
+     * instance's device-bound caches (filter pool, stale swapchain) and rebuilds the swapchain
+     * from the retained platform surface. True when the device is usable afterwards; a missing
+     * surface waits for the next surface callback.
+     *
+     * Failures are laddered, not retried at the caller's pace. A recovery that fails at surface
+     * creation has lost the device it just built, whose own loss callback starts the next
+     * recovery - unthrottled, that loop recreated a device every second for the rest of the
+     * session (90 generations in the field log, one whole leaked device each). Early failures
+     * run at the caller's own pace; each further one buys a longer cooldown; enough consecutive
+     * failures stop the self-retries until a fresh loss event. A recovery only resets the dial
+     * once its device has stayed alive [RECOVERY_STABLE_MS] - a device that dies again
+     * immediately belongs to the same pressure era, not to a new one.
+     */
+    suspend fun recoverFromDeviceLoss(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now < recoveryCooldownUntil) {
+            Log.i(
+                "WebGpuRenderer",
+                "recovery deferred ${(recoveryCooldownUntil - now) / 1000.0}s (consecutive failures: $recoveryFailures)"
+            )
+            return false
+        }
+        return try {
+            withContext(dispatcher) {
+                mutex.withLock {
+                    // The device retired by the previous recovery is a full recovery cycle old
+                    // by now: continuations that were mid-flight when it died read `device`
+                    // from the companion when they resume (see [onDispatcher]), so nothing
+                    // references the retired handles any more and this is the safe point to
+                    // free them. Reassigning instead leaked a whole Dawn device per recovery -
+                    // the wrapper has no finalizer (see Release.kt) - and the loss loop was
+                    // compounding the very memory pressure that had started it.
+                    destroyRetired()
+                    val deadDevice = deviceOrNull()
+                    val deadAdapter = adapterOrNull()
+
+                    // Drop the swapchain and the native window BEFORE the new device exists.
+                    // Dawn can defer vkDestroySurfaceKHR past close(), and a second createSurface
+                    // on the same window while the old swapchain is still connected to it fails
+                    // with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR - which loses the device again.
+                    val previous = surface
+                    surface = null
+                    try {
+                        previous?.close()
+                    } catch (_: Throwable) {
+                    }
+                    // cleanup() releases this after closing the surface, for the same reason: the
+                    // window reference is ours, so ours has to be the one that goes.
+                    if (window != 0L) {
+                        NativeWindow.release(window)
+                        window = 0L
+                    }
+                    // Releasing our references does not disconnect the window - the deferred
+                    // vkDestroySurfaceKHR does, and it runs only when the instance's event
+                    // loop is pumped. Nothing here had pumped it, so the old surface was
+                    // still connected when createSurface() built the replacement: the fresh
+                    // device was lost at birth and its loss callback started the next
+                    // recovery. Give the deferred work wall-clock time to run.
+                    pumpSurfaceTeardown()
+
+                    if (!recreateDeviceLocked()) {
+                        noteRecoveryFailure()
+                        return@withLock false
+                    }
+                    // The companion no longer names the dead device, so nothing drives it
+                    // after this lock ends; free it one recovery cycle from now (above).
+                    retiredDevice = deadDevice
+                    retiredAdapter = deadAdapter
+                    try {
+                        filters.cleanup()
+                    } catch (e: Throwable) {
+                        Log.w("WebGpuRenderer", "filter cleanup during recovery failed", e)
+                    }
+                    val platform = platformSurface
+                    if (platform == null || !platform.isValid || surfaceDetached) {
+                        platformSurface = null
+                        Log.w("WebGpuRenderer", "recovery has no live platform surface; next init() rebuilds it")
+                        noteRecoverySuccess()
+                        return@withLock true
+                    }
+                    createSurface()
+                    // A failed surface build loses the device it was created on - synchronously,
+                    // on the loss-callback executor - so a fresh `deviceLost` here means this
+                    // recovery never produced a usable device. Reporting success would have
+                    // reset the ladder and hidden the loop for the rest of the session.
+                    if (deviceLost) {
+                        noteRecoveryFailure()
+                        return@withLock false
+                    }
+                    noteRecoverySuccess()
+                    true
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.e("WebGpuRenderer", "recoverFromDeviceLoss failed", e)
+            noteRecoveryFailure()
+            false
+        }
+    }
+
+    /**
+     * Gives Dawn's deferred surface destruction wall-clock time to run: [GPUSurface.close] only
+     * drops our reference, and the `vkDestroySurfaceKHR` that actually disconnects the window is
+     * dispatched onto the instance's event loop. Called wherever a surface has just been closed
+     * and a new one may be built on the same window; a failed build loses the device it was
+     * created on, so this pump is what stands between recovery and the loop it used to feed.
+     */
+    private suspend fun pumpSurfaceTeardown() {
+        repeat(SURFACE_TEARDOWN_PUMPS) {
+            instance.processEvents()
+            delay(SURFACE_TEARDOWN_PUMP_MS)
+        }
+    }
+
+    /**
+     * Frees the device and adapter retired by the previous recovery. Holds [mutex]; runs on the
+     * render thread.
+     *
+     * The device gets [GPUDevice.destroy] and **never [GPUDevice.close]**. `close()` is the only
+     * thing in the whole pipeline that deletes the global refs the androidx.webgpu glue holds for
+     * a wrapper, and the glue constructs its callback runnables *at dispatch time* from those
+     * refs: `DeviceLostCallbackRunnable` / `UncapturedErrorCallbackRunnable` are built with
+     * `(callback, GPUDevice, …)` when Dawn flushes a pending record - which can be long after we
+     * parked the device, because a loss record queued but never dispatched (nothing drives a
+     * parked device) rides until some later command's processing flushes it. `close()` on a
+     * retired device deleted those globals out from under a still-pending record, and the next
+     * frame's `finish()` - which pumps the callback queue - aborted the process inside
+     * `NewObjectV` with ART's `JNI ERROR (app bug): accessed deleted Global`. Field evidence:
+     * Multilaser M8_4G, Android 11, double device loss in one pressure era (tombstone:
+     * `finish$default` → `submitAndRelease` → `NewObjectV`). So `destroy()` frees the GPU memory
+     * - the part that fed the loss loop - while the wrapper's global stays alive and any late
+     * record dispatches harmlessly (the stale-fire guard in [deviceDescriptor] keeps it from
+     * reaching the recovery ladder). The residue is the destroyed device's shell plus one Java
+     * wrapper per recovery: kilobytes, and recoveries are rare.
+     */
+    private fun destroyRetired() {
+        retiredDevice?.let { d ->
+            try {
+                d.destroy()
+            } catch (_: Throwable) {
+            }
+        }
+        retiredDevice = null
+        retiredAdapter?.let { a ->
+            try {
+                a.close()
+            } catch (_: Throwable) {
+            }
+        }
+        retiredAdapter = null
+    }
+
+    /** Cooldown bought by [failures] consecutive failed recoveries - see [recoverFromDeviceLoss]. */
+    private fun recoveryBackoffMs(failures: Int): Long =
+        if (failures <= 3) {
+            // Inside one loss-driven chain's own pacing (250/500/750 ms), so a chain's later
+            // attempts still get through.
+            300L * failures
+        } else {
+            minOf(1_500L shl (failures - 4), 30_000L)
+        }
+
+    /** Called under [mutex] when a recovery attempt did not produce a usable device. */
+    private fun noteRecoveryFailure() {
+        recoveryFailures++
+        val backoff = recoveryBackoffMs(recoveryFailures)
+        recoveryCooldownUntil = SystemClock.uptimeMillis() + backoff
+        Log.w("WebGpuRenderer", "recovery failed (consecutive: $recoveryFailures, next attempt in ${backoff}ms)")
+        if (recoveryFailures < RECOVERY_GIVE_UP_ATTEMPTS) {
+            scheduleRecoveryRetry(backoff)
+        } else if (recoveryFailures == RECOVERY_GIVE_UP_ATTEMPTS) {
+            Log.e(
+                "WebGpuRenderer",
+                "recovery gave up after $recoveryFailures consecutive failures; a later device-loss " +
+                    "event restarts the ladder"
+            )
+        }
+    }
+
+    /** Called under [mutex] when a recovery attempt produced a device that is alive at return. */
+    private fun noteRecoverySuccess() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastRecoverySuccessAt >= RECOVERY_STABLE_MS) {
+            recoveryFailures = 0
+        }
+        lastRecoverySuccessAt = now
+        notifyDeviceRecovered()
+    }
+
+    /**
+     * One self-healing retry after a failed recovery. The loss-driven chain that started the
+     * recovery gives up after its own attempts, and a failure inside the cooldown produces no
+     * new loss callback - without this the reader stayed dead until the user recreated it, even
+     * once the pressure that broke it had passed. The cooldown gate in [recoverFromDeviceLoss]
+     * keeps overlapping chains and retries from piling up; the ladder's give-up stops them.
+     */
+    private fun scheduleRecoveryRetry(delayMs: Long) {
+        if (!recoveryRetryScheduled.compareAndSet(false, true)) return
+        CoroutineScope(dispatcher).launch {
+            try {
+                delay(delayMs)
+                if (deviceLost || initError != null) recoverFromDeviceLoss()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+            } finally {
+                recoveryRetryScheduled.set(false)
+            }
+        }
+    }
+
+    /**
+     * Retry acquiring the device after [deviceLost] (or a failed init) instead of staying
+     * latched dead. Suspends on the render dispatcher under the render mutex, so it never runs
+     * against an in-flight frame. True when the device is usable afterwards.
+     */
+    suspend fun reinit(): Boolean {
+        if (isAvailable) return true
+        return try {
+            withContext(dispatcher) {
+                mutex.withLock {
+                    recreateDeviceLocked()
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.e("WebGpuRenderer", "reinit failed", e)
+            false
+        }
+    }
+
+    /** Device-only recreation shared by [reinit] and [recoverFromDeviceLoss]. Must hold [mutex]. */
+    internal suspend fun recreateDeviceLocked(): Boolean {
+        if (isAvailable) return true
+        return try {
+            // An adapter is consumed by the first requestDevice that succeeds on it, so the one
+            // that built the lost device can never build another - Dawn rejects it as "consumed",
+            // and with nothing re-requesting an adapter the renderer stayed unavailable for good.
+            adapter = instance.requestAdapter(
+                GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility)
+            )
+            device = requestDeviceBestEffort()
+            initialized = true
+            deviceLost = false
+            initError = null
+            deviceGeneration++
+            // A fresh adapter can report different limits, and this is read live by the upload
+            // paths, so it has to move with the device rather than keep the previous one's value.
+            maxTextureDimension2D = device.getLimits().maxTextureDimension2D
+            val core = runCatching {
+                device.getFeatures().features.contains(FeatureName.CoreFeaturesAndLimits)
+            }.getOrDefault(false)
+            Log.i(
+                "WebGpuRenderer",
+                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D core=$core)"
+            )
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.e("WebGpuRenderer", "recreateDevice requestDevice failed", e)
+            initError = e
+            false
+        }
+    }
+
+    /** Non-suspending best-effort [reinit] for callbacks that cannot suspend. */
+    fun requestReinit() {
+        try {
+            runBlocking(dispatcher) {
+                reinit()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w("WebGpuRenderer", "requestReinit dispatch failed", e)
+        }
+    }
+
+    /** Dispatches only when not already on the render thread, which would deadlock. */
+    private fun onRenderThread(block: () -> Unit) {
+        if (Thread.currentThread().name == "WebGPU-Render-Thread") {
+            block()
+        } else {
+            runBlocking(dispatcher) { block() }
+        }
+    }
+
+    private fun createSurface() {
+        if (surface != null) return
+        val pending = pendingSurface ?: return
+
+        // A transient layout pass can hand over a near-zero size; [resize] picks it up later.
+        if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) {
+            Log.w("WebGpuRenderer", "surface deferred at undersized ${width}x${height}")
+            return
+        }
+
+        val initSurface = initSurface@{
+            // A cleanup queued first let [pending] go; a surface from it would leak.
+            if (surface != null || pendingSurface !== pending) return@initSurface
+            val created = instance.createSurface(
+                GPUSurfaceDescriptor(
+                    surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
+                        safeWindowFromSurface(pending).also { acquired -> window = acquired }
+                    )
+                )
+            )
+            try {
+                created.apply {
+                    // Before the first latch, so the swapchain is configured knowing
+                    // whether float is even available.
+                    Hdr.resolve(this, adapter)
+                    // No images exist yet, so a previous session's stranded retains can go
+                    // without discarding a live one.
+                    Hdr.resetContent()
+                    Hdr.latchFrameFormat()
+                    configure(
+                        GPUSurfaceConfiguration(
+                            device,
+                            this@WebGpuRenderer.width,
+                            this@WebGpuRenderer.height,
+                            Hdr.frameFormat,
+                            TextureUsage.RenderAttachment
+                        )
+                    )
+                    this@WebGpuRenderer.configuredFormat = Hdr.frameFormat
+                }
+            } catch (e: Throwable) {
+                // Unassigned, so cleanup would never free either.
+                created.close()
+                if (window != 0L) {
+                    NativeWindow.release(window)
+                    window = 0L
+                }
+                throw e
+            }
+            this@WebGpuRenderer.surface = created
+        }
+
+        onRenderThread(initSurface)
+    }
+
+    suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): FrameResult {
+        if (!isAvailable) return FrameResult.Unavailable
+        val startTime = if (profilingEnabled) System.nanoTime() else 0L
+
+        mutex.withLock {
+            // Only [init]/[resize] can build one, so a redraw alone accomplishes nothing.
+            // KMK --> A surface a scheduled recreation just closed is a pause, not an outage:
+            // the recreate lands within a few frames (it pumps the teardown and rebuilds on this
+            // dispatcher), so Retry keeps the walk alive without reporting a failure the viewer
+            // asked for itself. KMK <--
+            val surface = surface ?: if (surfaceRecreateScheduled.get()) {
+                return FrameResult.Retry
+            } else {
+                return FrameResult.Unavailable
+            }
+            // [detachSurface] ran: the platform window is going away, so nothing may start a
+            // frame against it - the framework tears it down once the destroy callbacks return.
+            if (surfaceDetached) return FrameResult.Unavailable
+            // A stale surface from before a resize shrunk below this would otherwise still reach
+            // getCurrentTexture - [createSurface]/[reconfigure] refuse to configure one this small.
+            if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) {
+                return FrameResult.Unavailable
+            }
+
+            // Between frames and under the lock - the only place a rebuild is safe.
+            if (resizePending) {
+                resizePending = false
+                reconfigure(surface)
+            }
+
+            // An HDR image arriving, or the last one leaving, changes what the swapchain should
+            // be. Here rather than at the decode: the format can only change between frames, and
+            // this is the one place guaranteed to be between them - hence the latch too.
+            try {
+                Hdr.latchFrameFormat()
+                if (Hdr.frameFormat != configuredFormat) {
+                    reconfigure(surface)
+                    Hdr.syncPresentation()
+                } else if (Hdr.consumePresentationDirty()) {
+                    // Same format, but a brighter image arrived (or the brightest was freed), so
+                    // the headroom asked of the display has moved.
+                    Hdr.syncPresentation()
+                }
+            } catch (e: Exception) {
+                // Escaping would end the frame loop.
+                Log.e("WebGpuRenderer", "HDR presentation update failed", e)
+            }
+
+            val current = try {
+                surface.getCurrentTexture()
+            } catch (e: Exception) {
+                Log.w("WebGpuRenderer", "Failed to get current texture", e)
+                return FrameResult.Retry
+            }
+
+            // A non-success status hands back a null texture, and every GPUTexture read goes
+            // straight through its handle - so one segfaults rather than throws. Outdated means
+            // a window resize under a frame already in flight.
+            val texture = current.texture
+            if (!current.status.isSurfaceSuccess() || texture.handle == 0L) {
+                Log.w(
+                    "WebGpuRenderer",
+                    "No surface texture: ${SurfaceGetCurrentTextureStatus.toString(current.status)}"
+                )
+                // Lost needs a new surface: park until one arrives.
+                if (texture.handle != 0L) texture.close()
+                if (current.status == SurfaceGetCurrentTextureStatus.Lost) {
+                    surfaceErrorStreak = 0
+                    return FrameResult.Unavailable
+                }
+                // KMK --> A swapchain stuck in Dawn's error state never clears through
+                // [reconfigure] - configure only updates the descriptor on a surface whose WSI
+                // object is already broken. Escalate: ~half a second of consecutive Errors tears
+                // the surface down and rebuilds it (the one reset that gives the driver a fresh
+                // swapchain); twice that parks the loop with [FrameResult.Unavailable] so
+                // collect() reports once and the walk stops burning cycles against a surface
+                // that cannot draw. The park lasts until something else invalidates - a page
+                // decode, a resize, the user - at which point the ladder gets a fresh window.
+                // A Drawn frame resets everything.
+                // KMK <--
+                surfaceErrorStreak++
+                if (surfaceErrorStreak >= SURFACE_ERROR_GIVE_UP_STREAK) {
+                    Log.e(
+                        "WebGpuRenderer",
+                        "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
+                    )
+                    surfaceParkCount++
+                    surfaceErrorStreak = 0
+                    scheduleSurfaceRecreate()
+                    return FrameResult.Unavailable
+                }
+                if (surfaceErrorStreak == SURFACE_ERROR_RECREATE_STREAK) {
+                    Log.w(
+                        "WebGpuRenderer",
+                        "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
+                    )
+                    scheduleSurfaceRecreate()
+                }
+                reconfigure(surface)
+                return FrameResult.Retry
+            }
+            surfaceErrorStreak = 0
+
+            var encoder: GPUCommandEncoder? = null
+            try {
+                encoder = device.createCommandEncoder()
+                // RenderPage's masked-rect slot ring needs this frame's start to reset its count -
+                // see the ring's note for why slots must be distinct within one frame.
+                RenderPage.beginFrame()
+                // Draws into an offscreen texture when filters are enabled; endFrame runs them
+                // over it and lands the result on the swapchain.
+                fn(encoder, filters.beginFrame(texture))
+                filters.endFrame(encoder, texture)
+                // A device loss landing while [fn] above suspends (tile generation waits inside
+                // it) invalidates the native queue before this submit. The Kotlin deviceLost flag
+                // only flips when the loss callback runs, so the entry isAvailable gate cannot
+                // cover the gap - and submitting on the dead handle is a null-deref SEGV inside
+                // libwebgpu_c_bundled (Java_androidx_webgpu_GPUQueue_submit) that kills the
+                // process with no exception to catch. cleanup() holds the same rule: once the
+                // device is lost there is nothing to drive. Drop the frame; the app-side loss
+                // listener rebuilds and re-drives. UNVERIFIED: the residual window between this
+                // recheck and the JNI call cannot be closed from Kotlin.
+                //
+                // The platform surface has the same exposure, with one difference: [detachSurface]
+                // sets [surfaceDetached] from the surface-destroyed callback and then drains this
+                // very frame before returning - the framework holds the teardown until that
+                // callback returns - so this check, not the drain, is what actually stops a frame
+                // that was mid-draw when the surface went away. The isValid probe is a last
+                // backstop for teardowns that bypass the callback.
+                if (!isAvailable || surfaceDetached || platformSurface?.isValid == false) {
+                    val why = when {
+                        surfaceDetached -> "Surface detached mid-frame"
+                        platformSurface?.isValid == false -> "Platform surface invalid mid-frame"
+                        else -> "Device lost mid-frame"
+                    }
+                    Log.w("WebGpuRenderer", "$why; dropping frame")
+                    // Non-local return, like the other FrameResult exits above: the withLock
+                    // block's own value is discarded, so a return@withLock would fall through
+                    // to the FrameResult.Drawn tail.
+                    return FrameResult.Unavailable
+                }
+                device.queue.submitAndRelease(encoder)
+                encoder = null
+                surface.present()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("WebGpuRenderer", "Render error", e)
+                // Don't rethrow - allow the app to continue rendering next frame
+            } catch (e: OutOfMemoryError) {
+                Log.e("WebGpuRenderer", "Out of memory rendering", e)
+            } finally {
+                // Unsubmitted if the frame threw.
+                encoder?.close()
+                // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
+                texture.close()
+            }
+        }
+
+        if (profilingEnabled) {
+            val frameTime = System.nanoTime() - startTime
+            recordFrameTime(frameTime)
+            Log.d(
+                "WebGpuRenderer", "Frame: %.2fms | Avg: %.2fms | FPS: %.1f".format(
+                    frameTime / 1_000_000f, recentAvgFrameTimeMs, estimatedFps
+                )
+            )
+        }
+
+        return FrameResult.Drawn
+    }
+
+    /** Rebuild the swapchain at the size [init] was last given. Must hold [mutex]. */
+    private fun reconfigure(surface: GPUSurface) {
+        if (width < MIN_SURFACE_DIMENSION || height < MIN_SURFACE_DIMENSION) return
+        try {
+            surface.configure(
+                GPUSurfaceConfiguration(
+                    device, width, height, Hdr.frameFormat, TextureUsage.RenderAttachment
+                )
+            )
+            configuredFormat = Hdr.frameFormat
+        } catch (e: Exception) {
+            Log.w("WebGpuRenderer", "Failed to reconfigure surface", e)
+        }
+    }
+
+    fun cleanup() {
+        // Check if already on dispatcher thread to avoid deadlock
+        val isOnDispatcherThread = Thread.currentThread().name == "WebGPU-Render-Thread"
+
+        val doCleanup: suspend () -> Unit = {
+            mutex.withLock {
+                // Once the device is lost there is nothing to free, and calling into its objects
+                // crashed in native code.
+                if (!deviceLost) {
+                    filters.cleanup()
+                    surface?.close()
+                }
+                surface = null
+                // After the surface: Vulkan holds its own reference while its surface lives, so ours is the last.
+                if (window != 0L) {
+                    NativeWindow.release(window)
+                    window = 0L
+                }
+                pendingSurface = null
+                resizePending = false
+                // The same deferral as in [recoverFromDeviceLoss]: a viewer recreated right
+                // after this one (a reading-mode switch) inits on a window the closed
+                // surface may still own until the deferred destroy actually runs.
+                pumpSurfaceTeardown()
+            }
+        }
+
+        if (isOnDispatcherThread && mutex.isLocked) {
+            // The mutex holder is on this thread: blocking would deadlock.
+            CoroutineScope(dispatcher).launch { doCleanup() }
+        } else if (isOnDispatcherThread) {
+            // Already on dispatcher, run synchronously
+            runBlocking {
+                doCleanup()
+            }
+        } else {
+            runBlocking(dispatcher) {
+                doCleanup()
+            }
+        }
+    }
+}
+
+/** Suboptimal still draws - it only asks to be reconfigured eventually. */
+private fun Int.isSurfaceSuccess(): Boolean =
+    this == SurfaceGetCurrentTextureStatus.SuccessOptimal ||
+            this == SurfaceGetCurrentTextureStatus.SuccessSuboptimal

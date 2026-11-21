@@ -1,0 +1,207 @@
+# RENDERER PACKAGE KNOWLEDGE BASE
+
+## OVERVIEW
+GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled filtered-render cache with stencil masking, live page draw, mipmaps, rescalers, fullscreen pass.
+
+## WHERE TO LOOK
+| Task | Location | Notes |
+|------|----------|-------|
+| Device/adapter/instance, render thread, frame profiling | `WebGpuRenderer.kt` | companion singleton; `dispatcher` = single-thread "WebGPU-Render-Thread"; `isOnRenderThread()`; `mutex`/`withContext` gate GPU work |
+| Tile cache, stencil, prewarm, generation | `TileRenderer.kt` | ~2100 lines; densest invariant prose comments in the repo. Read header + `gridPlacement`/`drawCore` docs before touching |
+| Live page draw (fast + filtered) | `RenderPage.kt` | 3 shader variants: `samplerVariant` (stencil-tested), `plainVariantMasked` (no-op stencil), `plainVariant` (stencil-free) |
+| Image upload / placement math | `Image.kt` | `prepareForRender` placement; `solveImagePlacement` (TileRenderer.kt) inverts it |
+| Mipmap chain | `Mipmap.kt` | |
+| Tile resize chain | `Rescaler.kt` | `Upscaler`/`Downscaler` base; 4 calls per tile, in order, on tile worker |
+| Magnify upscaler | `UpscalerCatmullRom.kt` | also the fallback for zoom other upscalers leave over |
+| ArtCNN upscaler | `UpscalerArtCnn.kt` | 9 compute passes, luma only, 8x8 workgroups, premultiplied output |
+| Shrink downscaler | `DownscalerBox.kt` | |
+| Fullscreen triangle | `Fullscreen.kt` | shared with `filter` package |
+
+## CONVENTIONS (differs from parent)
+- **A 0x0 surface callback must not write the stored dimensions.** `init` and `resize` refuse
+  any size below `MIN_SURFACE_DIMENSION`: a surface created before its view is laid out, or
+  mid-teardown (e-ink readers do this on every refresh-mode switch), reported 0x0, and storing
+  that zero made every later `homeScale` computation take its degenerate 0.01 branch — pages
+  attached in the window latched a scale of 0.01 and drew at a few dozen pixels (field: e-ink
+  "swipe back, swipe forward, page is now tiny"). Keep the previous dimensions and let the real
+  resize callback move them. The same rule lives app-side (`WebGpuZoom.kt` must not latch
+  maxScale from a parentless page) and in `ImagePage`'s parent setter (the home init defers to
+  `attach` when the state is unsized). Sentinel fallbacks are returned, never stored.
+- **The device requests `core-features-and-limits` whenever the adapter exposes it** (KMK island
+  in `requiredFeaturesFor`). `FeatureLevel.Compatibility` is still requested - that is the
+  adapter's mode, not the device's - but the device itself then runs core WebGPU and the
+  compatibility restrictions stop applying: 128-invocation workgroups, 16384-byte uniform
+  buffers, 15 inter-stage variables, storage buffers barred from the vertex stage, and
+  16 texture+sampler combinations per stage. Field evidence (2026-11, Adreno 6xx and
+  Mali bifrost webgpureport exports) is that every shipping adapter in the field lists
+  `core-features-and-limits`, so compat mode was pure restriction with no benefit. A
+  pipeline that exceeds a compat limit fails validation with no exception on the draw
+  path - a frame that draws nothing. Devices without the feature (the compat plateau)
+  keep the old behaviour; check `core=true` in the init log line when comparing field
+  reports. Dawn reports the upgraded device's limits directly, so none of the
+  `maxTextureDimension2D` clamping work changes.
+- Everything here is touched only on the render thread; `cleanup` may be called from any thread and posts its work there.
+- Stencil is a ring buffer of 3 textures (`STENCIL_BUFFER_COUNT`), never one shared texture: a rotated stencil must not still be in flight from a prior frame.
+- Grid snaps to the nearest screen pixel so every blit is an exact 1:1 texel copy; tile bind groups/uniforms are created once at generation, only the anchor/clip uniform is rewritten.
+- Generation runs on the render thread but outside the render mutex, a few tiles at a time with a suspend between batches; pending tiles pull on-screen-first, centre-out.
+- **An incomplete grid at rest is held, not revealed progressively** (`drawCore`'s `holdIncomplete`).
+  Tiles pull centre-out, and blitting each one as it lands turns a page open into a ripple from
+  the middle of the screen — very visible on e-ink, where a partial refresh flashes its region.
+  When the camera is still (the placement is float-identical to the previous draw) and any visible
+  tile is missing or dropped for its filtered re-cut, the blit is skipped and `drawCore` returns
+  false so the caller's fast full-page path shows; once coverage is complete the whole grid is
+  blitted in one switch. While the camera moves, progressive blitting stays. The hold is bounded
+  by `HOLD_INCOMPLETE_MAX_FRAMES` so a budget too small for one viewport degrades instead of
+  pinning the fast path forever. `renderFullyTiled`/`blitAvailableTiles` deliberately pass
+  `holdIncomplete = false` — transitions need their progressive seed.
+- One grid per whole `ImagePage.ImageSingle`, not per image: a spread's seam bakes into whichever tile straddles it.
+- Rescaler applies only when `factor > 1 && supported && appliesAt(scale) && fits(tileSize)`; what it declines resolves in one step.
+- Tile cache budget 16-64 MB; `cacheScreens` coerced to 0.5-3.0; `onLowMemory()` shrinks and
+  evicts, `restoreMemoryBudget()` puts the pre-shrink value back.
+- **`cacheByteBudget` (host-set, 0 = derive from `cacheScreens`) overrides the screens path
+  entirely.** At or above ~1440p the 16-64 MB `coerceIn` is what actually sized the atlas, so
+  tuning `cacheScreens` there did nothing — which is why a host that knows its memory class now
+  supplies bytes instead.
+- **A shrink applies immediately, a grow re-cuts the atlas.** `maxTileBytes` takes
+  `minOf(allocated, budgetTiles())` so eviction honours a lowered budget without reallocating; the
+  atlas itself is one fixed allocation latched in `atlasSide`, so growth arms
+  `atlasGrowthPending` and `newFrame` tears it down and re-cuts — the only point in a frame where
+  no caller holds a grid.
+- **`onLowMemory` scales whichever budget is in force**, not just `cacheScreens` — `budgetTiles`
+  ignores screens once a host sets bytes, so shrinking screens there would silently shed nothing.
+- **`drawMaskedRect` draws from a frame-counted ring, and `WebGpuRenderer.render()` feeds it.**
+  Every background rect per page per frame (the continuous underlay is the reader's most frequent
+  one) used to build a fresh `GPUBuffer` + bind group; the ring (`maskedRectSlots`) serves them
+  with `Mipmap.tileUniformFor`'s persistent-buffer precedent instead. `RenderPage.beginFrame()`
+  is called once per encoded frame — the count resets there, slots are distinct only *within
+  one frame* (two `writeBuffer` calls before a submit make every draw the buffer serves read the
+  last colour), draws past `MASKED_RECT_RING` fall back to the one-shot pair, and the ring is
+  dropped when `deviceGeneration` moves. A second render entry point must call
+  `RenderPage.beginFrame()` too.
+- **A `getCurrentTexture` status of `Error` is a wedged swapchain, not a transient retry**
+  (KMK island in `WebGpuRenderer.render`). Field evidence (PowerVR/Android 11, Multilaser M8_4G):
+  the swapchain can be born wedged — `Error` on every frame from the first one, while `configure`
+  keeps succeeding — and `reconfigure` can never clear it, because configure only updates the
+  descriptor on a surface whose WSI object is already broken. `render` counts the consecutive
+  failed frames: at `SURFACE_ERROR_RECREATE_STREAK` (30) it schedules
+  `scheduleSurfaceRecreate()` (close the WGPU surface, release and re-acquire the window, pump the
+  deferred teardown, rebuild — the device and the tile grids stay valid, unlike a device-loss
+  recovery); at `SURFACE_ERROR_GIVE_UP_STREAK` (120) it returns `FrameResult.Unavailable` so
+  `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface that
+  cannot draw. Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never
+  "fix" an Error streak by reconfiguring harder — the surface object itself has to go away.
+- **A park leaves a count behind: `surfaceParkCount` (instance-scoped, `@Volatile`, monotonic).**
+  The give-up path parks and then goes quiet, so a host watching only `isAvailable` saw a session
+  that spent its whole life parked close looking healthy (the PowerVR black-screen shape).
+  `render` increments the counter when it parks — render-thread only — and hosts snapshot it at
+  viewer construction and diff the two reads at teardown. Never reset it anywhere, `init()` and
+  recovery included: the caller's own snapshot is what scopes the count to one session, and a
+  reset would launder a parked lifetime into a healthy one. The `Lost` status and the
+  detach/dead-device `FrameResult.Unavailable` returns deliberately do not count: those are
+  device-loss shapes with strike paths of their own.
+
+## ANTI-PATTERNS
+- Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.
+- **Do not return `maxTileBytes` to `atlasBudgetTiles` alone.** That figure is the atlas's allocation, not the policy; a lowered `cacheByteBudget` would then only bind after a full surface rebuild.
+- **`Display.registerHdrSdrRatioChangedListener` throws `IllegalStateException` unless `isHdrSdrRatioAvailable`.** Gate registration on that flag, not on a non-null display — otherwise every surface creation on an SDR-only panel logs a full stack trace for the display's own correct answer.
+- Prewarmed-never-drawn pages blit a stale clip rect: `prewarm`'s tiles leave the wanted range empty, and it once silently missed a step `drawCore`/`availableTileKeys` had. Keep one shared definition (`forEachTile`/`gridPlacement`); never fork a copy.
+- Stencil writes 1: `blitPipelineStencilWrite` writes 1 wherever it draws; `RenderPage.samplerVariant` tests `NotEqual` against 1 so a pixel the blit already wrote is skipped, not shaded twice.
+- Transition caches bypass stencil: the transition cache-seed pass has no stencil attachment at all. Use `plainVariant` (stencil-free) there; `plainVariantMasked` only declares a no-op stencil so it is valid inside a stencil-attached pass. A stencil-free pass cannot just gain one.
+- `TimestampQuery` absent means `generate()` returns null: `timestampsSupported` gates measurement, so `generate(req, scope): Job?` yields null and callers must handle it (`blitAvailableTiles` falls back to `workerScope`, fire-and-forget). Never assume a Job came back.
+- `CompareFunction.Always` is code, not a marker: it is the real depth/stencil compare in pipeline descriptors (RenderPage.kt, TileRenderer.kt). Grep false positive, not a TODO.
+- Never reuse a single stencil texture across frames; never add a stencil attachment to a pass that has none (transitions).
+- **Never let the `drawMaskedRect` ring wrap inside one frame.** Distinct slots only hold between two
+  writes to one buffer when a submit separates them, and `writeBuffer` never lands between a
+  submitted frame's commands — so the per-frame count (`RenderPage.beginFrame`) is the load-bearing
+  reset. A frame that would exceed `MASKED_RECT_RING` already falls back to one-shot
+  allocate-and-close; keep that fallback rather than rotating modulo the ring size.
+- **`Draw.rect`/`Draw.circle` allocate a buffer per call by design** — their rect count per frame is
+  unbounded (transitions, procedural placeholder pages), so they cannot adopt the guard-free ring.
+  Transient paths first; only move them onto persistent slots once a per-frame ceiling exists.
+- **Clamp every texture dimension the code chooses to `WebGpuRenderer.maxTextureDimension2D` — a
+  hardcoded 8192 is a per-frame rejection on a cap device, not a conservative bound.** Observed
+  case: a PowerVR Rogue in Compatibility mode reports `maxTextureDimension2D = 4096`, and every
+  texture the renderer sized itself at 8192 failed `createTexture`: the *surface* (`init`/`resize`
+  now clamp through `surfaceDimensionCap()` — the swapchain's canvas reads back as a texture of
+  exactly the configured size), the transition caches (per-page-turn `ensureTextures create failed`
+  for the whole session), the filter pool (`acquire`, whose `beginFrame` catch then silently
+  disabled filters for the session), the tile atlas (`atlasSide`) and the font atlas
+  (`growAtlas`/`addGlyph`). All five now clamp at
+  `minOf(8192, WebGpuRenderer.maxTextureDimension2D)`. The limit is re-queried from
+  `device.getLimits()` in companion init and on every `recreateDeviceLocked`, so it tracks
+  whichever adapter is live — read it per call, never cache it (a fresh adapter after recovery can
+  report different limits).
+- **A capped tile atlas degrades exactly like a full one: `TileAtlas.acquire` returns -1 and the
+  tile is dropped for now.** `atlasSide()` floors the device-capped side to whole `SLAB_SIZE`
+  slabs, so a budget the capped side cannot fit takes the same path a merely-full atlas takes
+  instead of making every tile request fail. `atlasBudgetTiles` still records the *requested*
+  budget even when the side is capped — it is what the budget now is, not what the atlas holds —
+  so a cap cannot loop a grow-through-`newFrame` regen.
+- **A glyph past the font-atlas cap renders advance-only, and that result is cached for the
+  session.** `addGlyph` returns a bare-advance `Glyph` (`hasQuad = false`, exactly like a space)
+  when the raster exceeds the cap *or* no longer fits the shelf after `growAtlas` clamped — the
+  post-grow re-check is what stops it blitting past the (smaller) texture and CPU mirror.
+  `growAtlas` returns early when the cap leaves the requested size unchanged, rather than
+  re-creating the same texture again.
+- **Never build a surface on a window whose old surface was closed without pumping
+  `instance.processEvents()` first.** `GPUSurface.close()` drops only our reference; Dawn
+  defers the `vkDestroySurfaceKHR` that disconnects the window onto the instance event loop,
+  and `createSurface()` on a still-connected window fails `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` —
+  which loses the *fresh* device at birth, fires its loss callback, and (before the recovery
+  ladder existed) looped: one new device per second, 90 generations in the field log. Both
+  `recoverFromDeviceLoss` and `cleanup()` now call `pumpSurfaceTeardown()` after dropping the
+  surface and window. Any new path that closes a surface and may later build one on the same
+  window needs the pump too.
+- **The surfaceDestroyed callback is the framework's last wait before the window dies — drain
+  the frame in flight there (`detachSurface`).** Compose's `dispatchSurfaceDestroyed` runs the
+  `Surface.onDestroyed` hooks first and then cancels the render job without waiting for it, and
+  the framework dismantles the window - its BufferQueue and every gralloc buffer behind the
+  swapchain images - as soon as the callbacks return. A cancellation only lands at a suspension
+  point, so a frame already past its last one (the fast tile path suspends only while
+  generating) ran its whole `render` tail - submit and present - into that teardown: a barrage
+  of `GraphicBufferAllocator: Failed to allocate (4 x 4) format 59` failures, then a SIGABRT
+  inside `GPUQueue_submit` on device rotation. `detachSurface` (wired through
+  `ViewerSurface`'s `Surface.onDestroyed`, registered before the host block's first suspension
+  so nothing can destroy a surface ahead of it) sets the `surfaceDetached` gate and drains the
+  in-flight frame on the render mutex under a timeout before returning; `render()` refuses new
+  frames at entry and re-checks at the submit. `init()` clears the gate only for a surface the
+  framework has not already invalidated (`surface.isValid`), so a surface destroyed between its
+  create callback and the block's first resume cannot clear its own detach. Rule: any new
+  surface entry point must keep that registration and these two gates; the submit-side gate is
+  what actually stops the frame that was mid-draw, because the drain is the thing waiting on
+  it.
+- **Retired devices are freed one recovery cycle later, and freed with `destroy()` alone — never
+  `close()`.** The `GPUDevice`/`GPUAdapter` wrappers hold native references with no finalizer
+  behind them (see `Release.kt`), so `recreateDeviceLocked`'s bare reassignment leaked a whole
+  Dawn device per recovery — the loss loop's memory pressure fed itself. `recoverFromDeviceLoss`
+  parks the dead handles in `retiredDevice`/`retiredAdapter` and `destroyRetired()` frees them at
+  the start of the *next* recovery: mid-flight continuations read `device` from the companion when
+  they resume (see `onDispatcher`), so the safe free point is a full cycle later, under the render
+  mutex. But `close()` is also the only thing that deletes the global refs the androidx.webgpu
+  glue holds for a wrapper, and the glue constructs its callback runnables **at dispatch time**
+  from those refs — `DeviceLostCallbackRunnable` is built with `(callback, GPUDevice, …)` when
+  Dawn flushes a pending record, which can be long after we parked the device, because a loss
+  record queued but never dispatched (nothing drives a parked device) rides until a later
+  command's processing flushes it. `destroyAndRelease()` on a retired device deleted those
+  globals out from under a still-pending record, and the next frame's `finish()` — which pumps
+  the callback queue — aborted the process inside `NewObjectV` with ART's
+  `JNI ERROR (app bug): accessed deleted Global` (field: double device loss in one pressure era,
+  Multilaser M8_4G / Android 11). So `destroyRetired()` calls `destroy()` — which frees the GPU
+  memory that fed the loss loop — while the wrapper's global stays alive for any late dispatch;
+  `deviceDescriptor()`'s stale-fire guard (ignore a loss callback whose device is not the
+  companion's current one) keeps that dispatch from reaching the recovery ladder. `Release.kt`
+  deliberately defines no `GPUDevice.destroyAndRelease()`.
+- **`::device.isInitialized` is prohibited from the instance class.** The companion's lateinit
+  vars cannot be checked with a `::`-reference from outside the companion ("backing field is
+  not accessible at this point" — the field belongs to the companion instance). Use the
+  companion helpers `deviceOrNull()` / `adapterOrNull()` instead; the same rule is why
+  `isAvailable`'s getter lives inside the companion.
+- **A recovery that lost its device at birth must report failure.** After `createSurface()` the
+  recovery re-reads `deviceLost`: a failed surface build loses the fresh device synchronously on
+  the loss-callback executor, and returning `true` for that case reset the app-side failure
+  counting and hid the loop. The recovery ladder itself (`recoveryFailures` /
+  `recoveryCooldownUntil` / `scheduleRecoveryRetry` / `RECOVERY_GIVE_UP_ATTEMPTS`) lives in
+  `WebGpuRenderer`; hosts hear about silent successes through `DeviceRecoveredListener` — the
+  loss callback fires once, but the self-healing retries that later succeed are silent, and a
+  host that only listens for losses keeps pages that failed to decode while the device was dead
+  on their `ErrorPage`.
