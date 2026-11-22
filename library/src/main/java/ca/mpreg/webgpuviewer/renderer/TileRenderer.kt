@@ -1858,10 +1858,15 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             st.pending.clear()
             return false
         }
-        // Off screen: nothing to draw, so nothing for tiles to be missing either.
+        // Off screen: nothing to draw - and therefore nothing covered either. Answering `true`
+        // here told `ImagePage.ImageSingle.drawLive` the tiles had painted the page, so it
+        // skipped `renderPage`, and a page whose grid placement collapsed stayed invisible with
+        // no error and no log line anywhere. Whether the page really is off screen is the
+        // caller's placement to prove; letting the fast path draw it off screen costs one quad,
+        // and a page that is actually visible can never be lost to a degenerate placement again.
         if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) {
             st.pending.clear()
-            return true
+            return tileCoverage(placementEmpty = true, blitted = false, missingVisible = false)
         }
 
         val ts = gp.ts
@@ -1944,7 +1949,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
         st.heldFrames = 0
 
-        drawInstanced(pass, dst.format, st, useStencilMask)
+        val blitted = drawInstanced(pass, dst.format, st, useStencilMask)
 
         // Drop what fell outside the wanted range, else a page scrolling past keeps accumulating
         // tiles. Only when the range moved - a scroll crosses a tile boundary every tile-size
@@ -1965,22 +1970,34 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         if (st.pending.isNotEmpty()) schedule()
-        return !missingVisible
+        // "Covered" means the tiles painted this frame. A grid with nothing missing but nothing
+        // blitted (no instance buffer yet, or a count over capacity) used to answer `true` and
+        // make the page invisible - see [tileCoverage] and [drawInstanced].
+        return tileCoverage(
+            placementEmpty = false,
+            blitted = blitted,
+            missingVisible = missingVisible,
+        )
     }
 
     /**
      * Blit [st]'s cached tiles as one instanced draw. A frame that only moved the grid uploads
      * nothing - that lives in the uniform.
+     *
+     * Returns whether the pass was actually handed an instance list this frame. Callers must not
+     * report the page as covered off a `false` here: an early return leaves the destination
+     * untouched, and telling `ImagePage.ImageSingle.drawLive` the tiles painted everything is
+     * what made a page stay invisible with no error anywhere.
      */
     private fun drawInstanced(
         pass: GPURenderPassEncoder, format: Int, st: PageTiles, useStencilMask: Boolean
-    ) {
+    ): Boolean {
         if (st.instancesDirty) uploadInstances(st)
-        val instances = st.instances ?: return
-        if (st.instanceCount == 0) return
+        val instances = st.instances ?: return false
+        if (st.instanceCount == 0) return false
         if (st.instanceCount > st.instanceCapacity) {
             Log.w(TAG, "drawInstanced count=${st.instanceCount} > capacity=${st.instanceCapacity}")
-            return
+            return false
         }
 
         if (useStencilMask) {
@@ -1992,6 +2009,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         pass.setBindGroup(0, st.bindGroup ?: gridBindGroup(st).also { st.bindGroup = it })
         pass.setVertexBuffer(0, instances)
         pass.draw(6, st.instanceCount)
+        return true
     }
 
     /**

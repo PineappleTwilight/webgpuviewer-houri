@@ -68,7 +68,20 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   paints it. The pass itself is wrapped too (`beginLivePass`): a device that cannot provide the
   **Stencil8 attachment** throws one line earlier, and the fast path is the only render path in
   this library that opens no stencil pass at all. Do not remove either catch; "the tiles and the
-  mask are only an optimization" is precisely the invariant they protect.
+  mask are only an optimization" is precisely the invariant they protect. **And the other half of
+  that invariant is what `tiles.draw` is allowed to answer**: it may return covered only when it
+  blitted this frame. A grid that answered `true` after painting nothing (an empty placement, or
+  no instance buffer) skipped `renderPage` and left the page invisible with no error — the 2026-11-22
+  black-page shape. `TileRenderer.drawCore` now requires an actual blit; if you add a "nothing to
+  draw" early return, it must answer `false`, never `true`.
+- **The page is painted *under* the tiles, every frame — the tile cache is an overlay, never a
+  substitute.** `ImageSingle.drawLive` paints the page with `renderPage` unconditionally and then
+  blits the tile cache over it. It used to paint the page only when the grid answered "not
+  covered", which made the page's visibility a function of the tile path's honesty: any wrong
+  answer (an empty placement, no instance buffer, a count over capacity) or any blit whose pixels
+  did not land left a black page with no error — the 2026-11-22 report. The cost is one textured
+  page quad per frame per page, which is what the pre-tile renderer did and what every non-WebGPU
+  viewer does. **Do not reintroduce the skip**: `covered` may decide prewarming and nothing else.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and

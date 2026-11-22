@@ -1073,7 +1073,33 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                 drawable.forEach { d ->
                     val page = d.page
                     val crop = d.vp.crop
-                    // KMK --> The chained slot edges are the authoritative clip for an uncropped
+                    // KMK --> The page is painted under the tiles on every frame, the same rule
+                    // the paged path now follows (see ImagePage.ImageSingle.drawLive): the tile
+                    // cache is an overlay, never a substitute. `covered` used to decide whether
+                    // the page was drawn at all, so a grid that answered "covered" after landing
+                    // no pixels left the page showing nothing but its background rect - the
+                    // black-screen shape on the continuous viewer. `covered` now only decides
+                    // whether the neighbours may prewarm.
+                    //
+                    // It must come BEFORE tiles.draw: the tiles are the sharp cut and have to be
+                    // the top layer, or drawing the page after them would paint over them.
+                    d.placed.forEach { placed ->
+                        val image = placed.image
+                        if (page.isAnimated || page.highQuality) {
+                            RenderPage.renderFast(
+                                pass, image, texture, placed.x, placed.y, placed.imageScale,
+                                src = placed.src,
+                            )
+                        } else {
+                            RenderPage.renderFast(
+                                pass, image, texture, placed.x, placed.y, placed.imageScale,
+                                linear = false,
+                                src = placed.src,
+                            )
+                        }
+                    }
+                    // KMK -->
+                    // The chained slot edges are the authoritative clip for an uncropped
                     // page: both neighbours of a boundary clamp at the same float, so the
                     // pixel-centre rule always gives the boundary row to exactly one of them
                     // (see captureRenderState's chain note). A cropped page keeps the derived
@@ -1095,23 +1121,6 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                         } else null,
                     )
                     if (!covered && page.highQuality && !page.isAnimated) allCovered = false
-                    if (!covered) {
-                        d.placed.forEach { placed ->
-                            val image = placed.image
-                            if (page.isAnimated || page.highQuality) {
-                                RenderPage.renderFast(
-                                    pass, image, texture, placed.x, placed.y, placed.imageScale,
-                                    src = placed.src,
-                                )
-                            } else {
-                                RenderPage.renderFast(
-                                    pass, image, texture, placed.x, placed.y, placed.imageScale,
-                                    linear = false,
-                                    src = placed.src,
-                                )
-                            }
-                        }
-                    }
 
                     if (page.fade < 1f) {
                         val top = anchorY + s.scale * d.vp.docTop

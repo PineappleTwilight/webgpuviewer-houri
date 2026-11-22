@@ -343,6 +343,24 @@ open class ImagePage {
          */
         open var highQuality: Boolean = true
 
+        /**
+         * KMK --> The page is painted directly, every frame, *under* the tiles.
+         *
+         * The tile cache is an overlay: `tiles.draw` blits sharp tiles wherever it has them and
+         * the page's own texture shows everywhere else. The library's "the fast path underneath
+         * is already a complete, correctly positioned page" comment always claimed this, but the
+         * direct draw used to run only when the tile path *answered* it had covered nothing - so
+         * the page's visibility was a function of the grid's honesty. Any wrong answer (an empty
+         * placement, no instance buffer, a count over capacity), and any blit whose pixels did
+         * not land (a rejected pass, a bad atlas region, a transparent tile), left a black page
+         * with no error anywhere. That is the 2026-11-22 black-screen report.
+         *
+         * Drawing it unconditionally costs one textured page quad per frame per page, which is
+         * exactly what the pre-tile renderer did and what every non-WebGPU viewer does; the
+         * tiles still supply the sharpness. A page can no longer be missing from the frame for
+         * any reason owned by `TileRenderer`.
+         * KMK <--
+         */
         override val width: Int
             get() = image?.width ?: 0
         override val height: Int
@@ -554,9 +572,9 @@ open class ImagePage {
          * As [ImagePage.drawLive]. Animated frames always want the fast path regardless of
          * [highQuality] (never worth a tile cache that would just churn every frame); a
          * non-[highQuality], non-animated page falls back to the plain [renderWith] (via `super`);
-         * everything else goes through the tile cache, backfilling with [renderPage] wherever it
-         * isn't covered yet. Opens its own pass (with a stencil attachment, for [TileRenderer]'s
-         * masking) rather than sharing one from the caller - see [Render] for why that split exists.
+         * everything else paints the page itself and then blits the tile cache over it. Opens its
+         * own pass (with a stencil attachment, for [TileRenderer]'s masking) rather than sharing
+         * one from the caller - see [Render] for why that split exists.
          */
         override fun drawLive(
             encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
@@ -600,11 +618,15 @@ open class ImagePage {
             }
             try {
                 // Background always drawn live first (its fades are position-dependent, never
-                // from a stale tile) so it stays underneath everything else. Tiles draw next,
-                // marking every pixel they cover in the stencil buffer tiles.draw() writes to;
-                // renderPage then only shades what's left uncovered instead of the whole
-                // viewport, since tiles.draw() already produced the right pixel wherever it drew.
+                // from a stale tile) so it stays underneath everything else.
                 renderBackground(pass, dst, 0f, 0f, 1f)
+                // KMK --> The page itself is painted every frame, under the tiles. The tile cache
+                // is an overlay, never a substitute: see the note on [ImageSingle] for the
+                // black-screen report that made this unconditional.
+                renderPage(pass, dst, 0f, 0f, 1f)
+                // Tiles draw next, marking every pixel they cover in the stencil buffer
+                // tiles.draw() writes to. Where they paint they supply the sharp cut; where they
+                // don't, the page above shows through.
                 // KMK --> A tile-pipeline failure must not take the page down with it. The tile
                 // cache is an optimization; `renderPage` is the same content drawn directly from
                 // the page's own textures. On a driver that rejects a tile atlas/pipeline
@@ -621,9 +643,6 @@ open class ImagePage {
                         e
                     )
                     false
-                }
-                if (!covered) {
-                    renderPage(pass, dst, 0f, 0f, 1f)
                 }
                 if (fade < 1f) fadeRect(dst)?.let {
                     drawFade(

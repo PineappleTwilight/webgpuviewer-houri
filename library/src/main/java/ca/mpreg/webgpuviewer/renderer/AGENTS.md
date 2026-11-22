@@ -115,6 +115,24 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   reset would launder a parked lifetime into a healthy one. The `Lost` status and the
   detach/dead-device `FrameResult.Unavailable` returns deliberately do not count: those are
   device-loss shapes with strike paths of their own.
+- **The only proof that anything reached the display is `presentedFrames` (instance-scoped,
+  `@Volatile`, monotonic), incremented after `surface.present()` returns.** Every other "drawn"
+  signal in the stack is a claim made *before* the frame is submitted — the viewer publishes its
+  on-screen page set in `captureRenderState`, ahead of `render()` — which is how a session that
+  never presented a frame still reported `drawn=true` in the 2026-11-22 black-screen report. Hosts
+  snapshot this counter at construction and diff it at teardown; `frames=0` with pages decoded is
+  the never-presented shape, `frames>0` with nothing on screen is the drew-but-invisible one. Do
+  not reset it (same rule as `surfaceParkCount`) and do not substitute a frame *attempt* for it:
+  a `Retry`, an `Unavailable`, or a draw that threw are all frames that never presented.
+- **`TileRenderer.draw`/`drawCore` may answer "covered" only when it actually blitted.** The
+  answer is what makes `ImagePage.ImageSingle.drawLive` skip `renderPage` for the rest of the
+  frame, so a `true` after painting nothing is a black page with no error anywhere. Two such
+  answers were open until 2026-11-22: the empty-placement branch ("off screen, nothing to draw"
+  → `true`) and a grid with nothing missing but nothing blitted (`drawInstanced` early-returns on
+  no instance buffer or a count over capacity; `drawCore` then returned `!missingVisible`).
+  `drawInstanced` now reports whether it drew and the empty-placement branch answers `false`, so
+  the direct page draw always paints in those cases. Keep the rule: coverage is a fact about
+  pixels written this frame, never about what the grid *believes* it has.
 
 ## ANTI-PATTERNS
 - Never touch `TileRenderer` without reading its invariant prose comments (header, `gridPlacement`, `drawCore`). They document why things are the way they are.

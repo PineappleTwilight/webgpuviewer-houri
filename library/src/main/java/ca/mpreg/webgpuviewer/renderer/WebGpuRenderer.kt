@@ -673,6 +673,24 @@ class WebGpuRenderer {
         private set
 
     /**
+     * KMK --> How many frames actually reached `present()`: encoded, submitted to the queue and
+     * handed to the surface. Monotonic per renderer instance; hosts snapshot it at viewer
+     * construction and again at session end and diff the two reads, exactly like
+     * [surfaceParkCount].
+     *
+     * This is the only counter that can tell "the display was never written" from "the display
+     * was written and the page was invisible", and no earlier field log could distinguish them:
+     * the app's `anyPageDrawn` is set by the render *walk* before the frame is submitted, so a
+     * session that never presented a single frame still reported `drawn=true`. A black screen
+     * with `frames=0` is a renderer/surface defect; the same screen with `frames>0` is a draw or
+     * compositing defect. Render thread only; volatile because hosts read it.
+     * KMK <--
+     */
+    @Volatile
+    var presentedFrames = 0L
+        private set
+
+    /**
      * KMK --> Whether a [scheduleSurfaceRecreate] pass is queued or running, so [render] treats a
      * momentarily absent surface as Retry (the recreate finishes within a few frames) instead of
      * reporting an outage for a reset it asked for itself.
@@ -1288,6 +1306,11 @@ class WebGpuRenderer {
                 device.queue.submitAndRelease(encoder)
                 encoder = null
                 surface.present()
+                // KMK --> Counted only after the present returns, so the counter means "the
+                // surface was handed this frame". See the field's own note for why a session
+                // report needs it.
+                // KMK <--
+                presentedFrames++
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
