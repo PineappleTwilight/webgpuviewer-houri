@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import androidx.webgpu.BackendType
 import androidx.webgpu.DeviceLostCallback
 import androidx.webgpu.FeatureLevel
 import androidx.webgpu.FeatureName
@@ -87,6 +88,16 @@ class WebGpuRenderer {
         // breath. 120 is the point where retrying has been proven futile four times over.
         private const val SURFACE_ERROR_RECREATE_STREAK = 30
         private const val SURFACE_ERROR_GIVE_UP_STREAK = 120
+
+        /**
+         * Consecutive frames whose draw threw before the frame loop is asked to park. A thrown
+         * draw used to fall through to `FrameResult.Drawn` - the submit was skipped, so nothing
+         * reached the display, yet the viewer reset its streak and kept treating the session as
+         * healthy. A deterministic pipeline failure then presented as an eternal black screen
+         * with no park, no retry and no strike. ~0.5 s at 60fps gives a transient allocation
+         * failure a few chances before the failure is reported.
+         */
+        private const val DRAW_FAILURE_GIVE_UP_STREAK = 30
         // KMK <--
 
         /**
@@ -104,6 +115,25 @@ class WebGpuRenderer {
         lateinit var instance: GPUInstance
         lateinit var adapter: GPUAdapter
         lateinit var device: GPUDevice
+
+        /**
+         * KMK --> One line naming the adapter as the driver reports it. The backend is the fact
+         * every field report needs and no current log carries: Dawn on Android may run Vulkan or
+         * fall back to OpenGLES, and a shader/pipeline defect can be backend-specific (PowerVR's
+         * Vulkan driver is the one with the documented mip/dynamic-rendering bugs; its GLES
+         * driver is a different compiler with different failures). Written at init and after
+         * every device recreation, read by the app's session header and diagnostics.
+         * KMK <--
+         */
+        @Volatile
+        var adapterDescription: String = "unknown"
+            private set
+
+        private fun describeAdapter(adapter: GPUAdapter): String = runCatching {
+            val info = adapter.getInfo()
+            "vendor=${info.vendor} arch=${info.architecture} device=${info.device} " +
+                "desc=${info.description} backend=${BackendType.toString(info.backendType)}"
+        }.getOrElse { "info unavailable: ${it::class.simpleName}" }
 
         /**
          * The device's real texture size ceiling - requested at creation, since Compatibility mode
@@ -478,6 +508,7 @@ class WebGpuRenderer {
 
                     adapter =
                         instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
+                    adapterDescription = describeAdapter(adapter)
 
                     val adapterLimits = adapter.getLimits()
 
@@ -490,7 +521,7 @@ class WebGpuRenderer {
                     }.getOrDefault(false)
                     Log.i(
                         "WebGpuRenderer",
-                        "maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} device=$maxTextureDimension2D core=$core"
+                        "adapter $adapterDescription; maxTextureDimension2D adapter=${adapterLimits.maxTextureDimension2D} device=$maxTextureDimension2D core=$core"
                     )
                 } catch (e: Throwable) {
                     // Fails soft via initError - a driver init failure shouldn't poison the whole class.
@@ -617,6 +648,14 @@ class WebGpuRenderer {
      * KMK <--
      */
     private var surfaceErrorStreak = 0
+
+    /**
+     * KMK --> Consecutive frames whose draw threw - see [DRAW_FAILURE_GIVE_UP_STREAK]. A frame
+     * that draws resets it; it is not the swapchain streak, because the surface is fine and
+     * recreating it would not help a pipeline or validation failure.
+     * KMK <--
+     */
+    private var drawFailureStreak = 0
 
     /**
      * KMK --> How many times this surface has *parked*: hit [SURFACE_ERROR_GIVE_UP_STREAK]
@@ -1013,6 +1052,7 @@ class WebGpuRenderer {
             adapter = instance.requestAdapter(
                 GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility)
             )
+            adapterDescription = describeAdapter(adapter)
             device = requestDeviceBestEffort()
             initialized = true
             deviceLost = false
@@ -1026,7 +1066,7 @@ class WebGpuRenderer {
             }.getOrDefault(false)
             Log.i(
                 "WebGpuRenderer",
-                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D core=$core)"
+                "recreated the device (generation $deviceGeneration, maxTextureDimension2D=$maxTextureDimension2D core=$core, adapter $adapterDescription)"
             )
             true
         } catch (e: CancellationException) {
@@ -1166,8 +1206,15 @@ class WebGpuRenderer {
             val current = try {
                 surface.getCurrentTexture()
             } catch (e: Exception) {
+                // KMK --> A throw here is the same wedge as a non-success status, and it used to
+                // return Retry without ever touching the streak: the escalation below could not
+                // fire, and with the viewer's own retry cap now gone that would have been an
+                // unbounded rearm instead of a recovery. Count it, and reconfigure in case the
+                // surface came back rather than the swapchain being wedged.
+                // KMK <--
                 Log.w("WebGpuRenderer", "Failed to get current texture", e)
-                return FrameResult.Retry
+                reconfigure(surface)
+                return onSwapchainError()
             }
 
             // A non-success status hands back a null texture, and every GPUTexture read goes
@@ -1195,26 +1242,8 @@ class WebGpuRenderer {
                 // decode, a resize, the user - at which point the ladder gets a fresh window.
                 // A Drawn frame resets everything.
                 // KMK <--
-                surfaceErrorStreak++
-                if (surfaceErrorStreak >= SURFACE_ERROR_GIVE_UP_STREAK) {
-                    Log.e(
-                        "WebGpuRenderer",
-                        "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
-                    )
-                    surfaceParkCount++
-                    surfaceErrorStreak = 0
-                    scheduleSurfaceRecreate()
-                    return FrameResult.Unavailable
-                }
-                if (surfaceErrorStreak == SURFACE_ERROR_RECREATE_STREAK) {
-                    Log.w(
-                        "WebGpuRenderer",
-                        "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
-                    )
-                    scheduleSurfaceRecreate()
-                }
                 reconfigure(surface)
-                return FrameResult.Retry
+                return onSwapchainError()
             }
             surfaceErrorStreak = 0
 
@@ -1262,16 +1291,25 @@ class WebGpuRenderer {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // KMK --> Do not fall through to Drawn: the submit did not happen, so reporting a
+                // drawn frame reset the viewer's streak and kept a deterministic pipeline failure
+                // invisible forever. Count it and let the bounded draw-failure ladder answer.
+                // KMK <--
                 Log.e("WebGpuRenderer", "Render error", e)
-                // Don't rethrow - allow the app to continue rendering next frame
+                return onDrawError()
             } catch (e: OutOfMemoryError) {
                 Log.e("WebGpuRenderer", "Out of memory rendering", e)
+                System.gc()
+                return onDrawError()
             } finally {
                 // Unsubmitted if the frame threw.
                 encoder?.close()
                 // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
                 texture.close()
             }
+            // A frame that reached here submitted and presented - the draw-failure dial resets
+            // under the same lock that reads it.
+            drawFailureStreak = 0
         }
 
         if (profilingEnabled) {
@@ -1285,6 +1323,72 @@ class WebGpuRenderer {
         }
 
         return FrameResult.Drawn
+    }
+
+    /**
+     * KMK --> One frame whose draw threw, and what the loop should do about it.
+     *
+     * Bounded separately from [onSwapchainError] because the surface is healthy here: a retry
+     * can succeed after a transient allocation failure, but a deterministic pipeline or shader
+     * failure repeats forever. Returning [FrameResult.Unavailable] after
+     * [DRAW_FAILURE_GIVE_UP_STREAK] parks the loop with one reported reason instead of a
+     * vsync-rate exception storm the user sees only as a black page.
+     *
+     * Render thread, under [mutex].
+     * KMK <--
+     */
+    private fun onDrawError(): FrameResult {
+        drawFailureStreak++
+        if (drawFailureStreak >= DRAW_FAILURE_GIVE_UP_STREAK) {
+            Log.e(
+                "WebGpuRenderer",
+                "draw failure streak $drawFailureStreak frames; parking until the next invalidation"
+            )
+            drawFailureStreak = 0
+            return FrameResult.Unavailable
+        }
+        return FrameResult.Retry
+    }
+
+    /**
+     * KMK --> Count one failed swapchain frame and answer what the frame should return.
+     *
+     * The two escalation dials live together here because both put the renderer on the path to
+     * recovery: [SURFACE_ERROR_RECREATE_STREAK] replaces the WebGPU surface (the only reset that
+     * gives a PowerVR-style wedged WSI object a fresh swapchain), and
+     * [SURFACE_ERROR_GIVE_UP_STREAK] parks the loop with [FrameResult.Unavailable] after four
+     * proved-futile recreate windows. A [FrameResult.Drawn] frame resets [surfaceErrorStreak] in
+     * [render].
+     *
+     * One caller is a non-success `getCurrentTexture` status, the other a throw from the same
+     * call. **Both must come through here**: the viewer re-arms on every [FrameResult.Retry], so
+     * a Retry that does not increment this streak is an unbounded frame-rate retry with no
+     * recovery, which is exactly how a wedged PowerVR swapchain used to present as a healthy
+     * session that simply never drew.
+     *
+     * Render thread, under [mutex].
+     * KMK <--
+     */
+    private fun onSwapchainError(): FrameResult {
+        surfaceErrorStreak++
+        if (surfaceErrorStreak >= SURFACE_ERROR_GIVE_UP_STREAK) {
+            Log.e(
+                "WebGpuRenderer",
+                "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
+            )
+            surfaceParkCount++
+            surfaceErrorStreak = 0
+            scheduleSurfaceRecreate()
+            return FrameResult.Unavailable
+        }
+        if (surfaceErrorStreak == SURFACE_ERROR_RECREATE_STREAK) {
+            Log.w(
+                "WebGpuRenderer",
+                "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
+            )
+            scheduleSurfaceRecreate()
+        }
+        return FrameResult.Retry
     }
 
     /** Rebuild the swapchain at the size [init] was last given. Must hold [mutex]. */

@@ -562,7 +562,16 @@ open class ImagePage {
             encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
         ): Boolean {
             if (isAnimated) {
-                val pass = beginLivePass(encoder, dst, tiles)
+                val pass = try {
+                    beginLivePass(encoder, dst, tiles)
+                } catch (e: Exception) {
+                    Log.e(
+                        "ImagePage",
+                        "Animated/stencil pass failed for ${width}x$height; using the fast page path",
+                        e
+                    )
+                    return super.drawLive(encoder, dst, tiles)
+                }
                 try {
                     renderBackground(pass, dst, 0f, 0f, 1f)
                     renderPage(pass, dst, 0f, 0f, 1f)
@@ -574,7 +583,21 @@ open class ImagePage {
 
             if (!highQuality) return super.drawLive(encoder, dst, tiles)
 
-            val pass = beginLivePass(encoder, dst, tiles)
+            // KMK --> A device that cannot provide the stencil attachment (or rejects the tile
+            // pass for any other reason) used to throw here before the tile catch below could
+            // ever run, every frame, for the life of the page. The fast path opens no stencil
+            // pass at all, so demote and draw the page directly instead.
+            val pass = try {
+                beginLivePass(encoder, dst, tiles)
+            } catch (e: Exception) {
+                highQuality = false
+                Log.e(
+                    "ImagePage",
+                    "Tile/stencil pass failed for ${width}x$height; using the fast page path",
+                    e
+                )
+                return super.drawLive(encoder, dst, tiles)
+            }
             try {
                 // Background always drawn live first (its fades are position-dependent, never
                 // from a stale tile) so it stays underneath everything else. Tiles draw next,
@@ -582,7 +605,23 @@ open class ImagePage {
                 // renderPage then only shades what's left uncovered instead of the whole
                 // viewport, since tiles.draw() already produced the right pixel wherever it drew.
                 renderBackground(pass, dst, 0f, 0f, 1f)
-                val covered = tiles.draw(pass, this, dst, 0f, 0f, 1f)
+                // KMK --> A tile-pipeline failure must not take the page down with it. The tile
+                // cache is an optimization; `renderPage` is the same content drawn directly from
+                // the page's own textures. On a driver that rejects a tile atlas/pipeline
+                // (PowerVR field reports), every frame used to throw here before the fallback
+                // below could run, so the page stayed black. Demote this page to the fast path
+                // for the rest of its life and let the pass show it.
+                val covered = try {
+                    tiles.draw(pass, this, dst, 0f, 0f, 1f)
+                } catch (e: Exception) {
+                    highQuality = false
+                    Log.e(
+                        "ImagePage",
+                        "Tile draw failed for ${width}x$height; using the fast page path",
+                        e
+                    )
+                    false
+                }
                 if (!covered) {
                     renderPage(pass, dst, 0f, 0f, 1f)
                 }

@@ -90,6 +90,22 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface that
   cannot draw. Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never
   "fix" an Error streak by reconfiguring harder — the surface object itself has to go away.
+  A throw from `getCurrentTexture` is the same wedge and goes through the same
+  `onSwapchainError()` counter; returning a bare `Retry` from that catch would leave the streak
+  untouched.
+  **The viewer must keep re-arming `Retry` until the renderer's own thresholds are reached.**
+  `ImageViewerState.collect()` used to stop invalidating after `MAX_RETRIES` (10) frames, which is
+  below both 30 and 120: the loop parked before the escalation could ever start, the session
+  recorded no park, and a wedged PowerVR swapchain presented as a healthy session that simply
+  never drew. `Retry` is now paced by the frame clock and re-arms unconditionally; every path
+  that returns it escalates above, so the renderer owns the bound.
+- **A draw that throws is not a drawn frame.** `render()`'s catch around `fn`/submit used to log
+  "Render error" and fall through to `FrameResult.Drawn`; the submit had been skipped, so nothing
+  reached the display while the viewer reset its retry streak and the session looked healthy. A
+  deterministic pipeline/validation failure therefore presented as a permanent black screen with
+  no park and no strike. Draw failures now go through `onDrawError()`: retried up to
+  `DRAW_FAILURE_GIVE_UP_STREAK` (30) and then parked as `Unavailable`. Keep that result honest —
+  anything that skips the submit owes the caller a failure, not `Drawn`.
 - **A park leaves a count behind: `surfaceParkCount` (instance-scoped, `@Volatile`, monotonic).**
   The give-up path parks and then goes quiet, so a host watching only `isAvailable` saw a session
   that spent its whole life parked close looking healthy (the PowerVR black-screen shape).

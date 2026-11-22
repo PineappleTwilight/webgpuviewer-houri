@@ -59,6 +59,16 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   clip edges must be *assigned* from one another, not computed from neighbours' inputs twice —
   `round(a) + b` isn't `round(a + b)` and `x + y + z` isn't `x + (y + z)`; the only value that
   cannot disagree is the one both sides share.
+- **A tile-pipeline failure falls back to the fast page path, it does not fail the page.**
+  `ImageSingle.drawLive` calls `tiles.draw`, then `renderPage` only when the tile path reports
+  it covered nothing. A driver that throws out of the tile path (bad atlas allocation, rejected
+  pipeline) used to take the whole frame down before the direct draw could run — every frame,
+  for the life of the page, on a device where the simple `renderPage` pipeline was fine. The
+  call is now wrapped: on an exception the page sets `highQuality = false` and the direct draw
+  paints it. The pass itself is wrapped too (`beginLivePass`): a device that cannot provide the
+  **Stencil8 attachment** throws one line earlier, and the fast path is the only render path in
+  this library that opens no stencil pass at all. Do not remove either catch; "the tiles and the
+  mask are only an optimization" is precisely the invariant they protect.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and

@@ -394,9 +394,6 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     @Volatile
     private var reportedUnavailable = false
 
-    @Volatile
-    private var retries = 0
-
     // Wakes [collect] when there is nothing to draw. Buffered, so no send races [dirty]'s check.
     private val renderWake = Channel<Unit>(Channel.CONFLATED)
 
@@ -448,11 +445,19 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 }) {
                     FrameResult.Drawn -> {
                         reportedUnavailable = false
-                        retries = 0
                     }
 
-                    // Past the cap, park until something else invalidates.
-                    FrameResult.Retry -> if (++retries <= MAX_RETRIES) invalidate()
+                    // KMK --> Always re-arm. The renderer owns the bound: a wedged swapchain
+                    // returns Retry while its error streak climbs to SURFACE_ERROR_RECREATE_STREAK
+                    // (30) and then SURFACE_ERROR_GIVE_UP_STREAK (120), where it parks and returns
+                    // Unavailable. This loop used to stop after MAX_RETRIES (10) frames, which is
+                    // *below* both thresholds - so the PowerVR wedge escalation could never run:
+                    // five retries, a parked loop, and a black screen with no park recorded for
+                    // the strike system to see. Retry is paced by the frame clock, and every
+                    // renderer path that can return it now escalates on its own, so there is no
+                    // unbounded spin left for this cap to guard.
+                    // KMK <--
+                    FrameResult.Retry -> invalidate()
 
                     // No invalidate: leaving [dirty] clear parks the loop on [renderWake] rather
                     // than spinning the frame clock, and a later resize still wakes it.
@@ -703,8 +708,5 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
         /** Coalescing window for non-forced [emitReaderState] (scroll settles). */
         const val READER_STATE_THROTTLE_MS = 500L
-
-        /** FrameResult.Retry attempts past which collect() parks until something else invalidates. */
-        const val MAX_RETRIES = 10
     }
 }
