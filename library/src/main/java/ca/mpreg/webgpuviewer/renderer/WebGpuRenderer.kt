@@ -381,6 +381,18 @@ class WebGpuRenderer {
         var deviceGeneration = 0L
             private set
 
+        /**
+         * KMK --> Process-wide count of uncaptured WebGPU errors. Dawn validation rejects a
+         * command buffer wholesale; the submit itself still returns normally, so without this
+         * counter a stale-device cache reads as a healthy session that presents black frames
+         * (2026-11-23 Mali-G76 dump). [render] compares it around the submit and reports the
+         * frame as failed instead of drawn.
+         * KMK <--
+         */
+        @Volatile
+        var validationErrors = 0L
+            private set
+
         /** Guards every field below - written on the render thread, read from wherever polls them. */
         private val profilingLock = Any()
         private var frameCount = 0L
@@ -456,6 +468,7 @@ class WebGpuRenderer {
             },
             deviceLostCallbackExecutor = Executor(Runnable::run),
             uncapturedErrorCallback = UncapturedErrorCallback { _, type, message ->
+                validationErrors++
                 lastUncapturedError = "type=$type: $message"
                 Log.e(
                     "WebGpuRenderer",
@@ -693,7 +706,8 @@ class WebGpuRenderer {
      */
     val debugSummary: String
         get() = "surface=${width}x$height configured=$configuredFormat frame=${Hdr.frameFormat} " +
-            "gen=$deviceGeneration maxTex=$maxTextureDimension2D ${Hdr.surfaceSummary()}"
+            "gen=$deviceGeneration maxTex=$maxTextureDimension2D " +
+            "errs=$validationErrors ${Hdr.surfaceSummary()}"
 
     private var scope: CoroutineScope? = null
 
@@ -1326,6 +1340,12 @@ class WebGpuRenderer {
             deviceLost = false
             initError = null
             deviceGeneration++
+            // KMK --> Every pipeline and bind group cached by a painter belongs to the device
+            // that built it; a stale one makes Dawn reject the whole command buffer and the
+            // surface presents nothing (2026-11-23 Mali-G76 field dump). Drop them before any
+            // frame can use the new device.
+            RenderPage.resetForDeviceRebuild()
+            // KMK <--
             // A fresh adapter can report different limits, and this is read live by the upload
             // paths, so it has to move with the device rather than keep the previous one's value.
             maxTextureDimension2D = device.getLimits().maxTextureDimension2D
@@ -1587,8 +1607,22 @@ class WebGpuRenderer {
                     // to the FrameResult.Drawn tail.
                     return FrameResult.Unavailable
                 }
+                val errorsBefore = validationErrors
                 device.queue.submitAndRelease(encoder)
                 encoder = null
+                // KMK --> An uncaptured validation error invalidates the command buffer Dawn was
+                // handed, so this frame draws nothing even though submit returned. Report it as a
+                // failed frame (bounded by onDrawError) instead of presenting black and counting
+                // it as drawn.
+                if (validationErrors != errorsBefore) {
+                    Log.e(
+                        "WebGpuRenderer",
+                        "dropping frame: ${validationErrors - errorsBefore} WebGPU validation error(s) " +
+                            "last=${lastUncapturedError.orEmpty()}"
+                    )
+                    return onDrawError()
+                }
+                // KMK <--
                 surface.present()
                 // KMK --> Counted only after the present returns, so the counter means "the
                 // surface was handed this frame". See the field's own note for why a session

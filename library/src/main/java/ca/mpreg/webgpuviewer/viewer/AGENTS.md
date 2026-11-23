@@ -94,6 +94,22 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   did not land left a black page with no error — the 2026-11-22 report. The cost is one textured
   page quad per frame per page, which is what the pre-tile renderer did and what every non-WebGPU
   viewer does. **Do not reintroduce the skip**: `covered` may decide prewarming and nothing else.
+- **Device-bound pipeline caches do not survive a rebuild, and a rejected frame is not drawn.**
+  `RenderPage`'s `Variant`/`FormatKeyed` caches (sampler, sampler-unmasked, plain, plain-masked,
+  masked-rect) are built against one `GPUDevice`; nothing cleared them when `recreateDeviceLocked`
+  replaced it. The 2026-11-23 Mali-G76 dump has the signature: `recoveries=1`, `frames=110`,
+  `drawn=true`, endless `Uncaptured WebGPU error [BindGroupLayout] is associated with [Device]`
+  → `Invalid CommandBuffer` → black screen. A validation error invalidates the submitted command
+  buffer while `submit` still returns, so `render` compares `WebGpuRenderer.validationErrors`
+  across the submit and reports a failed frame (`onDrawError`) instead of a drawn one.
+  `RenderPage.resetForDeviceRebuild()` runs inside `recreateDeviceLocked`, under the render mutex,
+  after `deviceGeneration++`. **Rule: a painter that caches a pipeline, bind group or buffer keyed
+  by device owes a reset at device recreation — resetting pages does not reach an object cache.**
+- **`tileCacheUsable=false` stops the grid at the source.** `TileRenderer.draw`/`prewarm` return
+  immediately when the adapter's tile path is unusable. The 2026-11-23 PowerVR dump still logged
+  `Renderer: Create tile …` and `Pre-warming next page tiles` despite `tiles=false`, so a grid was
+  still being allocated; a grid that blits garbage can paint over the direct page draw that is
+  supposed to be the fallback. Keep the gate at both entry points.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and

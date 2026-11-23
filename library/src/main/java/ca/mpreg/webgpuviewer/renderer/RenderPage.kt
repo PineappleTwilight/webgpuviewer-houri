@@ -101,6 +101,10 @@ object RenderPage {
     internal class Variant(build: (format: Int) -> GPURenderPipeline) {
         private val byFormat = FormatKeyed(build)
         fun pipeline(format: Int): GPURenderPipeline = byFormat[format]
+
+        /** KMK --> Drop every pipeline built on the retiring device. */
+        fun clear() = byFormat.clear()
+        // KMK <--
     }
 
     // Every caller of renderFast is inside ImageViewerState/ImageViewerContinuousState's own
@@ -339,6 +343,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             try { slot?.buffer?.destroyAndRelease() } catch (_: Throwable) {}
         }
         maskedRectSlots.fill(null)
+    }
+
+    /**
+     * KMK --> Every pipeline and bind group this object caches belongs to the device that built
+     * it. After a device rebuild they are all invalid, and a frame that uses one is rejected
+     * wholesale by Dawn: `[BindGroupLayout] is associated with [Device], and cannot be used with
+     * [Device]`, then `[Invalid CommandBuffer]`, and the surface presents nothing. The 2026-11-23
+     * Mali-G76 dump (recoveries=1, 110 presented frames, screen frozen) is exactly this cache
+     * surviving its device. Called from [WebGpuRenderer.recreateDeviceLocked] under the render
+     * mutex, so no pass can be holding one of these handles.
+     * KMK <--
+     */
+    internal fun resetForDeviceRebuild() {
+        samplerVariant.clear()
+        samplerVariantUnmasked.clear()
+        plainVariant.clear()
+        plainVariantMasked.clear()
+        maskedRectPipelines.clear()
+        dropMaskedRectRing()
+        maskedRectGeneration = -1L
     }
 
     internal fun drawMaskedRect(

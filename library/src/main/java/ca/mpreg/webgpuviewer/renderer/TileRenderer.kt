@@ -1537,6 +1537,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * displaced becomes current and calls [draw] again.
      */
     fun prewarm(page: ImagePage.ImageSingle, dst: GPUTexture) {
+        // KMK --> Never start a grid on a device whose tile path is unusable.
+        if (!WebGpuRenderer.tileCacheUsable) return
+        // KMK <--
         if (page.destroyed || !page.highQuality || page.isAnimated) return
         if (!page.hasUploadedImage) return
 
@@ -1708,6 +1711,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         y: Float,
         scale: Float
     ): Boolean {
+        // KMK --> A device whose tile path paints black never gets a grid at all. The direct
+        // page draw is the fallback, not an overlay under a possibly-black tile blit.
+        if (!WebGpuRenderer.tileCacheUsable) return false
+        // KMK <--
         val a = pagedAnchor(page, dst, x, y, scale)
         val covered = drawCore(
             pass,
@@ -1752,6 +1759,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         crop: Rect? = null,
         clipEdges: ClipEdges? = null,
     ): Boolean {
+        // KMK --> Same rule as the paged draw: no tile grid on a device that cannot use one.
+        if (!WebGpuRenderer.tileCacheUsable) return false
+        // KMK <--
         val a =
             continuousAnchor(page, dst, cameraDocY, docTop, pageHeight, viewerOffsetX, scale, crop)
                 ?: return false
