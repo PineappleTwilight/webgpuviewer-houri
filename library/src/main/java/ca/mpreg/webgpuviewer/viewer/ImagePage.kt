@@ -792,6 +792,33 @@ open class ImagePage {
             linear: Boolean = true,
             masked: Boolean = true
         ) {
+            // KMK --> A page whose own scale is the parentless sentinel (0.01) or non-finite is
+            // invisible by construction, and so is a page whose home placement lands entirely
+            // outside the surface. Both are recovery states, never a user's zoom: the reader's
+            // own minimum scale is far above the sentinel and a home page is centered by
+            // definition. Fit the page in place instead of drawing nothing; the 2026-11-23
+            // PowerVR dump presents 134 frames with no image, and this is the geometry half of
+            // that shape.
+            if (width > 0 && height > 0 && (this.scale <= 0.02f || !this.scale.isFinite())) {
+                refitPage(dst, "scale=${this.scale}")
+            } else if (atHome && width > 0 && height > 0) {
+                val r = image?.placement(dst, this.x, this.y, this.scale)
+                if (r != null && (!r.all { it.isFinite() } || r[2] <= 0f || r[0] >= 1f || r[3] <= 0f || r[1] >= 1f)) {
+                    refitPage(dst, "home rect=${r.joinToString()}")
+                }
+            }
+            // KMK <--
+            // KMK --> Diagnostics-only: every page draw records its geometry and every image
+            // quad it intends to emit, so a session that presents but shows nothing can be
+            // told apart from one whose walk never reached the page.
+            val probeRect = image?.placement(dst, this.x, this.y, this.scale)?.joinToString()
+            RenderProbe.notePage(
+                "${width}x$height scale=$scale drawScale=${this.scale} x=$x y=$y " +
+                    "home=$homeScale trim=${trimWidth}x$trimHeight " +
+                    "mips=${image?.mipmaps?.size} fmt=${image?.mipmaps?.firstOrNull()?.format} " +
+                    "dst=${dst.width}x${dst.height} hq=$highQuality rect=$probeRect"
+            )
+            // KMK <--
             val variant = RenderPage.variantFor(linear, masked)
             if (!linear || !masked) {
                 drawPageBackground(pass, dst, scale, maskedBackground = masked)
@@ -802,6 +829,18 @@ open class ImagePage {
                 }
             }
         }
+
+        /** KMK --> Last-resort fit for a page that cannot land on the surface. */
+        private fun refitPage(dst: GPUTexture, why: String) {
+            val fit = minOf(dst.width.toFloat() / width, dst.height.toFloat() / height)
+            if (!fit.isFinite() || fit <= 0f) return
+            Log.e("ImagePage", "Refitting page ${width}x$height ($why) to $fit")
+            homeScale = fit
+            scale = fit
+            x = 0f
+            y = 0f
+        }
+        // KMK <--
 
         /**
          * Draw just this page's per-image background colour, skipping the image itself - for
@@ -923,7 +962,10 @@ open class ImagePage {
                         (this.y + y + WebGpuRenderer.offsetY) / imgScale - WebGpuRenderer.offsetY
                     val placeScale = this.scale * scale * imgScale
                     val rect = img.placement(dst, placeX, placeY, placeScale)
+                    RenderProbe.noteImage(rect.joinToString())
                     action(img, rect, placeX, placeY, placeScale)
+                } else {
+                    RenderProbe.noteSkippedNoMips()
                 }
             }
         }

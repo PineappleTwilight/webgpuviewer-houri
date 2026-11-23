@@ -684,6 +684,17 @@ class WebGpuRenderer {
     var width: Int = 0
     var height: Int = 0
 
+    /**
+     * KMK --> The instance facts a field report needs and no existing line carried: the canvas it
+     * is presenting at, the format it configured versus the one frames are drawn in, the device
+     * generation and the surface's advertised formats. Read by the app's session header and the
+     * close-out diagnostics; no rendering effect.
+     * KMK <--
+     */
+    val debugSummary: String
+        get() = "surface=${width}x$height configured=$configuredFormat frame=${Hdr.frameFormat} " +
+            "gen=$deviceGeneration maxTex=$maxTextureDimension2D ${Hdr.surfaceSummary()}"
+
     private var scope: CoroutineScope? = null
 
     private var pendingSurface: Surface? = null
@@ -1538,9 +1549,12 @@ class WebGpuRenderer {
             var encoder: GPUCommandEncoder? = null
             try {
                 encoder = device.createCommandEncoder()
-                // RenderPage's masked-rect slot ring needs this frame's start to reset its count -
-                // see the ring's note for why slots must be distinct within one frame.
+                // KMK --> Both rings belong to this encoded frame: the masked-rect slots and the
+                // diagnostics probe. A frame that throws after this point leaves the probe with
+                // whatever it actually asked for before the throw, which is what the dump wants.
                 RenderPage.beginFrame()
+                ca.mpreg.webgpuviewer.viewer.RenderProbe.beginFrame()
+                // KMK <--
                 // Draws into an offscreen texture when filters are enabled; endFrame runs them
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))

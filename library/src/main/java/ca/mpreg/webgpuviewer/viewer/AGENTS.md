@@ -74,14 +74,18 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   no instance buffer) skipped `renderPage` and left the page invisible with no error — the 2026-11-22
   black-page shape. `TileRenderer.drawCore` now requires an actual blit; if you add a "nothing to
   draw" early return, it must answer `false`, never `true`.
-- **The tile cache is not offered on PowerVR Rogue.** `WebGpuRenderer.tileCacheUsable` is false
-  for an adapter description naming PowerVR, and `ImageSingle.drawLive`/`renderCacheSeed` take the
-  direct `renderWith` path before either the animated or the high-quality branch. The 2026-11-23
-  field dump (Multilaser M8_4G, PowerVR GE8322) presents on every frame (`frames=139`,
-  `drawn=true`) and still shows no image; the direct draw is the path that does not open the
-  tile/stencil pass. The app also sets `highQuality=false` for those pages so the tile grid is
-  never generated or prewarmed. Do not remove the gate without a device test — it is a
-  presentation fallback, not a quality choice.
+- **The first on-screen page is often still a placeholder — `page=` must follow the adopted image.**
+  `resolveFetchedPage(0)` marks a page as drawn on the first frame `imagePage.isOnScreen` answers
+  true, which is usually the `ProgressPage` the shell starts with; recording geometry there reported
+  `img=null scale=null` for a session that had decoded three pages (2026-11-23 dump). The recorder
+  now overwrites the record as soon as the on-screen page is an `ImageSingle`, so the line describes
+  the image, not the spinner.
+- **A page the renderer cannot place is refit when it is drawn.** `ImageSingle.renderPage` refits a
+  page whose own `scale` is the parentless 0.01 sentinel or non-finite, or whose *home* placement
+  lies entirely outside the surface, instead of drawing nothing. This is the geometry half of a
+  black frame the diagnostics can otherwise only describe; it never overrides a user's pan/zoom
+  (the guard fires at home or on the sentinel only). The refit is logged as
+  `ImagePage: Refitting page ...` and appears in `page=`.
 - **The page is painted *under* the tiles, every frame — the tile cache is an overlay, never a
   substitute.** `ImageSingle.drawLive` paints the page with `renderPage` unconditionally and then
   blits the tile cache over it. It used to paint the page only when the grid answered "not

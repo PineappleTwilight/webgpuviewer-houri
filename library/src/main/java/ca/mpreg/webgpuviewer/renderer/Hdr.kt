@@ -266,6 +266,11 @@ object Hdr {
         return formats.isEmpty() || formats.contains(format)
     }
 
+    /** KMK --> The surface's advertised formats, for the renderer's session diagnostics. */
+    internal fun surfaceSummary(): String =
+        "sdr=$sdrFrameFormat hdr=$surfaceSupported formats=[${surfaceFormatList.joinToString(",")}]"
+    // KMK <--
+
     /**
      * KMK --> Forget everything a surface answered, for a device/instance rebuild that may land on
      * a different backend. HDR presentation above all: the OpenGLES backend does not expose a
