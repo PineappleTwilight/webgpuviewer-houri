@@ -83,22 +83,61 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   the swapchain can be born wedged — `Error` on every frame from the first one, while `configure`
   keeps succeeding — and `reconfigure` can never clear it, because configure only updates the
   descriptor on a surface whose WSI object is already broken. `render` counts the consecutive
-  failed frames: at `SURFACE_ERROR_RECREATE_STREAK` (30) it schedules
+  failed frames and escalates in four rungs, all named by `SwapchainRecoveryPolicy`: at
+  `RECREATE_SURFACE_AT` (30) it schedules
   `scheduleSurfaceRecreate()` (close the WGPU surface, release and re-acquire the window, pump the
-  deferred teardown, rebuild — the device and the tile grids stay valid, unlike a device-loss
-  recovery); at `SURFACE_ERROR_GIVE_UP_STREAK` (120) it returns `FrameResult.Unavailable` so
-  `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface that
-  cannot draw. Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never
-  "fix" an Error streak by reconfiguring harder — the surface object itself has to go away.
+  deferred teardown, rebuild); at `REBUILD_DEVICE_AT` (60) it rebuilds the whole
+  device through `recoverFromDeviceLoss(force = true, freshInstance = true)` (a new Dawn
+  **instance**, adapter and device — the closest reset to the process restart that clears this
+  wedge — with the swapchain rebuilt from the retained platform surface), and at
+  `SWITCH_BACKEND_AT` (90) it sets `preferBackend = OpenGLES` and rebuilds
+  again, because GLES presents through EGL rather than `VkSwapchainKHR` and does not inherit the
+  wedged WSI object. At `GIVE_UP_AT` (120) it returns `FrameResult.Unavailable`
+  so `collect()` reports once, parks, and the walk stops feeding fetch/evict churn to a surface
+  that cannot draw — the park does **not** schedule another surface rebuild; every rung has been
+  tried for that streak, and the next decode/resize/user action re-arms the ladder from zero.
+  Any Drawn frame resets the streak; a fresh `init()` resets it too. Rule: never "fix" an Error
+  streak by reconfiguring harder — the surface object itself has to go away.
+  **Do not reconfigure on every failed frame.** The error path used to call `reconfigure()` on
+  each `Error`, building a fresh swapchain per frame on the driver the recovery exists for; only
+  `Outdated` reconfigures now, and `Timeout` is a plain Retry.
+  **A reconfigure never acquires in the same frame.** The resize path and the HDR-format path both
+  configure and return `Retry`; the next frame acquires from the new swapchain. Continuous mode
+  applies its column width right around the first surface callback, so configure-then-acquire in
+  one frame was the shortest possible window for a PowerVR driver to build and use a fresh
+  swapchain — exactly the "born wedged from the first frame" shape.
   A throw from `getCurrentTexture` is the same wedge and goes through the same
   `onSwapchainError()` counter; returning a bare `Retry` from that catch would leave the streak
   untouched.
+  **A rebuild that succeeds at surface creation is not a recovery.** `scheduleSwapchainReset`
+  deliberately does **not** reset `surfaceErrorStreak` when `recoverFromDeviceLoss` returns true:
+  the field wedge rebuilds a device and configures a surface cleanly and still gets `Error` on the
+  next frame, so a reset there restarted the ladder and the loop never reached the GLES rung. Only
+  a `Drawn` frame clears the streak (and `init()`/`Lost` clear it for a genuinely new surface).
   **The viewer must keep re-arming `Retry` until the renderer's own thresholds are reached.**
   `ImageViewerState.collect()` used to stop invalidating after `MAX_RETRIES` (10) frames, which is
   below both 30 and 120: the loop parked before the escalation could ever start, the session
   recorded no park, and a wedged PowerVR swapchain presented as a healthy session that simply
   never drew. `Retry` is now paced by the frame clock and re-arms unconditionally; every path
-  that returns it escalates above, so the renderer owns the bound.
+  that returns it escalates above, so the renderer owns the bound. `render` also answers `Retry`
+  for the whole duration of `swapchainResetScheduled`, not only while the surface is null, so the
+  device/backend rebuild cannot be interrupted by a half-torn-down frame.
+- **The swapchain ladder asks the host to drop device-bound caches before it rebuilds the device**
+  (`DeviceRebuildListener`). The tile atlas, mip chains and filter pool live in
+  `ImageViewerState`/`TileRenderer`, and a device-loss recovery has always dropped them before
+  `recoverFromDeviceLoss`; the ladder starts inside the renderer, so `ImageViewerState` registers
+  a suspending listener that runs `tiles.recoverFromDeviceLoss()` first. Without it the next
+  frame records against handles from the retired device. Keep the hook suspending: the rebuild
+  must not start until the host has actually released the old objects.
+- **The surface's advertised format wins over the hardcoded `RGBA8Unorm`.** `Hdr.resolve` caches
+  `GPUSurfaceCapabilities.formats` and picks the SDR present format from it
+  (`RGBA8Unorm` -> `BGRA8Unorm` -> first advertised). All render targets are allocated against
+  `Hdr.frameFormat`, so a surface that lists only `BGRA8Unorm` now gets a consistent set instead
+  of a configure that fails inside Dawn while returning no exception — which presents exactly as
+  the wedged-swapchain `Error` above. `Hdr.surfaceSupports` gates the HDR format too, and
+  `resetSurfaceSupportForBackendChange()` clears the answer before a rebuild that may change
+  backends. The capability list, usages, alpha and present modes are logged at surface creation;
+  read that line before theorising about a format mismatch.
 - **A draw that throws is not a drawn frame.** `render()`'s catch around `fn`/submit used to log
   "Render error" and fall through to `FrameResult.Drawn`; the submit had been skipped, so nothing
   reached the display while the viewer reset its retry streak and the session looked healthy. A

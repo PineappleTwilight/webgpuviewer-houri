@@ -82,12 +82,10 @@ class WebGpuRenderer {
         private const val RECOVERY_STABLE_MS = 15_000L
         private const val RECOVERY_GIVE_UP_ATTEMPTS = 12
 
-        // KMK --> Swapchain-error escalation thresholds - see the [surfaceErrorStreak] field.
-        // 30 failed frames is ~0.5s at 60fps: long enough that a genuinely transient present
-        // failure rides through, short enough that a wedged swapchain is noticed within a
-        // breath. 120 is the point where retrying has been proven futile four times over.
-        private const val SURFACE_ERROR_RECREATE_STREAK = 30
-        private const val SURFACE_ERROR_GIVE_UP_STREAK = 120
+        // KMK --> Swapchain-error escalation thresholds. The table itself is
+        // [SwapchainRecoveryPolicy] - pure, no Android import, asserted offline by
+        // SwapchainRecoveryHarness. The renderer owns only the side effects.
+        // KMK <--
 
         /**
          * Consecutive frames whose draw threw before the frame loop is asked to park. A thrown
@@ -134,6 +132,94 @@ class WebGpuRenderer {
             "vendor=${info.vendor} arch=${info.architecture} device=${info.device} " +
                 "desc=${info.description} backend=${BackendType.toString(info.backendType)}"
         }.getOrElse { "info unavailable: ${it::class.simpleName}" }
+
+        /**
+         * KMK --> Which Dawn backend the live adapter came from, and which one a rebuild asks
+         * for first. Both start [BackendType.Undefined] ("whatever Dawn picks"). The swapchain
+         * ladder sets [preferBackend] to OpenGLES after a device rebuild failed to clear a
+         * wedged Vulkan swapchain - the GLES backend presents through EGL rather than
+         * `VkSwapchainKHR`, so it does not inherit that WSI state. A backend that turns out to
+         * be unavailable is dropped back to the default instead of poisoning the renderer.
+         *
+         * [activeBackend] is what the live adapter reports, not what was asked for: Dawn may
+         * fall back to another backend when the preference cannot be honoured, and a recovery
+         * that keeps naming the wrong one would mislead the next rung of the ladder.
+         * KMK <--
+         */
+        @Volatile
+        private var activeBackend: Int = BackendType.Undefined
+
+        @Volatile
+        private var preferBackend: Int = BackendType.Undefined
+
+        /**
+         * KMK --> Host hook that runs before [scheduleSwapchainReset] replaces the device.
+         *
+         * The renderer does not own the host's device-bound caches - the tile atlas, mip chains
+         * and filter pool live in [ImageViewerState]/[TileRenderer] - and those hold handles from
+         * the device about to be retired. A device-loss recovery has always asked the host to
+         * drop them first (`ImageViewerState.recoverFromDeviceLoss`); the swapchain ladder runs
+         * from inside the renderer, so it needs the same chance or the next frame paints from a
+         * destroyed atlas. Suspending on purpose: the rebuild must not start until the host has
+         * actually let go of the old handles.
+         * KMK <--
+         */
+        fun interface DeviceRebuildListener {
+            suspend fun onBeforeDeviceRebuild()
+        }
+
+        private val deviceRebuildListeners = CopyOnWriteArrayList<DeviceRebuildListener>()
+
+        @JvmStatic
+        fun addDeviceRebuildListener(listener: DeviceRebuildListener) {
+            deviceRebuildListeners.addIfAbsent(listener)
+        }
+
+        @JvmStatic
+        fun removeDeviceRebuildListener(listener: DeviceRebuildListener) {
+            deviceRebuildListeners.remove(listener)
+        }
+
+        private suspend fun notifyBeforeDeviceRebuild() {
+            for (listener in deviceRebuildListeners) {
+                try {
+                    listener.onBeforeDeviceRebuild()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Log.w("WebGpuRenderer", "device-rebuild listener failed", e)
+                }
+            }
+        }
+
+        private fun adapterOptions(backend: Int) = GPURequestAdapterOptions(
+            featureLevel = FeatureLevel.Compatibility,
+            backendType = backend,
+        )
+
+        private suspend fun requestAdapterFor(backend: Int): GPUAdapter {
+            return try {
+                instance.requestAdapter(adapterOptions(backend))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                if (backend == BackendType.Undefined) throw e
+                // A backend this build of Dawn was compiled without, or one the driver refuses
+                // to surface: asking for it must not take the renderer down with it.
+                Log.w(
+                    "WebGpuRenderer",
+                    "adapter on ${BackendType.toString(backend)} unavailable; falling back to the default backend",
+                    e,
+                )
+                preferBackend = BackendType.Undefined
+                instance.requestAdapter(adapterOptions(BackendType.Undefined))
+            }
+        }
+
+        private fun noteActiveBackend(adapter: GPUAdapter) {
+            activeBackend = runCatching { adapter.getInfo().backendType }
+                .getOrDefault(BackendType.Undefined)
+        }
 
         /**
          * The device's real texture size ceiling - requested at creation, since Compatibility mode
@@ -506,8 +592,8 @@ class WebGpuRenderer {
 
                     instance = createInstanceWithLibrary()
 
-                    adapter =
-                        instance.requestAdapter(GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility))
+                    adapter = requestAdapterFor(BackendType.Undefined)
+                    noteActiveBackend(adapter)
                     adapterDescription = describeAdapter(adapter)
 
                     val adapterLimits = adapter.getLimits()
@@ -658,7 +744,7 @@ class WebGpuRenderer {
     private var drawFailureStreak = 0
 
     /**
-     * KMK --> How many times this surface has *parked*: hit [SURFACE_ERROR_GIVE_UP_STREAK]
+     * KMK --> How many times this surface has *parked*: hit [SwapchainRecoveryPolicy.GIVE_UP_AT]
      * consecutive swapchain `Error`s and gone [FrameResult.Unavailable] until something else
      * invalidates - the PowerVR black-screen shape where `isAvailable` stays true the whole
      * time, so the device-loss path never fires. Written on the render thread only; hosts
@@ -697,6 +783,16 @@ class WebGpuRenderer {
      * KMK <--
      */
     private val surfaceRecreateScheduled = AtomicBoolean(false)
+
+    /**
+     * KMK --> Whether a [scheduleSwapchainReset] pass is queued or running. That pass rebuilds
+     * the device (and, on its second rung, the adapter's backend), which takes the surface away
+     * for longer than a swapchain recreate; [render] must answer Retry for the same reason it
+     * does while [surfaceRecreateScheduled] is set, or the viewer sees a one-off outage and
+     * parks its loop before the recovery it asked for can finish.
+     * KMK <--
+     */
+    private val swapchainResetScheduled = AtomicBoolean(false)
 
     @Synchronized
     fun init(scope: CoroutineScope, surface: Surface, width: Int, height: Int) {
@@ -817,9 +913,84 @@ class WebGpuRenderer {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
+                // KMK --> A surface that cannot be rebuilt at all is one rung past the swapchain:
+                // escalate to the device rebuild instead of leaving `surface` null, which would
+                // answer Unavailable on every frame and park the viewer before the ladder ran.
+                // KMK <--
                 Log.e("WebGpuRenderer", "surface recreation failed", e)
+                scheduleSwapchainReset(switchBackend = false)
             } finally {
                 surfaceRecreateScheduled.set(false)
+            }
+        }
+    }
+
+    /**
+     * KMK --> When the surface rebuild was not enough: rebuild the whole GPU device, and on the
+     * next rung ask for Dawn's OpenGLES backend.
+     *
+     * Field evidence (2026-11-22, Multilaser M8_4G / PowerVR GE8322): the second reader session
+     * in a process was born with `getCurrentTexture` returning `Error` on every frame while
+     * `configure` succeeded, and a fresh WebGPU surface on the same device reproduced it. That
+     * is one level above the swapchain: Dawn's Vulkan WSI object is wedged, and only a new
+     * device - or a genuinely different WSI implementation - can clear it. The first forced pass
+     * also replaces the Dawn instance (`freshInstance = true`): a new VkInstance is the closest
+     * reset to the process restart that always cleared the field case, and the previous instance
+     * is left open rather than closed under retired wrappers. The GLES switch is the second rung
+     * because its presentation path is EGL, not `vkCreateAndroidSurfaceKHR`/`VkSwapchainKHR`, so
+     * it cannot inherit the wedged object.
+     *
+     * Runs on the render dispatcher and suspends inside the teardown pump, so it must not be
+     * called inline from [render] (which holds [mutex]). [swapchainResetScheduled] keeps the
+     * frame loop in Retry while the surface is away, exactly like [surfaceRecreateScheduled].
+     * KMK <--
+     */
+    private fun scheduleSwapchainReset(switchBackend: Boolean) {
+        if (!swapchainResetScheduled.compareAndSet(false, true)) return
+        if (switchBackend) preferBackend = BackendType.OpenGLES
+        CoroutineScope(dispatcher).launch {
+            try {
+                // The host owns the tile atlas and other device-bound caches; it must drop them
+                // before the device they were allocated on is retired (see the listener's note).
+                notifyBeforeDeviceRebuild()
+                // KMK --> The device rung also replaces the Dawn instance: the field wedge lives
+                // in the WSI, and a new VkInstance is the closest thing to the process restart
+                // that always cleared it. The backend rung reuses that fresh instance and moves
+                // the adapter to GLES.
+                // KMK <--
+                val ok = recoverFromDeviceLoss(force = true, freshInstance = !switchBackend)
+                if (ok) {
+                    // KMK --> Do NOT reset surfaceErrorStreak here. `ok` means a device and a
+                    // surface were created; it does not mean a frame reached the display. The
+                    // field case this ladder exists for (PowerVR) rebuilds cleanly and still gets
+                    // `getCurrentTexture` Error on the first frame, so resetting here restarted
+                    // the count at 0 and the loop never reached SWITCH_BACKEND_AT - it just kept
+                    // re-running the 30/60 rungs. Only a Drawn frame resets the streak (render()).
+                    // KMK <--
+                    Log.i(
+                        "WebGpuRenderer",
+                        if (switchBackend) {
+                            "swapchain recovered after switching to the ${BackendType.toString(activeBackend)} backend"
+                        } else {
+                            "swapchain recovered after a device rebuild"
+                        },
+                    )
+                } else {
+                    Log.e(
+                        "WebGpuRenderer",
+                        if (switchBackend) {
+                            "swapchain still wedged after the backend switch"
+                        } else {
+                            "swapchain still wedged after a device rebuild"
+                        },
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e("WebGpuRenderer", "swapchain reset failed", e)
+            } finally {
+                swapchainResetScheduled.set(false)
             }
         }
     }
@@ -830,6 +1001,14 @@ class WebGpuRenderer {
      * from the retained platform surface. True when the device is usable afterwards; a missing
      * surface waits for the next surface callback.
      *
+     * KMK --> [force] is the swapchain ladder's entry point. The device is alive there - only its
+     * swapchain is wedged - so [recreateDeviceLocked]'s "already available" short-circuit would
+     * skip the rebuild. Forcing it also re-requests the adapter, which is what lets
+     * [scheduleSwapchainReset] move the session onto the GLES backend ([preferBackend]).
+     * A forced call ignores the failure cooldown: it is not a loss-driven retry, it is the one
+     * escalation that has not been tried for this surface yet.
+     * KMK <--
+     *
      * Failures are laddered, not retried at the caller's pace. A recovery that fails at surface
      * creation has lost the device it just built, whose own loss callback starts the next
      * recovery - unthrottled, that loop recreated a device every second for the rest of the
@@ -839,15 +1018,21 @@ class WebGpuRenderer {
      * once its device has stayed alive [RECOVERY_STABLE_MS] - a device that dies again
      * immediately belongs to the same pressure era, not to a new one.
      */
-    suspend fun recoverFromDeviceLoss(): Boolean {
+    suspend fun recoverFromDeviceLoss(
+        force: Boolean = false,
+        freshInstance: Boolean = false,
+    ): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now < recoveryCooldownUntil) {
+        if (!force && now < recoveryCooldownUntil) {
             Log.i(
                 "WebGpuRenderer",
                 "recovery deferred ${(recoveryCooldownUntil - now) / 1000.0}s (consecutive failures: $recoveryFailures)"
             )
             return false
         }
+        // A forced reset racing the surface teardown has no window to build on; the next init()
+        // owns that case, and reporting failure here would count against the recovery ladder.
+        if (force && surfaceDetached) return true
         return try {
             withContext(dispatcher) {
                 mutex.withLock {
@@ -861,6 +1046,7 @@ class WebGpuRenderer {
                     destroyRetired()
                     val deadDevice = deviceOrNull()
                     val deadAdapter = adapterOrNull()
+                    val backendBefore = activeBackend
 
                     // Drop the swapchain and the native window BEFORE the new device exists.
                     // Dawn can defer vkDestroySurfaceKHR past close(), and a second createSurface
@@ -886,9 +1072,23 @@ class WebGpuRenderer {
                     // recovery. Give the deferred work wall-clock time to run.
                     pumpSurfaceTeardown()
 
-                    if (!recreateDeviceLocked()) {
+                    if (!recreateDeviceLocked(force = force, freshInstance = freshInstance)) {
                         noteRecoveryFailure()
                         return@withLock false
+                    }
+                    // A forced rebuild may have changed the WSI implementation (Vulkan -> GLES).
+                    // Its surface capabilities are a different list, and the old answer would
+                    // make the renderer configure a float or RGBA swapchain this backend cannot
+                    // present. Safe under the render mutex: no frame is between a latch and an
+                    // allocation here.
+                    if (activeBackend != backendBefore || freshInstance) {
+                        Hdr.resetSurfaceSupportForBackendChange()
+                        Log.i(
+                            "WebGpuRenderer",
+                            "backend changed ${BackendType.toString(backendBefore)} -> " +
+                                "${BackendType.toString(activeBackend)}" +
+                                if (freshInstance) " (fresh instance); surface formats reset" else "; surface formats reset",
+                        )
                     }
                     // The companion no longer names the dead device, so nothing drives it
                     // after this lock ends; free it one recovery cycle from now (above).
@@ -1061,15 +1261,39 @@ class WebGpuRenderer {
     }
 
     /** Device-only recreation shared by [reinit] and [recoverFromDeviceLoss]. Must hold [mutex]. */
-    internal suspend fun recreateDeviceLocked(): Boolean {
-        if (isAvailable) return true
+    internal suspend fun recreateDeviceLocked(
+        force: Boolean = false,
+        freshInstance: Boolean = false,
+    ): Boolean {
+        if (isAvailable && !force) return true
         return try {
+            // KMK --> A fresh Dawn instance is the strongest reset available without restarting
+            // the process: a new VkInstance means a new WSI connection, not merely a new logical
+            // device on the one whose surface state is suspect. The previous instance is left
+            // open on purpose - closing it while any retired wrapper still names an object from
+            // it is the same class of JNI hazard as closing a retired device - and the OS frees
+            // it at process exit. Only the swapchain ladder asks for this; a normal loss keeps
+            // the instance.
+            // KMK <--
+            if (freshInstance) {
+                Log.i(
+                    "WebGpuRenderer",
+                    "recreating the Dawn instance (previous one left for process exit)",
+                )
+                instance = createInstanceWithLibrary()
+                activeBackend = BackendType.Undefined
+                Hdr.resetSurfaceSupportForBackendChange()
+            }
             // An adapter is consumed by the first requestDevice that succeeds on it, so the one
             // that built the lost device can never build another - Dawn rejects it as "consumed",
             // and with nothing re-requesting an adapter the renderer stayed unavailable for good.
-            adapter = instance.requestAdapter(
-                GPURequestAdapterOptions(featureLevel = FeatureLevel.Compatibility)
-            )
+            //
+            // KMK --> The requested backend is the session's preference: Undefined on a normal
+            // recovery (Dawn's own choice), OpenGLES after the swapchain ladder proved the Vulkan
+            // WSI wedged. requestAdapterFor drops an unavailable preference rather than failing.
+            // KMK <--
+            adapter = requestAdapterFor(preferBackend)
+            noteActiveBackend(adapter)
             adapterDescription = describeAdapter(adapter)
             device = requestDeviceBestEffort()
             initialized = true
@@ -1131,6 +1355,14 @@ class WebGpuRenderer {
         val initSurface = initSurface@{
             // A cleanup queued first let [pending] go; a surface from it would leak.
             if (surface != null || pendingSurface !== pending) return@initSurface
+            // KMK --> Field reports cannot see the platform window's state from the app side, and
+            // an invalid/abandoned Surface here is one of the few ways a swapchain is born unusable.
+            // KMK <--
+            Log.i(
+                "WebGpuRenderer",
+                "creating surface ${this@WebGpuRenderer.width}x${this@WebGpuRenderer.height} " +
+                    "valid=${pending.isValid}",
+            )
             val created = instance.createSurface(
                 GPUSurfaceDescriptor(
                     surfaceSourceAndroidNativeWindow = GPUSurfaceSourceAndroidNativeWindow(
@@ -1178,12 +1410,17 @@ class WebGpuRenderer {
         val startTime = if (profilingEnabled) System.nanoTime() else 0L
 
         mutex.withLock {
+            // KMK --> The swapchain ladder's device/backend rebuild owns the surface and every
+            // device-bound cache for its whole duration. Answer Retry until it finishes rather
+            // than drawing one frame into a half-torn-down device.
+            // KMK <--
+            if (swapchainResetScheduled.get()) return FrameResult.Retry
             // Only [init]/[resize] can build one, so a redraw alone accomplishes nothing.
-            // KMK --> A surface a scheduled recreation just closed is a pause, not an outage:
-            // the recreate lands within a few frames (it pumps the teardown and rebuilds on this
+            // KMK --> A surface a scheduled recreation/reset just closed is a pause, not an
+            // outage: both land within a few frames (they pump the teardown and rebuild on this
             // dispatcher), so Retry keeps the walk alive without reporting a failure the viewer
             // asked for itself. KMK <--
-            val surface = surface ?: if (surfaceRecreateScheduled.get()) {
+            val surface = surface ?: if (surfaceRecreateScheduled.get() || swapchainResetScheduled.get()) {
                 return FrameResult.Retry
             } else {
                 return FrameResult.Unavailable
@@ -1201,6 +1438,13 @@ class WebGpuRenderer {
             if (resizePending) {
                 resizePending = false
                 reconfigure(surface)
+                // KMK --> Let the new swapchain settle for one full frame before acquiring from
+                // it. A layout change lands right at viewer open in continuous mode (the column
+                // width is applied after the first surface callback), and configuring and then
+                // acquiring inside the same frame is the shortest possible window for a driver to
+                // build and use a fresh swapchain. The frame loop re-arms on Retry.
+                // KMK <--
+                return FrameResult.Retry
             }
 
             // An HDR image arriving, or the last one leaving, changes what the swapchain should
@@ -1211,6 +1455,8 @@ class WebGpuRenderer {
                 if (Hdr.frameFormat != configuredFormat) {
                     reconfigure(surface)
                     Hdr.syncPresentation()
+                    // Same rule as a resize reconfigure: use the new swapchain next frame.
+                    return FrameResult.Retry
                 } else if (Hdr.consumePresentationDirty()) {
                     // Same format, but a brighter image arrived (or the brightest was freed), so
                     // the headroom asked of the display has moved.
@@ -1227,40 +1473,49 @@ class WebGpuRenderer {
                 // KMK --> A throw here is the same wedge as a non-success status, and it used to
                 // return Retry without ever touching the streak: the escalation below could not
                 // fire, and with the viewer's own retry cap now gone that would have been an
-                // unbounded rearm instead of a recovery. Count it, and reconfigure in case the
-                // surface came back rather than the swapchain being wedged.
+                // unbounded rearm instead of a recovery. Count it. Do *not* reconfigure: Dawn's
+                // configure only rewrites the descriptor on a WSI object that is already broken,
+                // and doing it on every failed frame built a fresh swapchain per frame on the
+                // very driver this recovery exists for.
                 // KMK <--
                 Log.w("WebGpuRenderer", "Failed to get current texture", e)
-                reconfigure(surface)
                 return onSwapchainError()
             }
 
             // A non-success status hands back a null texture, and every GPUTexture read goes
-            // straight through its handle - so one segfaults rather than throws. Outdated means
-            // a window resize under a frame already in flight.
+            // straight through its handle - so one segfaults rather than throws.
             val texture = current.texture
             if (!current.status.isSurfaceSuccess() || texture.handle == 0L) {
-                Log.w(
-                    "WebGpuRenderer",
-                    "No surface texture: ${SurfaceGetCurrentTextureStatus.toString(current.status)}"
-                )
-                // Lost needs a new surface: park until one arrives.
                 if (texture.handle != 0L) texture.close()
-                if (current.status == SurfaceGetCurrentTextureStatus.Lost) {
-                    surfaceErrorStreak = 0
-                    return FrameResult.Unavailable
+                when (current.status) {
+                    // A window resize under a frame already in flight, or the compositor
+                    // withholding buffers while backgrounded. Both are normal and self-correct
+                    // once the descriptor follows the window.
+                    SurfaceGetCurrentTextureStatus.Outdated -> {
+                        reconfigure(surface)
+                        return FrameResult.Retry
+                    }
+
+                    SurfaceGetCurrentTextureStatus.Timeout -> return FrameResult.Retry
+
+                    // Lost needs a new surface: park until one arrives.
+                    SurfaceGetCurrentTextureStatus.Lost -> {
+                        surfaceErrorStreak = 0
+                        return FrameResult.Unavailable
+                    }
                 }
                 // KMK --> A swapchain stuck in Dawn's error state never clears through
                 // [reconfigure] - configure only updates the descriptor on a surface whose WSI
-                // object is already broken. Escalate: ~half a second of consecutive Errors tears
-                // the surface down and rebuilds it (the one reset that gives the driver a fresh
-                // swapchain); twice that parks the loop with [FrameResult.Unavailable] so
-                // collect() reports once and the walk stops burning cycles against a surface
-                // that cannot draw. The park lasts until something else invalidates - a page
-                // decode, a resize, the user - at which point the ladder gets a fresh window.
-                // A Drawn frame resets everything.
+                // object is already broken. The escalation lives in [onSwapchainError]: surface
+                // rebuild, then device rebuild, then the GLES backend, then park.
                 // KMK <--
-                reconfigure(surface)
+                if (surfaceErrorStreak == 0) {
+                    Log.w(
+                        "WebGpuRenderer",
+                        "No surface texture: ${SurfaceGetCurrentTextureStatus.toString(current.status)}" +
+                            (lastUncapturedError?.let { " last=$it" } ?: ""),
+                    )
+                }
                 return onSwapchainError()
             }
             surfaceErrorStreak = 0
@@ -1376,12 +1631,19 @@ class WebGpuRenderer {
     /**
      * KMK --> Count one failed swapchain frame and answer what the frame should return.
      *
-     * The two escalation dials live together here because both put the renderer on the path to
-     * recovery: [SURFACE_ERROR_RECREATE_STREAK] replaces the WebGPU surface (the only reset that
-     * gives a PowerVR-style wedged WSI object a fresh swapchain), and
-     * [SURFACE_ERROR_GIVE_UP_STREAK] parks the loop with [FrameResult.Unavailable] after four
-     * proved-futile recreate windows. A [FrameResult.Drawn] frame resets [surfaceErrorStreak] in
-     * [render].
+     * The escalation dials live together here because they all put the renderer on the path to
+     * recovery: [SwapchainRecoveryPolicy.RECREATE_SURFACE_AT] replaces the WebGPU surface,
+     * [SwapchainRecoveryPolicy.REBUILD_DEVICE_AT] rebuilds the device (and with it Dawn's WSI object),
+     * [SwapchainRecoveryPolicy.SWITCH_BACKEND_AT] re-requests the adapter on Dawn's OpenGLES backend
+     * (EGL presentation, a different WSI implementation from `VkSwapchainKHR`), and
+     * [SwapchainRecoveryPolicy.GIVE_UP_AT] parks the loop with [FrameResult.Unavailable] once all three
+     * are proved futile. A [FrameResult.Drawn] frame resets [surfaceErrorStreak] in [render].
+     *
+     * The rungs matter because they fail in a fixed order on the field device (PowerVR GE8322,
+     * Android 11): a fresh surface on the same device reproduces the wedge, so the first rung
+     * only proves the swapchain object is not the whole problem. The 2026-11-22 dump shows the
+     * surface recreated at 30 and 120 frames with `getCurrentTexture` still Error, which is why
+     * the device and backend rungs exist.
      *
      * One caller is a non-success `getCurrentTexture` status, the other a throw from the same
      * call. **Both must come through here**: the viewer re-arms on every [FrameResult.Retry], so
@@ -1394,22 +1656,47 @@ class WebGpuRenderer {
      */
     private fun onSwapchainError(): FrameResult {
         surfaceErrorStreak++
-        if (surfaceErrorStreak >= SURFACE_ERROR_GIVE_UP_STREAK) {
-            Log.e(
-                "WebGpuRenderer",
-                "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
-            )
-            surfaceParkCount++
-            surfaceErrorStreak = 0
-            scheduleSurfaceRecreate()
-            return FrameResult.Unavailable
-        }
-        if (surfaceErrorStreak == SURFACE_ERROR_RECREATE_STREAK) {
-            Log.w(
-                "WebGpuRenderer",
-                "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
-            )
-            scheduleSurfaceRecreate()
+        when (SwapchainRecoveryPolicy.stepFor(surfaceErrorStreak)) {
+            SwapchainRecoveryStep.PARK -> {
+                Log.e(
+                    "WebGpuRenderer",
+                    "swapchain error streak $surfaceErrorStreak frames; parking until the surface changes"
+                )
+                surfaceParkCount++
+                surfaceErrorStreak = 0
+                // The park is final: every rung has been tried for this streak, and rebuilding yet
+                // another surface here only fed an Error loop the parking decision exists to stop.
+                // The next page decode, resize or user action re-arms the ladder from zero.
+                return FrameResult.Unavailable
+            }
+
+            SwapchainRecoveryStep.RECREATE_SURFACE -> {
+                Log.w(
+                    "WebGpuRenderer",
+                    "swapchain error streak $surfaceErrorStreak frames; recreating the surface"
+                )
+                scheduleSurfaceRecreate()
+            }
+
+            SwapchainRecoveryStep.REBUILD_DEVICE -> {
+                Log.w(
+                    "WebGpuRenderer",
+                    "swapchain error streak $surfaceErrorStreak frames; " +
+                        "recreating the surface did not help - rebuilding the GPU device"
+                )
+                scheduleSwapchainReset(switchBackend = false)
+            }
+
+            SwapchainRecoveryStep.SWITCH_BACKEND -> {
+                Log.w(
+                    "WebGpuRenderer",
+                    "swapchain error streak $surfaceErrorStreak frames; " +
+                        "device rebuild did not help - switching to the OpenGLES backend"
+                )
+                scheduleSwapchainReset(switchBackend = true)
+            }
+
+            SwapchainRecoveryStep.RETRY -> Unit
         }
         return FrameResult.Retry
     }

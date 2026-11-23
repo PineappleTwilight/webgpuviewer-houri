@@ -72,6 +72,11 @@ Android library + sample app: WebGPU-accelerated image viewer (manga-reader styl
   the published POM carries the dependency, so consumers always run the classes the library was
   compiled against. `mpreg-ca/androidx-webgpu-repo` must not be added back — its re-uploaded
   `1.0.0-dev06` paired new JNI symbols with old classes and broke every GPU call.
+- **Load the native runtime before the first `createInstance`, via `safeInitLibrary()`** — the
+  direct `System.loadLibrary("webgpu_c_bundled")` (which is exactly what the helper's
+  `initLibrary()` does) first, then the helper, then `WebGpuUtils.initLibrary` by reflection.
+  This is the upstream call order plus two fallbacks: a minified consumer that loses the helper
+  still finds the `.so`. Never move `createInstance` ahead of it.
 - NEVER/ALWAYS prose comments document invariants (TileRenderer.kt, ImagePage.kt densest) — read before touching pipeline.
 
 ## COMMANDS

@@ -21,6 +21,21 @@ code it patches still exists here and the fix is portable; near 0 means the targ
 
 ## Already answered in this fork (do not re-port)
 
+- **`initLibrary()` (the companion's first call in v58)** — `safeInitLibrary()` implements it and
+  more: a direct `System.loadLibrary("webgpu_c_bundled")` first (the same call the helper makes;
+  direct-first survives a minified consumer that loses the helper), then `initLibrary()`, then
+  `WebGpuUtils.initLibrary` by reflection. The class and its native library are therefore loaded
+  before `createInstance`, which is the failure this guards (`No implementation found ...
+  GPU.createInstance`).
+- **`requiredFeatures = TimestampQuery` (v58)** — `requiredFeaturesFor` adds it whenever the
+  adapter exposes it, and `TileRenderer` gates its measurements on the same feature.
+- **`Hdr.attachDisplay`'s ratio listener (v58)** — ours registers only when
+  `isHdrSdrRatioAvailable`; v58's `if (display != null)` can throw
+  `IllegalStateException` on an SDR-only panel.
+- **v58's surface configure/`getCurrentTexture` status path** — identical to this fork's pre-fix
+  base: `RGBA8Unorm` + `TextureUsage.RenderAttachment`, `Error` → log/reconfigure/Retry (v58 caps
+  retries at 10 and parks). There is no upstream surface fix to port; this fork's four-rung
+  `SwapchainRecoveryPolicy` is the answer to the wedge.
 - `acf9d1c` *Trigger redraw when cameOnScreen* — `ImagePage.cameOnScreen()` calls `onInvalidate`.
 - `92be54d` *Only update progress tracking when scrolling* — `isPanning` + `onViewport` gate exist.
 - `803fda0` *embed the render surface via TextureView* (pre-branch base) — `ViewerSurface.kt`

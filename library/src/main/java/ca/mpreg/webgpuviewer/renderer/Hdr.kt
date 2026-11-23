@@ -231,24 +231,87 @@ object Hdr {
      */
     suspend fun awaitSupportedByDevice(): Boolean {
         if (surfaceSupported != null && displaySupported != null) return supportedByDevice
-        return withTimeoutOrNull(RESOLVE_TIMEOUT_MS) { resolved.await() } ?: run {
+        // KMK --> Check the live values after the wait as well: a backend switch resets
+        // [surfaceSupported] while [resolved] is already complete, and a completed deferred would
+        // otherwise hand back the previous backend's answer.
+        // KMK <--
+        if (withTimeoutOrNull(RESOLVE_TIMEOUT_MS) { resolved.await() } == null) {
             Log.w(TAG, "No surface after ${RESOLVE_TIMEOUT_MS}ms - decoding as SDR")
-            false
+            return false
         }
+        return supportedByDevice
+    }
+
+    /**
+     * KMK --> What the surface advertises, and which SDR format to configure with.
+     *
+     * Every render target in the library is allocated against [frameFormat], so the format the
+     * swapchain is configured with must be one the driver actually reports. `RGBA8Unorm` is the
+     * usual answer, but it is not guaranteed: Vulkan WSI on Android is free to list only
+     * `BGRA8Unorm`, and configuring with a format the surface does not support fails inside Dawn
+     * without throwing out of `GPUSurface.configure` - the surface then returns
+     * `SurfaceGetCurrentTextureStatus.Error` on every frame. A field log cannot distinguish that
+     * from a wedged swapchain, so the format is chosen from the surface's own list and the list is
+     * written to logcat.
+     * KMK <--
+     */
+    @Volatile
+    private var surfaceFormatList: IntArray = IntArray(0)
+
+    @Volatile
+    private var sdrFrameFormat: Int = TextureFormat.RGBA8Unorm
+
+    internal fun surfaceSupports(format: Int): Boolean {
+        val formats = surfaceFormatList
+        return formats.isEmpty() || formats.contains(format)
+    }
+
+    /**
+     * KMK --> Forget everything a surface answered, for a device/instance rebuild that may land on
+     * a different backend. HDR presentation above all: the OpenGLES backend does not expose a
+     * float swapchain here, and keeping the old answer would make the renderer configure one.
+     * [resolved] is already complete by then, so telling a decode "not HDR" is the safe half - the
+     * session is mid-flight and its decoded pages cannot change format retroactively anyway.
+     * KMK <--
+     */
+    internal fun resetSurfaceSupportForBackendChange() {
+        // Null, not false: the next createSurface() must ask the new backend's surface for its
+        // own capability list (resolve() short-circuits on a non-null answer). Until it answers,
+        // supportedByDevice is false, which is the safe direction for a mid-session decode.
+        surfaceSupported = null
+        surfaceFormatList = IntArray(0)
+        sdrFrameFormat = TextureFormat.RGBA8Unorm
+        frameFormat = TextureFormat.RGBA8Unorm
+        hdrDrawn = false
+        framesWithoutHdr = HDR_IDLE_FRAMES
     }
 
     /** Kept from the first surface to answer; a later one on the same device reports the same. */
     internal fun resolve(surface: GPUSurface, adapter: GPUAdapter) {
         if (surfaceSupported != null) return
 
-        surfaceSupported = try {
-            surface.getCapabilities(adapter).formats.any { it == TextureFormat.RGBA16Float }
+        try {
+            val caps = surface.getCapabilities(adapter)
+            val formats = caps.formats
+            surfaceFormatList = formats
+            surfaceSupported = formats.any { it == TextureFormat.RGBA16Float }
+            sdrFrameFormat = when {
+                formats.contains(TextureFormat.RGBA8Unorm) -> TextureFormat.RGBA8Unorm
+                formats.contains(TextureFormat.BGRA8Unorm) -> TextureFormat.BGRA8Unorm
+                formats.isNotEmpty() -> formats.first()
+                else -> TextureFormat.RGBA8Unorm
+            }
+            Log.i(
+                TAG,
+                "surface formats=${formats.joinToString(",")} usages=${caps.usages} " +
+                    "alpha=${caps.alphaModes.joinToString(",")} present=${caps.presentModes.joinToString(",")} " +
+                    "HDR surface support=$surfaceSupported sdr=$sdrFrameFormat",
+            )
         } catch (e: Exception) {
+            surfaceSupported = false
             Log.w(TAG, "Could not read surface capabilities - staying in SDR", e)
-            false
         }
 
-        Log.i(TAG, "HDR surface support = $surfaceSupported")
         publishIfResolved()
     }
 
@@ -278,9 +341,13 @@ object Hdr {
     private val hdrLock = Any()
 
     val presentFormat: Int
-        get() = if (supportedByDevice && liveHdrCount > 0 && hdrRecentlyDrawn)
+        get() = if (supportedByDevice && liveHdrCount > 0 && hdrRecentlyDrawn &&
+            surfaceSupports(TextureFormat.RGBA16Float)
+        ) {
             TextureFormat.RGBA16Float
-        else TextureFormat.RGBA8Unorm
+        } else {
+            sdrFrameFormat
+        }
 
     /**
      * Rendered frames drawing no HDR image before presentation drops back to SDR.
@@ -389,6 +456,10 @@ object Hdr {
         if (drew) framesWithoutHdr =
             0 else if (framesWithoutHdr < HDR_IDLE_FRAMES) framesWithoutHdr++
 
+        // KMK --> [presentFormat] already resolves to an advertised format: HDR only when the
+        // surface lists RGBA16Float, otherwise [sdrFrameFormat] from the same capability list.
+        // Every allocation, pipeline target and the swapchain configure therefore agree.
+        // KMK <--
         val next = presentFormat
 
         // Presenting HDR but nothing drew it: the loop is invalidate-driven, so it has to be

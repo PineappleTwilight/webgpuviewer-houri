@@ -58,6 +58,21 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     internal val tiles = TileRenderer { invalidate() }
 
     /**
+     * KMK --> Runs before the renderer replaces the device behind a wedged swapchain.
+     *
+     * The device-loss path asks this state to drop its device-bound caches before rebuilding
+     * (`recoverFromDeviceLoss` below); the swapchain ladder starts inside the renderer, so it
+     * takes this hook to keep the same ordering. Without it the tile atlas, its mip chains and
+     * the filter pool still hold handles from the retired device and the next frame records
+     * against them.
+     * KMK <--
+     */
+    private val deviceRebuildListener =
+        WebGpuRenderer.Companion.DeviceRebuildListener {
+            tiles.recoverFromDeviceLoss()
+        }
+
+    /**
      * How a high-quality tile that magnifies the page is resized - see [Rescaler]. Assigning
      * drops the tiles already generated. [UpscalerArtCnn] doubles through a network first.
      */
@@ -364,6 +379,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         try {
             onReaderStateChanged?.invoke(ReaderState.Idle)
         } catch (_: Throwable) {}
+        WebGpuRenderer.addDeviceRebuildListener(deviceRebuildListener)
         this.renderer.init(scope, surface, width, height)
         this.scope = scope
         Hdr.requestFrame = invalidateCallback
@@ -694,6 +710,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         // Held by an object that outlives this state, so it has to be dropped by hand - but only
         // if it is still ours: a replacement viewer inits before the one it replaces cleans up.
         if (Hdr.requestFrame === invalidateCallback) Hdr.requestFrame = null
+        WebGpuRenderer.removeDeviceRebuildListener(deviceRebuildListener)
         Transition.releasePagesOf(this)
         tiles.cleanup()
         renderer.cleanup()
