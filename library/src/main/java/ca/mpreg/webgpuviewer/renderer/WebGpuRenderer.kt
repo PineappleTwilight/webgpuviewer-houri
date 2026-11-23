@@ -127,6 +127,21 @@ class WebGpuRenderer {
         var adapterDescription: String = "unknown"
             private set
 
+        /**
+         * KMK --> Whether the tile cache may be used on the live adapter.
+         *
+         * The tiled path is an overlay on top of the direct page draw, and on the PowerVR Rogue
+         * GE8322 field device it presents as a black page even though every frame reaches
+         * `present()` and every page decodes (2026-11-23 dump: `drawn=true frames=139`, no
+         * device loss or park, images never visible). The direct `renderWith` path is the same
+         * content without the tile atlas/stencil pass, so that device is served by it.
+         * A device-keyed fallback, not a quality decision: the direct path draws the page's own
+         * texture at full resolution.
+         * KMK <--
+         */
+        val tileCacheUsable: Boolean
+            get() = !adapterDescription.contains("PowerVR", ignoreCase = true)
+
         private fun describeAdapter(adapter: GPUAdapter): String = runCatching {
             val info = adapter.getInfo()
             "vendor=${info.vendor} arch=${info.architecture} device=${info.device} " +

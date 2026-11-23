@@ -74,6 +74,14 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   no instance buffer) skipped `renderPage` and left the page invisible with no error — the 2026-11-22
   black-page shape. `TileRenderer.drawCore` now requires an actual blit; if you add a "nothing to
   draw" early return, it must answer `false`, never `true`.
+- **The tile cache is not offered on PowerVR Rogue.** `WebGpuRenderer.tileCacheUsable` is false
+  for an adapter description naming PowerVR, and `ImageSingle.drawLive`/`renderCacheSeed` take the
+  direct `renderWith` path before either the animated or the high-quality branch. The 2026-11-23
+  field dump (Multilaser M8_4G, PowerVR GE8322) presents on every frame (`frames=139`,
+  `drawn=true`) and still shows no image; the direct draw is the path that does not open the
+  tile/stencil pass. The app also sets `highQuality=false` for those pages so the tile grid is
+  never generated or prewarmed. Do not remove the gate without a device test — it is a
+  presentation fallback, not a quality choice.
 - **The page is painted *under* the tiles, every frame — the tile cache is an overlay, never a
   substitute.** `ImageSingle.drawLive` paints the page with `renderPage` unconditionally and then
   blits the tile cache over it. It used to paint the page only when the grid answered "not

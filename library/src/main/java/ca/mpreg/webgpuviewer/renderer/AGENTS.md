@@ -210,6 +210,14 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   instead of making every tile request fail. `atlasBudgetTiles` still records the *requested*
   budget even when the side is capped — it is what the budget now is, not what the atlas holds —
   so a cap cannot loop a grow-through-`newFrame` regen.
+- **PowerVR Rogue does not use the tile cache.** `WebGpuRenderer.tileCacheUsable` is false when
+  the adapter description names PowerVR; `ImageSingle.drawLive` then takes the direct
+  `renderWith` path before the animated/high-quality branches, `renderCacheSeed` does the same,
+  and the app sets `highQuality=false` so prewarming never starts a grid. The 2026-11-23 dump
+  (M8_4G/GE8322) presented 139 frames with `drawn=true` and still showed no image; the tiled
+  overlay and stencil pass are the only path that dump could not rule out. The direct draw is the
+  same content without them. A device-keyed fallback, not a quality choice; leave it in place
+  until a PowerVR device proves the tiled path draws.
 - **A glyph past the font-atlas cap renders advance-only, and that result is cached for the
   session.** `addGlyph` returns a bare-advance `Glyph` (`hasQuad = false`, exactly like a space)
   when the raster exceeds the cap *or* no longer fits the shelf after `growAtlas` clamped — the

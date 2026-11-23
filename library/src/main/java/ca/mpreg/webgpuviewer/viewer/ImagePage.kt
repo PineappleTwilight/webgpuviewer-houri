@@ -579,6 +579,10 @@ open class ImagePage {
         override fun drawLive(
             encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
         ): Boolean {
+            // KMK --> The PowerVR gate sits before the animated and high-quality branches: the
+            // direct draw opens no stencil pass at all, which is the path this device has to use.
+            if (!WebGpuRenderer.tileCacheUsable) return super.drawLive(encoder, dst, tiles)
+            // KMK <--
             if (isAnimated) {
                 val pass = try {
                     beginLivePass(encoder, dst, tiles)
@@ -599,7 +603,7 @@ open class ImagePage {
                 return false
             }
 
-            if (!highQuality) return super.drawLive(encoder, dst, tiles)
+            if (!highQuality || !WebGpuRenderer.tileCacheUsable) return super.drawLive(encoder, dst, tiles)
 
             // KMK --> A device that cannot provide the stencil attachment (or rejects the tile
             // pass for any other reason) used to throw here before the tile catch below could
@@ -668,6 +672,10 @@ open class ImagePage {
         override fun renderCacheSeed(
             encoder: GPUCommandEncoder, tex: GPUTexture, tiles: TileRenderer
         ) {
+            if (!WebGpuRenderer.tileCacheUsable) {
+                super.renderCacheSeed(encoder, tex, tiles)
+                return
+            }
             if (isAnimated) {
                 val pass = beginCachePass(encoder, tex)
                 try {
@@ -691,7 +699,7 @@ open class ImagePage {
                 return
             }
 
-            if (!highQuality) {
+            if (!highQuality || !WebGpuRenderer.tileCacheUsable) {
                 super.renderCacheSeed(encoder, tex, tiles)
                 return
             }
@@ -721,7 +729,7 @@ open class ImagePage {
         }
 
         override fun newlyAvailableTileKeys(tiles: TileRenderer, tex: GPUTexture): Set<Long>? =
-            if (!highQuality || isAnimated) null else tiles.availableTileKeys(this, tex)
+            if (!highQuality || isAnimated || !WebGpuRenderer.tileCacheUsable) null else tiles.availableTileKeys(this, tex)
 
         override fun renderIntoCache(
             encoder: GPUCommandEncoder,

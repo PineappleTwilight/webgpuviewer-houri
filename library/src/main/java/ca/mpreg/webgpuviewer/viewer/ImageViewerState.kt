@@ -600,7 +600,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         if (covered && page is ImagePage.ImageSingle && page.atHome) {
             listOfNotNull(s.nextPage, s.prevPage).forEach { neighbor ->
                 val single = neighbor as? ImagePage.ImageSingle
-                if (single != null && single.highQuality && !single.isAnimated && single.atHome) {
+                if (single != null && single.highQuality && WebGpuRenderer.tileCacheUsable && !single.isAnimated && single.atHome) {
                     tiles.prewarm(single, texture)
                 }
             }
