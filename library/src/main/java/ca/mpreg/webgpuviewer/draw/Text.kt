@@ -1180,3 +1180,5 @@ private fun drawGlyphBatch(
     vertexBuffer.close()
     paramsBuffer.close()
 }
+
+internal fun resetTextPipelinesForDeviceRebuild() = pipelines.clear()

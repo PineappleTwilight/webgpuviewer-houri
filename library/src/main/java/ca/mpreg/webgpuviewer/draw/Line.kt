@@ -129,3 +129,5 @@ fun Draw.line(
     pass.dispatchWorkgroups(dispatchW, dispatchH)
     pass.endAndRelease(targetView)
 }
+
+internal fun resetLinePipelinesForDeviceRebuild() = pipelines.clear()

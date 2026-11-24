@@ -198,3 +198,5 @@ fun Draw.rect(
     pass.draw(6)
     uniformBuffer.close()
 }
+
+internal fun resetRectPipelinesForDeviceRebuild() = pipelines.clear()

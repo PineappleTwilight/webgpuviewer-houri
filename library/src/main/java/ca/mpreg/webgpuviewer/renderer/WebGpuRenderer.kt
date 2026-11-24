@@ -1355,6 +1355,14 @@ class WebGpuRenderer {
             // surface presents nothing (2026-11-23 Mali-G76 field dump). Drop them before any
             // frame can use the new device.
             RenderPage.resetForDeviceRebuild()
+            // KMK --> The draw primitives cache pipelines too (the page background is Draw.rect,
+            // page numbers are Draw.text). A stale one from these is the same
+            // "[RenderPipeline] is associated with [Device]" rejection the page pipelines had.
+            ca.mpreg.webgpuviewer.draw.resetRectPipelinesForDeviceRebuild()
+            ca.mpreg.webgpuviewer.draw.resetCirclePipelinesForDeviceRebuild()
+            ca.mpreg.webgpuviewer.draw.resetLinePipelinesForDeviceRebuild()
+            ca.mpreg.webgpuviewer.draw.resetTextPipelinesForDeviceRebuild()
+            // KMK <--
             // KMK <--
             // A fresh adapter can report different limits, and this is read live by the upload
             // paths, so it has to move with the device rather than keep the previous one's value.

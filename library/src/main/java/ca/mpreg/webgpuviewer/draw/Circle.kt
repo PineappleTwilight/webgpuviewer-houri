@@ -159,3 +159,5 @@ fun Draw.circle(
     pass.draw(6)
     uniformBuffer.close()
 }
+
+internal fun resetCirclePipelinesForDeviceRebuild() = pipelines.clear()
