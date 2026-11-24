@@ -94,6 +94,31 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   did not land left a black page with no error — the 2026-11-22 report. The cost is one textured
   page quad per frame per page, which is what the pre-tile renderer did and what every non-WebGPU
   viewer does. **Do not reintroduce the skip**: `covered` may decide prewarming and nothing else.
+- **The paged page pass has no stencil attachment, and nothing in it needs one.** With the page
+  painted under the tiles, the tiles' stencil writes have no consumer — the page is not masked by
+  them — so `ImageSingle.beginLivePass` opens a plain colour pass, `renderPage`/`renderBackground`
+  run `masked = false`, and `tiles.draw(..., useStencilMask = false)` blits with the stencil-free
+  pipeline. Before this, the page was drawn in a stencil-attached pass with a no-op stencil state;
+  the 2026-11-24 dumps (Mali-G76 and PowerVR GE8322) present a frame with a correct page quad and
+  `errs=0` while the screen stays black, which is exactly what a driver that mishandles a
+  stencil-attached pass leaves behind, and no pipeline state could be blamed from the log. Keep the
+  paged path stencil-free: a pass with no stencil attachment cannot discard a fragment for stencil
+  reasons. The continuous viewer still opens a stencil-attached shared pass (it draws several pages
+  through one `renderPass`), so its `masked = true` calls and the `samplerVariant`/`plainVariantMasked`
+  pipelines remain.
+- **The page-texture readback is the only fact that separates a black texture from a black
+  composite.** `RenderProbe.armTextureSample` copies the first drawn page's centre texel and
+  `WebGpuRenderer.render` reports it as `tex=rgba=…` in the session report. It was dropped once for
+  cost; the 2026-11-24 dumps then had `tex=none`, and the two possible causes could not be told
+  apart. Keep the one-shot copy (one 256-byte readback per session, after the present).
+- **The surface's alpha path is not the black-page cause, and making the TextureView opaque does
+  not fix it.** The page footprint already carries an opaque `backgroundColor` rect drawn before
+  the page, so the black seen there is an opaque black fill, not a transparent frame. Both
+  2026-11-24 dumps (Mali-G76 and PowerVR GE8322) show `draw=pages=1 quads=1`, a correct `rect`,
+  `errs=0` and a presented frame: the page's own pass discarded it, or the texture is black. The
+  page pass has no stencil attachment since 2026-11-24 (see above); `tex=` then settles texture vs
+  composite. Do not switch the TextureView to `isOpaque = true` as a fix: it would black out the
+  page margins and the fade's backdrop while leaving an opaque black page exactly as black.
 - **Device-bound pipeline caches do not survive a rebuild, and a rejected frame is not drawn.**
   `RenderPage`'s `Variant`/`FormatKeyed` caches (sampler, sampler-unmasked, plain, plain-masked,
   masked-rect) are built against one `GPUDevice`; nothing cleared them when `recreateDeviceLocked`

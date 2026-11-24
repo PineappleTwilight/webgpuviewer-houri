@@ -1709,7 +1709,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         dst: GPUTexture,
         x: Float,
         y: Float,
-        scale: Float
+        scale: Float,
+        useStencilMask: Boolean = true,
     ): Boolean {
         // KMK --> A device whose tile path paints black never gets a grid at all. The direct
         // page draw is the fallback, not an overlay under a possibly-black tile blit.
@@ -1726,7 +1727,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             a.pageScale,
             page.isScaleAnimating,
             applyRetainWindow = true,
-            useStencilMask = true,
+            useStencilMask = useStencilMask,
             holdIncomplete = true,
         )
         // Never "covered" off a pinned grid: it sits at the animation's target, so the live draw

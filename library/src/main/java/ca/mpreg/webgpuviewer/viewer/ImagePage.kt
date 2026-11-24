@@ -15,7 +15,6 @@ import androidx.compose.ui.util.fastCoerceIn
 import androidx.webgpu.GPUColor
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPURenderPassColorAttachment
-import androidx.webgpu.GPURenderPassDepthStencilAttachment
 import androidx.webgpu.GPURenderPassDescriptor
 import androidx.webgpu.GPURenderPassEncoder
 import androidx.webgpu.GPUTexture
@@ -530,9 +529,19 @@ open class ImagePage {
             }
         }
 
-        /** Opens a `LoadOp.Clear` pass on [dst], with a stencil attachment for [TileRenderer]'s masking. */
+        /**
+         * Opens a `LoadOp.Clear` pass on [dst] with **no stencil attachment**.
+         *
+         * The page is now painted under the tiles on every frame and the tile blit no longer
+         * masks anything, so nothing in this path reads or writes stencil. Keeping the
+         * attachment bought nothing and left the page's visibility dependent on a driver's
+         * stencil handling: the 2026-11-24 field dumps (Mali-G76 and PowerVR GE8322) present
+         * frames with a correct page quad and no validation error while the screen stays black,
+         * which is exactly the shape a stencil-attached pass that silently discards fragments
+         * leaves behind. A stencil-free pass cannot do that.
+         */
         private fun beginLivePass(
-            encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
+            encoder: GPUCommandEncoder, dst: GPUTexture
         ): GPURenderPassEncoder {
             val targetView = dst.createView()
             // The pass holds its own reference to its attachment, so ours can go at once.
@@ -545,11 +554,6 @@ open class ImagePage {
                             storeOp = StoreOp.Store,
                             clearValue = GPUColor(0.0, 0.0, 0.0, 0.0)
                         )
-                    ), depthStencilAttachment = GPURenderPassDepthStencilAttachment(
-                        view = tiles.stencilViewFor(dst),
-                        stencilLoadOp = LoadOp.Clear,
-                        stencilStoreOp = StoreOp.Discard,
-                        stencilClearValue = 0,
                     )
                 )
             ).also { targetView.close() }
@@ -580,8 +584,8 @@ open class ImagePage {
          * [highQuality] (never worth a tile cache that would just churn every frame); a
          * non-[highQuality], non-animated page falls back to the plain [renderWith] (via `super`);
          * everything else paints the page itself and then blits the tile cache over it. Opens its
-         * own pass (with a stencil attachment, for [TileRenderer]'s masking) rather than sharing
-         * one from the caller - see [Render] for why that split exists.
+         * own **stencil-free** pass rather than sharing one from the caller - see [Render] for
+         * why that split exists.
          */
         override fun drawLive(
             encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
@@ -591,19 +595,10 @@ open class ImagePage {
             if (!WebGpuRenderer.tileCacheUsable) return super.drawLive(encoder, dst, tiles)
             // KMK <--
             if (isAnimated) {
-                val pass = try {
-                    beginLivePass(encoder, dst, tiles)
-                } catch (e: Exception) {
-                    Log.e(
-                        "ImagePage",
-                        "Animated/stencil pass failed for ${width}x$height; using the fast page path",
-                        e
-                    )
-                    return super.drawLive(encoder, dst, tiles)
-                }
+                val pass = beginLivePass(encoder, dst)
                 try {
-                    renderBackground(pass, dst, 0f, 0f, 1f)
-                    renderPage(pass, dst, 0f, 0f, 1f)
+                    renderBackground(pass, dst, 0f, 0f, 1f, masked = false)
+                    renderPage(pass, dst, 0f, 0f, 1f, masked = false)
                 } finally {
                     pass.endAndRelease()
                 }
@@ -612,32 +607,18 @@ open class ImagePage {
 
             if (!highQuality || !WebGpuRenderer.tileCacheUsable) return super.drawLive(encoder, dst, tiles)
 
-            // KMK --> A device that cannot provide the stencil attachment (or rejects the tile
-            // pass for any other reason) used to throw here before the tile catch below could
-            // ever run, every frame, for the life of the page. The fast path opens no stencil
-            // pass at all, so demote and draw the page directly instead.
-            val pass = try {
-                beginLivePass(encoder, dst, tiles)
-            } catch (e: Exception) {
-                highQuality = false
-                Log.e(
-                    "ImagePage",
-                    "Tile/stencil pass failed for ${width}x$height; using the fast page path",
-                    e
-                )
-                return super.drawLive(encoder, dst, tiles)
-            }
+            val pass = beginLivePass(encoder, dst)
             try {
                 // Background always drawn live first (its fades are position-dependent, never
                 // from a stale tile) so it stays underneath everything else.
-                renderBackground(pass, dst, 0f, 0f, 1f)
+                renderBackground(pass, dst, 0f, 0f, 1f, masked = false)
                 // KMK --> The page itself is painted every frame, under the tiles. The tile cache
                 // is an overlay, never a substitute: see the note on [ImageSingle] for the
-                // black-screen report that made this unconditional.
-                renderPage(pass, dst, 0f, 0f, 1f)
-                // Tiles draw next, marking every pixel they cover in the stencil buffer
-                // tiles.draw() writes to. Where they paint they supply the sharp cut; where they
-                // don't, the page above shows through.
+                // black-screen report that made this unconditional. `masked = false` because
+                // this pass has no stencil attachment: the tiles no longer mask the page.
+                renderPage(pass, dst, 0f, 0f, 1f, masked = false)
+                // Tiles draw next. Where they paint they supply the sharp cut; where they
+                // don't, the page below shows through.
                 // KMK --> A tile-pipeline failure must not take the page down with it. The tile
                 // cache is an optimization; `renderPage` is the same content drawn directly from
                 // the page's own textures. On a driver that rejects a tile atlas/pipeline
@@ -645,7 +626,7 @@ open class ImagePage {
                 // below could run, so the page stayed black. Demote this page to the fast path
                 // for the rest of its life and let the pass show it.
                 val covered = try {
-                    tiles.draw(pass, this, dst, 0f, 0f, 1f)
+                    tiles.draw(pass, this, dst, 0f, 0f, 1f, useStencilMask = false)
                 } catch (e: Exception) {
                     highQuality = false
                     Log.e(
@@ -662,7 +643,10 @@ open class ImagePage {
                         it[0],
                         it[1],
                         it[2],
-                        it[3]
+                        it[3],
+                        // This pass has no stencil attachment; the masked rect pipeline would be
+                        // invalid here.
+                        masked = false,
                     )
                 }
                 return covered
@@ -871,8 +855,9 @@ open class ImagePage {
          * [RenderPage.drawMaskedRect] - since it always runs inside that pass.
          */
         fun renderBackground(
-            pass: GPURenderPassEncoder, dst: GPUTexture, x: Float, y: Float, scale: Float
-        ) = drawPageBackground(pass, dst, scale, maskedBackground = true)
+            pass: GPURenderPassEncoder, dst: GPUTexture, x: Float, y: Float, scale: Float,
+            masked: Boolean = true
+        ) = drawPageBackground(pass, dst, scale, maskedBackground = masked)
 
         /**
          * The background's fade, from the live pan/scale - it only shows near the edges of the
@@ -938,8 +923,10 @@ open class ImagePage {
             val a = (((color ushr 24) and 0xFF) * backgroundAlpha(scale)).toInt()
             if (a <= 0) return
 
-            // Alpha only. The frame clears transparent, so fading this out crossfades to whatever
-            // the app painted behind the surface - the backdrop this is meant to give way to.
+            // Alpha only. On the API 34+ SurfaceView the frame clears transparent, so fading this
+            // out crossfades to whatever the app painted behind the surface - the backdrop this is
+            // meant to give way to. Below API 34 the TextureView is opaque, so the same fade ends
+            // on the clear colour instead; the page footprint is opaque either way.
             // Both pipelines blend with SrcAlpha already, so scaling rgb here applied the fade a
             // second time and took the crossfade through black on its way there.
             val bgColor = (a shl 24) or (color and 0xFFFFFF)
