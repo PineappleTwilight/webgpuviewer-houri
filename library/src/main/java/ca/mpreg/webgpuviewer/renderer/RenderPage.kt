@@ -108,9 +108,12 @@ object RenderPage {
     }
 
     // Every caller of renderFast is inside ImageViewerState/ImageViewerContinuousState's own
-    // render pass, which always attaches TileRenderer's stencil buffer (see [stencilViewFor]) -
-    // so samplerVariant's pipeline can carry the stencil test directly, skipping a pixel
-    // TileRenderer's blit already wrote (stencil == 1) instead of shading it a second time.
+    // render pass, which always attaches TileRenderer's stencil buffer (see [stencilViewFor]).
+    // The stencil state here must be a no-op: the page is drawn *under* the tiles, while the
+    // stencil buffer is still cleared to 0 for the frame. A NotEqual test against the default
+    // reference of 0 discarded every page fragment on both Mali-G76 and PowerVR GE8322 - the
+    // page path drew nothing and the screen stayed black whenever the tile path was enabled.
+    // Tiles draw over the page with their own stencil-write pipeline, so no masking is needed.
     private val samplerVariant = Variant { format ->
         buildPipeline(
             TILE_HEADER + TILE_VS_MAIN + TILE_SAMPLER_FS, format,
@@ -118,8 +121,8 @@ object RenderPage {
                 format = TextureFormat.Stencil8,
                 depthWriteEnabled = OptionalBool.False,
                 depthCompare = CompareFunction.Always,
-                stencilFront = GPUStencilFaceState(compare = CompareFunction.NotEqual),
-                stencilBack = GPUStencilFaceState(compare = CompareFunction.NotEqual),
+                stencilFront = GPUStencilFaceState(compare = CompareFunction.Always),
+                stencilBack = GPUStencilFaceState(compare = CompareFunction.Always),
                 stencilReadMask = 0xFF,
             )
         )
