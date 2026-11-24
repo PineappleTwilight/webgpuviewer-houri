@@ -1,5 +1,7 @@
 package ca.mpreg.webgpuviewer.viewer
 
+import androidx.webgpu.GPUTexture
+
 /**
  * KMK --> What the newest encoded frame actually asked the page path to draw.
  *
@@ -35,6 +37,47 @@ object RenderProbe {
     var lastRect: String = "none"
         private set
 
+    // KMK --> One-shot page-texture readback: the first drawn page's centre four quarters are
+    // copied to a mappable buffer and logged as RGBA. This is what separates "the source texture
+    // is black" from "the texture is fine and the draw/compositor is black". Armed once per
+    // session by ImageSingle.renderPage, consumed by WebGpuRenderer.render.
+    class TextureSample(val texture: GPUTexture, val x: Int, val y: Int)
+
+    @Volatile
+    private var textureSampleArmed = false
+
+    @Volatile
+    private var pendingTexture: GPUTexture? = null
+
+    @Volatile
+    private var pendingX = 0
+
+    @Volatile
+    private var pendingY = 0
+
+    @Volatile
+    var textureSample: String = "none"
+        private set
+
+    fun armTextureSample(texture: GPUTexture, x: Int, y: Int) {
+        if (textureSampleArmed) return
+        textureSampleArmed = true
+        pendingTexture = texture
+        pendingX = x
+        pendingY = y
+    }
+
+    fun takeTextureSample(): TextureSample? {
+        val texture = pendingTexture ?: return null
+        pendingTexture = null
+        return TextureSample(texture, pendingX, pendingY)
+    }
+
+    fun noteTextureSample(value: String) {
+        textureSample = value
+    }
+    // KMK <--
+
     fun beginFrame() {
         pages = 0
         imageQuads = 0
@@ -57,5 +100,5 @@ object RenderProbe {
 
     fun summary(): String =
         "pages=$pages quads=$imageQuads skippedNoMips=$skippedNoMips " +
-            "last=$lastPage rect=$lastRect"
+            "last=$lastPage rect=$lastRect tex=$textureSample"
 }

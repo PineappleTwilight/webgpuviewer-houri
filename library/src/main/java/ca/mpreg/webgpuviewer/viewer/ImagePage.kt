@@ -826,6 +826,18 @@ open class ImagePage {
                     "dst=${dst.width}x${dst.height} hq=$highQuality rect=$probeRect"
             )
             // KMK <--
+            // KMK --> One-shot readback of the decoded page's centre texel, so the field report
+            // can say whether the source texture itself is black.
+            image?.mipmaps?.firstOrNull()?.let { m ->
+                m.textures.firstOrNull()?.let { tex ->
+                    RenderProbe.armTextureSample(
+                        tex,
+                        minOf(m.tilesize, m.width) / 2,
+                        minOf(m.tilesize, m.height) / 2,
+                    )
+                }
+            }
+            // KMK <--
             val variant = RenderPage.variantFor(linear, masked)
             if (!linear || !masked) {
                 drawPageBackground(pass, dst, scale, maskedBackground = masked)

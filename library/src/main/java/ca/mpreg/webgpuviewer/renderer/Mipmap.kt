@@ -151,7 +151,7 @@ class Mipmap(
                                 alignedWidth(tileWidth).coerceAtLeast(allocW), allocH
                             ),
                             format = format,
-                            usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
+                            usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.CopySrc or TextureUsage.RenderAttachment,
                         )
                     )
                 } catch (e: OutOfMemoryError) {
@@ -166,7 +166,7 @@ class Mipmap(
                                 GPUTextureDescriptor(
                                     size = GPUExtent3D(8, 8),
                                     format = format,
-                                    usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.RenderAttachment,
+                                    usage = TextureUsage.TextureBinding or TextureUsage.CopyDst or TextureUsage.CopySrc or TextureUsage.RenderAttachment,
                                 )
                             )
                         } catch (e2: Exception) {

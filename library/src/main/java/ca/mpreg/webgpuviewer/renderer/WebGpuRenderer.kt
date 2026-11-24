@@ -5,24 +5,34 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.webgpu.BackendType
+import androidx.webgpu.BufferUsage
 import androidx.webgpu.DeviceLostCallback
 import androidx.webgpu.FeatureLevel
 import androidx.webgpu.FeatureName
 import androidx.webgpu.GPU.createInstance
 import androidx.webgpu.GPUAdapter
+import androidx.webgpu.GPUBuffer
+import androidx.webgpu.GPUBufferDescriptor
 import androidx.webgpu.GPUCommandEncoder
 import androidx.webgpu.GPUDevice
 import androidx.webgpu.GPUDeviceDescriptor
+import androidx.webgpu.GPUExtent3D
 import androidx.webgpu.GPUInstance
 import androidx.webgpu.GPUInstanceDescriptor
 import androidx.webgpu.GPULimits
+import androidx.webgpu.GPUOrigin3D
 import androidx.webgpu.GPURequestAdapterOptions
 import androidx.webgpu.GPUSurface
 import androidx.webgpu.GPUSurfaceConfiguration
 import androidx.webgpu.GPUSurfaceDescriptor
 import androidx.webgpu.GPUSurfaceSourceAndroidNativeWindow
+import androidx.webgpu.GPUTexelCopyBufferInfo
+import androidx.webgpu.GPUTexelCopyBufferLayout
+import androidx.webgpu.GPUTexelCopyTextureInfo
 import androidx.webgpu.GPUTexture
+import androidx.webgpu.MapMode
 import androidx.webgpu.SurfaceGetCurrentTextureStatus
+import androidx.webgpu.TextureAspect
 import androidx.webgpu.TextureUsage
 import androidx.webgpu.UncapturedErrorCallback
 import androidx.webgpu.helper.Util.windowFromSurface
@@ -1567,6 +1577,7 @@ class WebGpuRenderer {
             surfaceErrorStreak = 0
 
             var encoder: GPUCommandEncoder? = null
+            var sampleBuffer: GPUBuffer? = null
             try {
                 encoder = device.createCommandEncoder()
                 // KMK --> Both rings belong to this encoded frame: the masked-rect slots and the
@@ -1579,6 +1590,37 @@ class WebGpuRenderer {
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))
                 filters.endFrame(encoder, texture)
+                // KMK --> One-shot page-texture readback, armed by ImageSingle.renderPage. The
+                // copy goes into this frame's encoder; the map is read after the present and the
+                // result lands in the session report's `tex=`. Nothing else in a frame changes.
+                ca.mpreg.webgpuviewer.viewer.RenderProbe.takeTextureSample()?.let { sample ->
+                    try {
+                        val buffer = device.createBuffer(
+                            GPUBufferDescriptor(
+                                usage = BufferUsage.MapRead or BufferUsage.CopyDst,
+                                size = 256,
+                                label = "page-readback",
+                            )
+                        )
+                        encoder.copyTextureToBuffer(
+                            GPUTexelCopyTextureInfo(
+                                sample.texture, 0,
+                                GPUOrigin3D(sample.x, sample.y, 0),
+                                TextureAspect.All,
+                            ),
+                            GPUTexelCopyBufferInfo(
+                                buffer, GPUTexelCopyBufferLayout(0, 256, 1)
+                            ),
+                            GPUExtent3D(1, 1, 1),
+                        )
+                        sampleBuffer = buffer
+                    } catch (e: Throwable) {
+                        ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
+                            "copy failed ${e.message}"
+                        )
+                    }
+                }
+                // KMK <--
                 // A device loss landing while [fn] above suspends (tile generation waits inside
                 // it) invalidates the native queue before this submit. The Kotlin deviceLost flag
                 // only flips when the loss callback runs, so the entry isAvailable gate cannot
@@ -1629,6 +1671,28 @@ class WebGpuRenderer {
                 // report needs it.
                 // KMK <--
                 presentedFrames++
+                // KMK --> Resolve the one-shot readback now that the GPU has the copy.
+                sampleBuffer?.let { buffer ->
+                    try {
+                        buffer.mapAndAwait(MapMode.Read, 0, 4)
+                        val bytes = ByteArray(4)
+                        buffer.getMappedRange(0, 4).get(bytes)
+                        ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
+                            "rgba=${bytes[0].toInt() and 0xFF},${bytes[1].toInt() and 0xFF}," +
+                                "${bytes[2].toInt() and 0xFF},${bytes[3].toInt() and 0xFF}"
+                        )
+                    } catch (e: Throwable) {
+                        ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
+                            "map failed ${e.message}"
+                        )
+                    } finally {
+                        try { buffer.unmap() } catch (_: Throwable) {}
+                        try { buffer.destroy() } catch (_: Throwable) {}
+                        try { buffer.close() } catch (_: Throwable) {}
+                    }
+                }
+                sampleBuffer = null
+                // KMK <--
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1647,6 +1711,12 @@ class WebGpuRenderer {
                 encoder?.close()
                 // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
                 texture.close()
+                // KMK --> A frame that threw before the map still owns the readback buffer.
+                sampleBuffer?.let { buffer ->
+                    try { buffer.destroy() } catch (_: Throwable) {}
+                    try { buffer.close() } catch (_: Throwable) {}
+                }
+                // KMK <--
             }
             // A frame that reached here submitted and presented - the draw-failure dial resets
             // under the same lock that reads it.
