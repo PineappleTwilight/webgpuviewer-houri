@@ -1362,6 +1362,7 @@ class WebGpuRenderer {
             ca.mpreg.webgpuviewer.draw.resetCirclePipelinesForDeviceRebuild()
             ca.mpreg.webgpuviewer.draw.resetLinePipelinesForDeviceRebuild()
             ca.mpreg.webgpuviewer.draw.resetTextPipelinesForDeviceRebuild()
+            ca.mpreg.webgpuviewer.draw.resetFontCacheForDeviceRebuild()
             // KMK <--
             // KMK <--
             // A fresh adapter can report different limits, and this is read live by the upload

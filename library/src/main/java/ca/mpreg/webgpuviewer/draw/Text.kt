@@ -383,6 +383,21 @@ class Font private constructor(
         // app's lifetime, so the memory is worth not stalling on a rebuild.
         private val familyCache = HashMap<FamilyKey, Font>()
 
+        /**
+         * KMK --> Every cached [Font] holds a GPU atlas texture built on the device that created
+         * it. A device rebuild leaves those textures dead, and the first text draw binds one:
+         * `TextureView "defaulted from [Texture (unlabeled 666x445 px, RGBA8Unorm)]" is associated
+         * with [Device]` - the 2026-11-23 PowerVR dump. Drop the cache so the next text draw
+         * builds a fresh atlas on the new device.
+         * KMK <--
+         */
+        internal fun clearCacheForDeviceRebuild() {
+            synchronized(familyCache) {
+                familyCache.values.forEach { it.destroy() }
+                familyCache.clear()
+            }
+        }
+
         // Baked once, independent of any draw size - an msdf atlas stays crisp scaled well past
         // this in either direction (see TEXT_SHADER's screen_px_range), so there's no reason to
         // rebuild (or cache-key) a whole new atlas per on-screen size the way a plain raster font
@@ -1182,3 +1197,5 @@ private fun drawGlyphBatch(
 }
 
 internal fun resetTextPipelinesForDeviceRebuild() = pipelines.clear()
+
+internal fun resetFontCacheForDeviceRebuild() = Font.clearCacheForDeviceRebuild()
