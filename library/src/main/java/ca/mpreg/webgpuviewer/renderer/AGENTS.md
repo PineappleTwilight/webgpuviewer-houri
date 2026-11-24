@@ -210,14 +210,15 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   instead of making every tile request fail. `atlasBudgetTiles` still records the *requested*
   budget even when the side is capped — it is what the budget now is, not what the atlas holds —
   so a cap cannot loop a grow-through-`newFrame` regen.
-- **PowerVR Rogue does not use the tile cache.** `WebGpuRenderer.tileCacheUsable` is false when
-  the adapter description names PowerVR; `ImageSingle.drawLive` then takes the direct
-  `renderWith` path before the animated/high-quality branches, `renderCacheSeed` does the same,
-  and the app sets `highQuality=false` so prewarming never starts a grid. The 2026-11-23 dump
-  (M8_4G/GE8322) presented 139 frames with `drawn=true` and still showed no image; the tiled
-  overlay and stencil pass are the only path that dump could not rule out. The direct draw is the
-  same content without them. A device-keyed fallback, not a quality choice; leave it in place
-  until a PowerVR device proves the tiled path draws.
+- **The tile cache is enabled on every adapter, PowerVR included.** It used to be false when the
+  adapter description named PowerVR; that was a misdiagnosis. The 2026-11-23 black frames came from
+  device-bound pipelines and font atlases surviving a device rebuild, not from the tile atlas or
+  stencil pass. With the tile path off, the direct `renderWith` path minifies with one bilinear tap
+  and no mip chain - visible as moire on halftone screentones at the ~0.6 scale a phone uses - and
+  page transitions, which seed their caches from the tile atlas, do not run. The tile path's box
+  filter is the quality path Mihon shows. Do not reintroduce a PowerVR gate without a device test
+  proving the tile path itself is broken; the direct path remains the fallback when a tile pass
+  throws.
 - **A glyph past the font-atlas cap renders advance-only, and that result is cached for the
   session.** `addGlyph` returns a bare-advance `Glyph` (`hasQuad = false`, exactly like a space)
   when the raster exceeds the cap *or* no longer fits the shelf after `growAtlas` clamped — the
