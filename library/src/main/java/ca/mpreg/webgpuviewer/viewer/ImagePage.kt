@@ -517,7 +517,14 @@ open class ImagePage {
                 )
             )
             try {
-                renderPage(pass, dst, x, y, scale, linear = false, masked = false)
+                // KMK --> The direct page path uses the same linear-light shader family as the
+                // tiled path, without the stencil test (this pass has no stencil attachment).
+                // `linear = false` selected the plain-variant pipelines, and on the PowerVR GE8322
+                // that pipeline draws nothing while the Mali-G76's linear pipeline draws the same
+                // page fine - the 2026-11-23 dumps differ only in which of the two ran. Keep the
+                // direct path on the proven shader; quality is free at one page per frame.
+                renderPage(pass, dst, x, y, scale, linear = true, masked = false)
+                // KMK <--
             } finally {
                 pass.endAndRelease(targetView)
             }

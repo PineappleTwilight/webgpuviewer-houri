@@ -105,11 +105,21 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   `RenderPage.resetForDeviceRebuild()` runs inside `recreateDeviceLocked`, under the render mutex,
   after `deviceGeneration++`. **Rule: a painter that caches a pipeline, bind group or buffer keyed
   by device owes a reset at device recreation — resetting pages does not reach an object cache.**
-- **`tileCacheUsable=false` stops the grid at the source.** `TileRenderer.draw`/`prewarm` return
-  immediately when the adapter's tile path is unusable. The 2026-11-23 PowerVR dump still logged
-  `Renderer: Create tile …` and `Pre-warming next page tiles` despite `tiles=false`, so a grid was
-  still being allocated; a grid that blits garbage can paint over the direct page draw that is
-  supposed to be the fallback. Keep the gate at both entry points.
+- **The direct page path draws with `linear = true`; never select the plain pipeline for it.**
+  `ImageSingle.renderWith` (the fallback used by `drawLive` when the tile grid is skipped, which is
+  every PowerVR page) used to call `renderPage(..., linear = false, masked = false)` and so ran the
+  `plainVariant` shader. On the PowerVR GE8322 that pipeline draws nothing while the same page on
+  the Mali-G76, drawn through `samplerVariant`, is visible with identical geometry and mipmaps
+  (2026-11-23 M8_4G dump: `draw=pages=1 quads=1 rect=0.0,0.276,1.0,0.724`, no validation errors,
+  black screen). The direct path now uses `linear = true, masked = false` - the linear-light shader
+  without the stencil test, valid in the stencil-free `renderWith` pass. Keep the cost argument out
+  of this: it is one page quad per frame, and a device that cannot draw the plain variant cannot
+  afford it.
+- **`settings.gradle.kts` pins `ca.mpreg:webgpuviewer` to `:webgpuviewer` in the included build.**
+  The fork's coordinates (`group = "ca.mpreg"`, `version = "0.0.0"`) happen to match the published
+  artifact the app depends on, so the composite build would substitute it even without an explicit
+  rule - but any future version bump on either side would silently switch the reader back to
+  mpreg's published AAR. The `dependencySubstitution` block makes the fork the only source.
 - **`doubleTapZoomEnabled` is the only host-facing gate; `doubleTapGesturesEnabled` follows it**
   (KMK island in `ImageViewerState.kt`; port of upstream `34fb12b`). The host sets one flag and the
   setter keeps the gesture flag tied, so "double-tap zoom off" means both "no second-tap zoom" and
