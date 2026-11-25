@@ -1702,6 +1702,11 @@ class WebGpuRenderer {
                         ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
                             "map failed ${e.message}"
                         )
+                        if (e.message?.contains("[Device]") == true || e.message?.contains("is lost") == true) {
+                            Log.w("WebGpuRenderer", "Device lost detected during texture readback: $e.message")
+                            drawFailureStreak++
+                            return FrameResult.Unavailable
+                        }
                     } finally {
                         try { buffer.unmap() } catch (_: Throwable) {}
                         try { buffer.destroy() } catch (_: Throwable) {}
