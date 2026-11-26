@@ -1689,7 +1689,17 @@ class WebGpuRenderer {
                 // KMK <--
                 presentedFrames++
                 // KMK --> Resolve the one-shot readback now that the GPU has the copy.
+                // KMK --> Device-lost guard: mapAndAwait on a lost device is a native fault
+                // (SIGILL) that kills the render thread before any Kotlin catch can run, so
+                // check the flag first and skip the readback entirely on loss. The catch below
+                // stays for genuine read errors that surface through an exception.
+                // KMK <--
                 sampleBuffer?.let { buffer ->
+                    if (deviceLost) {
+                        Log.w("WebGpuRenderer", "Skipping texture readback: device lost")
+                        drawFailureStreak++
+                        return FrameResult.Unavailable
+                    }
                     try {
                         buffer.mapAndAwait(MapMode.Read, 0, 4)
                         val bytes = ByteArray(4)
