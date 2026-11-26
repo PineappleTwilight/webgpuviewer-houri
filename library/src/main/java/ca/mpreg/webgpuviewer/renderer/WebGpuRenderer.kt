@@ -1654,7 +1654,11 @@ class WebGpuRenderer {
                 // callback returns - so this check, not the drain, is what actually stops a frame
                 // that was mid-draw when the surface went away. The isValid probe is a last
                 // backstop for teardowns that bypass the callback.
-                if (!isAvailable || surfaceDetached || platformSurface?.isValid == false) {
+                // Guard BEFORE submitting: a lost device triggers SIGILL on the JNI
+                // mapAndAwait/copy (libwebgpu_c_bundled); the crash aborts before the
+                // downstream deviceLost check ever runs. A lost device must never be
+                // submitted to the dead hardware.
+                if (!isAvailable || deviceLost || surfaceDetached || platformSurface?.isValid == false) {
                     val why = when {
                         surfaceDetached -> "Surface detached mid-frame"
                         platformSurface?.isValid == false -> "Platform surface invalid mid-frame"
