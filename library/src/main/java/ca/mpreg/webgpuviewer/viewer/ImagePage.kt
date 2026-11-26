@@ -333,10 +333,10 @@ open class ImagePage {
         var ownsImage: Boolean = true
 
         /**
-         * When false, this page skips [ca.mpreg.webgpuviewer.renderer.TileRenderer]'s tile cache
-         * entirely and its fast path renders through [renderPage] with `linear = false` instead of
-         * the default `linear = true` - for content not worth either path's extra correctness or
-         * sharpness, such as an app-drawn transition/error bitmap. A `var`, not a `val`, so
+         * When false, this page skips [ca.mpreg.webgpuviewer.renderer.TileRenderer]'s screen-space
+         * cache entirely and its fast path renders through [renderPage] with `linear = true` - the
+         * same linear-light shader the cached path uses. The plain variant is never selected for
+         * a decoded page here: it draws nothing on the PowerVR GE8322. A `var`, not a `val`, so
          * [ImageSpread] can override it to fan a set-through to both sides instead of just holding
          * its own copy.
          */
@@ -586,8 +586,7 @@ open class ImagePage {
          * everything else paints the page itself and then blits the tile cache over it. Opens its
          * own **stencil-free** pass rather than sharing one from the caller - see [Render] for
          * why that split exists.
-         */
-        override fun drawLive(
+         */        override fun drawLive(
             encoder: GPUCommandEncoder, dst: GPUTexture, tiles: TileRenderer
         ): Boolean {
             // KMK --> The PowerVR gate sits before the animated and high-quality branches: the

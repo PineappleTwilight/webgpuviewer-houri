@@ -138,24 +138,49 @@ class WebGpuRenderer {
             private set
 
         /**
-         * KMK --> Whether the tile cache may be used on the live adapter.
+         * KMK --> Host request for the high-quality tile *cache*. Defaults on, which is the
+         * right choice for every adapter that can afford the atlas.
          *
-         * It used to be false on PowerVR Rogue: the 2026-11-23 dump presented every frame with
-         * pages decoded and no image, and the direct `renderWith` path was kept as a
-         * device-keyed fallback. That diagnosis was wrong - the black frames were device-bound
-         * pipelines and font atlases surviving a device rebuild (see
-         * `recreateDeviceLocked`) - and the direct path has two visible costs the tile path does
-         * not: it minifies with one bilinear tap and no mip chain, which moires on halftone
-         * screentones at the ~0.6 scale a phone reader uses, and it bypasses the tile atlas that
-         * page transitions seed their caches from, so transitions do not run.
+         * Changing it takes effect on the next frame; pages already decoded with the old mode are
+         * re-decoded by the host's settings channel. This is a preference, not a capability -
+         * [tileCacheUsable] applies [TileCachePolicy] on top, so PowerVR cannot turn it back on.
+         * KMK <--
+         */
+        @Volatile
+        var tileCacheRequested: Boolean = true
+            private set
+
+        /** Host hook for the advanced tile-cache switch; see [tileCacheRequested]. */
+        @JvmStatic
+        fun requestTileCache(enabled: Boolean) {
+            tileCacheRequested = enabled
+        }
+
+        /**
+         * KMK --> Whether the high-quality tile cache may be used on the live adapter.
          *
-         * The tile path is the quality path on every adapter again. If it ever fails, the
-         * existing fallbacks still apply: `ImageSingle.drawLive` paints the page directly under
-         * the tiles and a tile-pipeline exception drops the page to the fast path.
+         * The cache is an atlas of screen-space tiles drawn over the page; texture tiling - the
+         * [Mipmap] grid every page is uploaded as - is separate and always on, because the
+         * device's texture limit makes it the only way a tall page can exist.
+         *
+         * PowerVR Rogue is forced off regardless of [tileCacheRequested]. The 2026-11-26 field
+         * report lost its Vulkan device under `VK_ERROR_OUT_OF_DEVICE_MEMORY` while the atlas was
+         * live, and the same build with the cache disabled read normally. The direct path now
+         * carries the quality the cache used to hide - a full mip chain and a nearest-level choice
+         * (see [ImageMipPolicy]) - and page transitions seed themselves directly, so neither of
+         * the two historical costs of disabling the cache applies.
          * KMK <--
          */
         val tileCacheUsable: Boolean
-            get() = true
+            get() = TileCachePolicy.isEnabled(tileCacheRequested, adapterDescription)
+
+        /** Why the cache is off, for the session report. Empty when it is on. */
+        val tileCacheOffReason: String
+            get() = when {
+                tileCacheUsable -> ""
+                TileCachePolicy.isPowerVr(adapterDescription) -> "powervr"
+                else -> "preference"
+            }
 
         private fun describeAdapter(adapter: GPUAdapter): String = runCatching {
             val info = adapter.getInfo()

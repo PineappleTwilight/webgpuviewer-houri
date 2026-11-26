@@ -934,6 +934,10 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         }
 
         val hasImagePage = s.pages.any { it.page is ImagePage.ImageSingle }
+        // KMK --> Cache off means no tile blit and no stencil in the shared pass; pages are
+        // drawn from their own mip chains with the unmasked pipeline twins.
+        val tilingEnabled = WebGpuRenderer.tileCacheUsable
+        // KMK <--
 
         val dstW = texture.width.toFloat()
         val dstH = texture.height.toFloat()
@@ -1085,18 +1089,25 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     // the top layer, or drawing the page after them would paint over them.
                     d.placed.forEach { placed ->
                         val image = placed.image
-                        if (page.isAnimated || page.highQuality) {
+                        // KMK --> The cache-free path must use the linear-light shader even
+                        // when highQuality is false: the plain variant draws nothing on the
+                        // PowerVR GE8322, and a cache-free session marks every decoded page
+                        // highQuality=false.
+                        if (page.isAnimated || page.highQuality || !tilingEnabled) {
                             RenderPage.renderFast(
                                 pass, image, texture, placed.x, placed.y, placed.imageScale,
                                 src = placed.src,
+                                masked = tilingEnabled,
                             )
                         } else {
                             RenderPage.renderFast(
                                 pass, image, texture, placed.x, placed.y, placed.imageScale,
                                 linear = false,
                                 src = placed.src,
+                                masked = tilingEnabled,
                             )
                         }
+                        // KMK <--
                     }
                     // KMK -->
                     // The chained slot edges are the authoritative clip for an uncropped
@@ -1105,7 +1116,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
                     // (see captureRenderState's chain note). A cropped page keeps the derived
                     // inset - its content edge is mid-slot and shares no boundary.
                     // KMK <--
-                    val covered = !page.isAnimated && tiles.draw(
+                    val covered = tilingEnabled && !page.isAnimated && tiles.draw(
                         pass,
                         page,
                         texture,
@@ -1179,7 +1190,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
         // Idle decode-ahead: only once everything on screen is sharp, so this never steals
         // generation bandwidth from visible tiles - and never while a gesture or fling is
         // driving the camera, when the targets would be stale by the time they generate.
-        if (!s.suppressGeneration && allCovered) {
+        if (tilingEnabled && !s.suppressGeneration && allCovered) {
             s.prewarmTargets.forEach { target ->
                 tiles.prewarmContinuous(
                     target.page, texture, s.cameraDocY, target.docTop,

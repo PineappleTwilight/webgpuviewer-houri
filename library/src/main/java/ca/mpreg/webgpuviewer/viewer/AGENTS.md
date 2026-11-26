@@ -16,7 +16,7 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
 - Pages are dumb: viewer never fetches/decodes images itself, app supplies `Image` objects.
 - `ImageSpread` composes two `ImageSingle` sides WITHOUT taking ownership of their images; the builder owns cleanup. `ImageSingle` with an image owns it and cleans up in `cleanup()`.
 - `Render` pages draw via `renderWith` (own pass, clears dst) or `renderLoaded` (loads dst, no clear: continuous mode shares one screen texture across pages, clearing would blank neighbors).
-- `ImageSingle.highQuality=false` skips `TileRenderer` cache entirely, fast path renders `linear=false`.
+- `ImageSingle.highQuality=false` skips `TileRenderer`'s screen-space cache; `WebGpuRenderer.tileCacheUsable=false` makes every page take that path. The direct draw uses the **linear** pipeline (`ImageSingle.renderWith`) and the image's own full mip chain; never send it back to the plain variant, which draws nothing on PowerVR.
 - Animated frames always take the fast path, never the tile cache (cache would churn every frame).
 - Transition cache textures are opened with `LoadOp.Clear`, NO stencil attachment: never masked.
 - `getCurrentTexture()` rotates buffers: always clear before loading, never assume previous contents.

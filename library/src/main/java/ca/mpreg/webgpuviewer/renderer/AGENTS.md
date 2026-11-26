@@ -8,6 +8,8 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 |------|----------|-------|
 | Device/adapter/instance, render thread, frame profiling | `WebGpuRenderer.kt` | companion singleton; `dispatcher` = single-thread "WebGPU-Render-Thread"; `isOnRenderThread()`; `mutex`/`withContext` gate GPU work |
 | Tile cache, stencil, prewarm, generation | `TileRenderer.kt` | ~2100 lines; densest invariant prose comments in the repo. Read header + `gridPlacement`/`drawCore` docs before touching |
+| Tile-cache switch + PowerVR override | `TileCachePolicy.kt` | pure; host request and adapter description in, effective cache mode out |
+| Direct-path mip level choice | `ImageMipPolicy.kt` | pure; full-chain sizing and the nearest-level rule that stops moiré without the cache |
 | Live page draw (fast + filtered) | `RenderPage.kt` | 3 shader variants: `samplerVariant` (stencil-tested), `plainVariantMasked` (no-op stencil), `plainVariant` (stencil-free) |
 | Image upload / placement math | `Image.kt` | `prepareForRender` placement; `solveImagePlacement` (TileRenderer.kt) inverts it |
 | Mipmap chain | `Mipmap.kt` | |
@@ -210,15 +212,21 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   instead of making every tile request fail. `atlasBudgetTiles` still records the *requested*
   budget even when the side is capped — it is what the budget now is, not what the atlas holds —
   so a cap cannot loop a grow-through-`newFrame` regen.
-- **The tile cache is enabled on every adapter, PowerVR included.** It used to be false when the
-  adapter description named PowerVR; that was a misdiagnosis. The 2026-11-23 black frames came from
-  device-bound pipelines and font atlases surviving a device rebuild, not from the tile atlas or
-  stencil pass. With the tile path off, the direct `renderWith` path minifies with one bilinear tap
-  and no mip chain - visible as moire on halftone screentones at the ~0.6 scale a phone uses - and
-  page transitions, which seed their caches from the tile atlas, do not run. The tile path's box
-  filter is the quality path Mihon shows. Do not reintroduce a PowerVR gate without a device test
-  proving the tile path itself is broken; the direct path remains the fallback when a tile pass
-  throws.
+- **The tile cache is a host-requested mode, and PowerVR Rogue is pinned off regardless.**
+  `WebGpuRenderer.tileCacheRequested` is the advanced switch (default on), and
+  `WebGpuRenderer.tileCacheUsable` folds in `TileCachePolicy`, which forces the cache off for
+  `powervr`/`img-tec`/`imagination`/`rogue` adapter descriptions. This is not the 2026-11-23
+  black-screen diagnosis returning: that report was fixed by dropping device-bound caches on a
+  rebuild. The 2026-11-26 PowerVR report is different - the device is lost under
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` while the cache atlas is live, and the same build with the cache
+  off reads normally. Texture tiling is untouched: every page is still uploaded as a [Mipmap] grid,
+  because the device's texture limit requires it. Two things make the cache-free path usable now:
+  `Image` builds the complete mip chain (not just levels above 2048) and the direct path selects
+  the nearest level for the draw scale (`ImageMipPolicy`), so halftone screentones do not moiré;
+  and `Transition` seeds its cache slot directly from the page (`renderCacheSeed`) instead of
+  expecting an atlas. Do not turn this into a blanket "tile path is broken" fallback - the cache
+  remains the quality path everywhere it fits, and a tile-pipeline exception still demotes a single
+  page through `ImageSingle.drawLive`'s catch.
 - **A glyph past the font-atlas cap renders advance-only, and that result is cached for the
   session.** `addGlyph` returns a bare-advance `Glyph` (`hasQuad = false`, exactly like a space)
   when the raster exceeds the cap *or* no longer fits the shelf after `growAtlas` clamped — the

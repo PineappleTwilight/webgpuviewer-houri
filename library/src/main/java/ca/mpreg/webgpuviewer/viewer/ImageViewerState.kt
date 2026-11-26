@@ -556,12 +556,22 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 ),
                 // Fresh each frame: the tile blit marks what it covered so masked draws skip
                 // re-shading it. Discarded afterward - nothing reads it across frames.
-                depthStencilAttachment = GPURenderPassDepthStencilAttachment(
-                    view = tiles.stencilViewFor(texture),
-                    stencilLoadOp = LoadOp.Clear,
-                    stencilStoreOp = StoreOp.Discard,
-                    stencilClearValue = 0,
-                )
+                //
+                // KMK --> With the tile cache off there is no tile blit and no masked draw in
+                // this pass, so the stencil has no consumer. A stencil attachment with none is
+                // the shape that emptied frames on tile-based drivers; omit it entirely and let
+                // the continuous walk use the stencil-free page pipelines.
+                depthStencilAttachment = if (WebGpuRenderer.tileCacheUsable) {
+                    GPURenderPassDepthStencilAttachment(
+                        view = tiles.stencilViewFor(texture),
+                        stencilLoadOp = LoadOp.Clear,
+                        stencilStoreOp = StoreOp.Discard,
+                        stencilClearValue = 0,
+                    )
+                } else {
+                    null
+                },
+                // KMK <--
             )
         )
         try {

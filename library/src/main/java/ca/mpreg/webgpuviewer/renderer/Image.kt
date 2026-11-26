@@ -353,8 +353,14 @@ class Image private constructor(
             var textureHeight = height
             var scale = 1f
 
+            // KMK --> Build the chain all the way to the uploader's 8px floor, not just below
+            // 2048. The cache used to supply box-filtered screen tiles, so a page smaller than
+            // 2048 never needed a mip; with the cache off the direct path does its own minifying,
+            // and a 960x1376 page at the reader's ~0.6 scale has no lower level to sample. That
+            // is the moiré on halftone screentones. The byte budget already counts 4/3 of the base
+            // area, so a complete chain is what it was always paying for.
             var guard = 0
-            while ((width * scale > TILESIZE || height * scale > TILESIZE) && guard++ < 8) {
+            while (ImageMipPolicy.shouldBuildNextLevel(textureWidth, textureHeight) && guard++ < 16) {
                 scale /= 2
                 val newWidth = floor(width * scale).toInt().coerceAtLeast(1)
                 val newHeight = floor(height * scale).toInt().coerceAtLeast(1)
@@ -368,6 +374,7 @@ class Image private constructor(
                 textureWidth = newWidth
                 textureHeight = newHeight
             }
+            // KMK <--
             return levels
         }
 
@@ -637,7 +644,7 @@ class Image private constructor(
         if (isHdr) Hdr.noteHdrDrawn(this, hdrHeadroom)
         if (mipmaps.isEmpty()) return emptyList()
 
-        val level = floor(log2(1 / scale)).toInt().coerceIn(0, mipmaps.size - 1)
+        val level = ImageMipPolicy.levelForScale(scale, mipmaps.size)
         val mipmap = mipmaps[level]
 
         val adjustedX = x + this.x / dst.width + WebGpuRenderer.offsetX

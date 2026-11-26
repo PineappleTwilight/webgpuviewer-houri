@@ -1637,6 +1637,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         crop: Rect? = null,
         clipEdges: ClipEdges? = null,
     ) {
+        // KMK --> Never start a grid on a device whose tile cache is off.
+        if (!WebGpuRenderer.tileCacheUsable) return
+        // KMK <--
         if (page.destroyed || !page.highQuality || page.isAnimated) return
         if (!page.hasUploadedImage) return
 

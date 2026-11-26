@@ -587,6 +587,44 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // page at all - in which case there's nothing further to compare against blittedKeys.
             val available = page.newlyAvailableTileKeys(tiles, texture)
 
+            // KMK --> With the tile cache off, a transition cache slot is a direct render of the
+            // page, never a tile composite. This is a real path, not a fallback: the direct page
+            // draw uses the linear-light pipeline (the plain variant draws nothing on the PowerVR
+            // GE8322) and the image's own full mip chain, so transitions keep animating without
+            // an atlas. Re-seed only when the page's identity/frame actually changed; an
+            // unchanged slide is a cache hit like it is on the tiled path.
+            if (!WebGpuRenderer.tileCacheUsable) {
+                if (identityMatches) return view
+
+                val pageX = page.x
+                val pageY = page.y
+                val pageScale = page.scale
+                val pageFrameVersion = page.frameVersion
+                page.renderCacheSeed(encoder, texture, tiles)
+
+                synchronized(cacheLock) {
+                    // Swapped mid-render: the view is still right, the metadata isn't.
+                    if (generation != cacheGeneration) return view
+                    if (isPage1) {
+                        blittedKeys1 = emptySet()
+                        cachedPage1 = page
+                        cachedX1 = pageX
+                        cachedY1 = pageY
+                        cachedScale1 = pageScale
+                        cachedFrameVersion1 = pageFrameVersion
+                    } else {
+                        blittedKeys2 = emptySet()
+                        cachedPage2 = page
+                        cachedX2 = pageX
+                        cachedY2 = pageY
+                        cachedScale2 = pageScale
+                        cachedFrameVersion2 = pageFrameVersion
+                    }
+                }
+                return view
+            }
+            // KMK <--
+
             if (identityMatches && (available == null || available == blittedKeys)) {
                 return view
             }
