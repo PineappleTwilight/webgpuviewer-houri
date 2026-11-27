@@ -487,7 +487,16 @@ class WebGpuRenderer {
                 // parked it (see [destroyRetired] for why its wrapper must stay alive for that).
                 // Firing the ladder for a device the companion no longer names would churn
                 // generations: every such dispatch would start another recovery. Ignore them.
-                if (lost !== deviceOrNull()) {
+                //
+                // Compare NATIVE HANDLES, never wrapper identity. The glue constructs the
+                // GPUDevice it hands to this callback at dispatch time from its own reference;
+                // `!==` against the companion's wrapper is not a device comparison and can call
+                // the live device "stale". When that happened on the M8_4G (2026-11-26), the
+                // real loss was ignored, `deviceLost` stayed false, and the texture readback
+                // went on to map a buffer on the dead device (SIGILL). GPUDevice.equals compares
+                // handles - use it explicitly so the intent survives a refactor.
+                val current = deviceOrNull()
+                if (current == null || lost.handle != current.handle) {
                     Log.w(
                         "WebGpuRenderer",
                         "stale device-lost callback for a retired device (reason=$reason: $message)"
@@ -1174,6 +1183,9 @@ class WebGpuRenderer {
                     // after this lock ends; free it one recovery cycle from now (above).
                     retiredDevice = deadDevice
                     retiredAdapter = deadAdapter
+                    // A readback armed on the dead device must not be copied from its texture on
+                    // the replacement - the app's page reset is about to destroy that texture.
+                    ca.mpreg.webgpuviewer.viewer.RenderProbe.discardTextureSample()
                     try {
                         filters.cleanup()
                     } catch (e: Throwable) {
@@ -1698,6 +1710,14 @@ class WebGpuRenderer {
                 val errorsBefore = validationErrors
                 device.queue.submitAndRelease(encoder)
                 encoder = null
+                // The loss callback is dispatched synchronously (`Executor(Runnable::run)`), so a
+                // device can die *inside* the submit above even though the pre-submit gate saw it
+                // alive. Do not present a frame to a dead swapchain or reach the readback with a
+                // device-bound buffer after that; the app recovery ladder owns the next step.
+                if (deviceLost || surfaceDetached) {
+                    Log.w("WebGpuRenderer", "Device lost during submit; dropping frame")
+                    return FrameResult.Unavailable
+                }
                 // KMK --> An uncaptured validation error invalidates the command buffer Dawn was
                 // handed, so this frame draws nothing even though submit returned. Report it as a
                 // failed frame (bounded by onDrawError) instead of presenting black and counting
@@ -1724,32 +1744,50 @@ class WebGpuRenderer {
                 // stays for genuine read errors that surface through an exception.
                 // KMK <--
                 sampleBuffer?.let { buffer ->
-                    if (deviceLost) {
-                        Log.w("WebGpuRenderer", "Skipping texture readback: device lost")
-                        drawFailureStreak++
-                        return FrameResult.Unavailable
-                    }
+                    // No native call on this buffer is safe once anything says the device is
+                    // gone - and the loss can land between the flag check and the map. A lost
+                    // device's mapAndAwait is a native fault on PowerVR (SIGILL); when it
+                    // surfaces as an exception instead, the cleanup below still goes through the
+                    // same JNI layer and kills the render thread a few milliseconds later. The
+                    // buffer is 256 bytes belonging to a device that is about to be retired:
+                    // leak it on loss rather than touch it.
+                    var deviceGone = deviceLost
                     try {
-                        buffer.mapAndAwait(MapMode.Read, 0, 4)
-                        val bytes = ByteArray(4)
-                        buffer.getMappedRange(0, 4).get(bytes)
-                        ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
-                            "rgba=${bytes[0].toInt() and 0xFF},${bytes[1].toInt() and 0xFF}," +
-                                "${bytes[2].toInt() and 0xFF},${bytes[3].toInt() and 0xFF}"
-                        )
-                    } catch (e: Throwable) {
-                        ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
-                            "map failed ${e.message}"
-                        )
-                        if (e.message?.contains("[Device]") == true || e.message?.contains("is lost") == true) {
-                            Log.w("WebGpuRenderer", "Device lost detected during texture readback: $e.message")
+                        if (deviceGone) {
+                            Log.w("WebGpuRenderer", "Skipping texture readback: device lost")
                             drawFailureStreak++
                             return FrameResult.Unavailable
                         }
+                        try {
+                            buffer.mapAndAwait(MapMode.Read, 0, 4)
+                            val bytes = ByteArray(4)
+                            buffer.getMappedRange(0, 4).get(bytes)
+                            ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
+                                "rgba=${bytes[0].toInt() and 0xFF},${bytes[1].toInt() and 0xFF}," +
+                                    "${bytes[2].toInt() and 0xFF},${bytes[3].toInt() and 0xFF}"
+                            )
+                        } catch (e: Throwable) {
+                            ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
+                                "map failed ${e.message}"
+                            )
+                            // Any failed map leaves the buffer in an unknown native state, so
+                            // none of the teardown calls below are safe either. Only a loss
+                            // fails the frame; the rest is the diagnostic saying so.
+                            deviceGone = true
+                            if (e.message?.contains("[Device]") == true || e.message?.contains("is lost") == true) {
+                                Log.w("WebGpuRenderer", "Device lost detected during texture readback: $e.message")
+                                drawFailureStreak++
+                                return FrameResult.Unavailable
+                            }
+                        }
                     } finally {
-                        try { buffer.unmap() } catch (_: Throwable) {}
-                        try { buffer.destroy() } catch (_: Throwable) {}
-                        try { buffer.close() } catch (_: Throwable) {}
+                        // Re-read the flag: the loss callback can run on this very thread
+                        // between the catch and here.
+                        if (!deviceGone && !deviceLost) {
+                            try { buffer.unmap() } catch (_: Throwable) {}
+                            try { buffer.destroy() } catch (_: Throwable) {}
+                            try { buffer.close() } catch (_: Throwable) {}
+                        }
                     }
                 }
                 sampleBuffer = null
@@ -1771,10 +1809,13 @@ class WebGpuRenderer {
                 // Unsubmitted if the frame threw.
                 encoder?.close()
                 // A readback armed above but never resolved (a dropped frame, a device loss)
-                // would otherwise keep its buffer.
-                sampleBuffer?.let {
-                    try { it.destroy() } catch (_: Throwable) {}
-                    try { it.close() } catch (_: Throwable) {}
+                // would otherwise keep its buffer. Never touch it after a loss, for the same
+                // reason the readback itself does not: the buffer's native calls are the SIGILL.
+                if (!deviceLost) {
+                    sampleBuffer?.let {
+                        try { it.destroy() } catch (_: Throwable) {}
+                        try { it.close() } catch (_: Throwable) {}
+                    }
                 }
                 // getCurrentTexture hands out a new reference every frame - see [endAndRelease].
                 texture.close()

@@ -48,6 +48,7 @@ data class SettingsProfile(
     val lutPreset: String = "",
     val lutCustomPath: String = "",
     val lutIntensity: Float = 0f,
+    val sharpen: Float = 0f,
     val webgpuDarkMode: Boolean = false,
     val webgpuDarkModeAmoled: Boolean = false,
     val darkModeTolerance: Float = 0.5f,
@@ -104,6 +105,7 @@ data class SettingsProfile(
         flag(lutPreset != old.lutPreset, SettingsImpact.LIVE)
         flag(lutCustomPath != old.lutCustomPath, SettingsImpact.LIVE)
         flag(lutIntensity != old.lutIntensity, SettingsImpact.LIVE)
+        flag(sharpen != old.sharpen, SettingsImpact.LIVE)
         flag(webgpuDarkMode != old.webgpuDarkMode, SettingsImpact.LIVE)
         flag(webgpuDarkModeAmoled != old.webgpuDarkModeAmoled, SettingsImpact.LIVE)
         flag(darkModeTolerance != old.darkModeTolerance, SettingsImpact.LIVE)

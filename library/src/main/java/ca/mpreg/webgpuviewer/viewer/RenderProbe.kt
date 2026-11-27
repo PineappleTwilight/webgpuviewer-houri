@@ -73,6 +73,18 @@ object RenderProbe {
         return TextureSample(texture, pendingX, pendingY)
     }
 
+    /**
+     * Drops an armed-but-not-yet-taken sample after a device rebuild. Its texture belongs to the
+     * retired device, and copying from it on the replacement would only add a validation error
+     * (or, on a driver that faults on dead handles, worse). The probe stays armed: it is a
+     * once-per-session diagnostic, not one per device generation.
+     */
+    fun discardTextureSample() {
+        pendingTexture = null
+        pendingX = 0
+        pendingY = 0
+    }
+
     fun noteTextureSample(value: String) {
         textureSample = value
     }

@@ -218,8 +218,12 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   `powervr`/`img-tec`/`imagination`/`rogue` adapter descriptions. This is not the 2026-11-23
   black-screen diagnosis returning: that report was fixed by dropping device-bound caches on a
   rebuild. The 2026-11-26 PowerVR report is different - the device is lost under
-  `VK_ERROR_OUT_OF_DEVICE_MEMORY` while the cache atlas is live, and the same build with the cache
-  off reads normally. Texture tiling is untouched: every page is still uploaded as a [Mipmap] grid,
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`. The cache-free path lowers that pressure (it is what the same
+  device's 2026-11-26 log runs, `tiles=false tiling=powervr`), but it does not guarantee the loss
+  cannot happen: that build still logged `vkQueueSubmit failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`
+  two seconds into the first decode. Treat the mode as a pressure reduction, not immunity - the
+  loss path has to be survivable on its own (see the native-handle rule in the landmines). Texture
+  tiling is untouched: every page is still uploaded as a [Mipmap] grid,
   because the device's texture limit requires it. Two things make the cache-free path usable now:
   `Image` builds the complete mip chain (not just levels above 2048) and the direct path selects
   the nearest level for the draw scale (`ImageMipPolicy`), so halftone screentones do not moiré;
@@ -279,8 +283,21 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   Multilaser M8_4G / Android 11). So `destroyRetired()` calls `destroy()` — which frees the GPU
   memory that fed the loss loop — while the wrapper's global stays alive for any late dispatch;
   `deviceDescriptor()`'s stale-fire guard (ignore a loss callback whose device is not the
-  companion's current one) keeps that dispatch from reaching the recovery ladder. `Release.kt`
+  companion's current one) keeps that dispatch from reaching the recovery ladder. **That guard
+  must compare native handles (`lost.handle != deviceOrNull()?.handle`), never wrapper identity**:
+  the callback's `GPUDevice` is constructed by the glue at dispatch time, so `lost !== device`
+  can call the live device stale, swallow a real `VK_ERROR_OUT_OF_DEVICE_MEMORY`, leave
+  `deviceLost` false, and let the readback map a buffer on the dead device (M8_4G, 2026-11-26:
+  SIGILL immediately after `Device lost detected during texture readback`). `Release.kt`
   deliberately defines no `GPUDevice.destroyAndRelease()`.
+- **A readback buffer belongs to the device that made it; on loss, leak it.** The one-shot page
+  texture probe in `render()` maps a 256-byte buffer after `present()`. The device-loss callback
+  can land between the flag check and the map, and every native call on the buffer after that —
+  `mapAndAwait`, `unmap`, `destroy`, `close` — runs through the same JNI layer whose lost-device
+  path is a SIGILL (the exception is reported, then the process dies in `finally`). The readback
+  therefore sets `deviceGone` on either signal (the flag or a `[Device] is lost` exception) and
+  skips *all* buffer teardown; the buffer is reclaimed with the device. Never "clean up" a
+  device-bound resource after a loss to be tidy — that is the crash.
 - **`::device.isInitialized` is prohibited from the instance class.** The companion's lateinit
   vars cannot be checked with a `::`-reference from outside the companion ("backing field is
   not accessible at this point" — the field belongs to the companion instance). Use the
