@@ -20,6 +20,11 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
 | Fullscreen triangle | `Fullscreen.kt` | shared with `filter` package |
 
 ## CONVENTIONS (differs from parent)
+- **`deviceGeneration` is read off the render thread and must stay `@Volatile`.** The host's
+  decode workers sample it before and after a page upload to decide whether the finished texture
+  belongs to the live device; a plain `var` lets a worker keep reading the retired generation and
+  either installs a stale texture (black page) or rejects a live one forever (the 2026-11-28
+  PowerVR blank-reader shape). Bumped in `recreateDeviceLocked`, written on the render thread.
 - **A 0x0 surface callback must not write the stored dimensions.** `init` and `resize` refuse
   any size below `MIN_SURFACE_DIMENSION`: a surface created before its view is laid out, or
   mid-teardown (e-ink readers do this on every refresh-mode switch), reported 0x0, and storing

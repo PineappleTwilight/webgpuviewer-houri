@@ -508,6 +508,7 @@ class WebGpuRenderer {
          * (see [ca.mpreg.webgpuviewer.filter.Filter.syncDevice]). Starts 0, so instances built
          * before any loss never spuriously reset.
          */
+        @Volatile
         var deviceGeneration = 0L
             private set
 
