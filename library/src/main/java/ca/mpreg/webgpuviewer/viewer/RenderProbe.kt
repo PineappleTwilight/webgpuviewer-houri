@@ -43,8 +43,14 @@ object RenderProbe {
     // session by ImageSingle.renderPage, consumed by WebGpuRenderer.render.
     class TextureSample(val texture: GPUTexture, val x: Int, val y: Int)
 
+    /** Failed maps after which the probe stops trying. See [noteTextureSample]. */
+    private const val MAX_TEXTURE_SAMPLE_ATTEMPTS = 3
+
     @Volatile
     private var textureSampleArmed = false
+
+    @Volatile
+    private var textureSampleAttempts = 0
 
     @Volatile
     private var pendingTexture: GPUTexture? = null
@@ -55,12 +61,39 @@ object RenderProbe {
     @Volatile
     private var pendingY = 0
 
+    /** Nanotime the current session opened, so `tex=` can say *when* it resolved. */
+    @Volatile
+    private var sessionStartedNanos = 0L
+
     @Volatile
     var textureSample: String = "none"
         private set
 
+    /**
+     * Open a fresh probe for a new reader session.
+     *
+     * The object is process-wide and outlives the activity, so without this every reader opened
+     * after the first inherits the previous session's sample - and because the armed flag was
+     * never cleared, `tex=` was effectively a once-per-process fact: a second session reported
+     * the first session's answer (or `none`) no matter what its own frames drew.
+     */
+    fun beginSession() {
+        textureSampleArmed = false
+        textureSampleAttempts = 0
+        pendingTexture = null
+        pendingX = 0
+        pendingY = 0
+        textureSample = "none"
+        sessionStartedNanos = System.nanoTime()
+        pages = 0
+        imageQuads = 0
+        skippedNoMips = 0
+        lastPage = "none"
+        lastRect = "none"
+    }
+
     fun armTextureSample(texture: GPUTexture, x: Int, y: Int) {
-        if (textureSampleArmed) return
+        if (textureSampleArmed || textureSampleAttempts >= MAX_TEXTURE_SAMPLE_ATTEMPTS) return
         textureSampleArmed = true
         pendingTexture = texture
         pendingX = x
@@ -74,19 +107,40 @@ object RenderProbe {
     }
 
     /**
-     * Drops an armed-but-not-yet-taken sample after a device rebuild. Its texture belongs to the
-     * retired device, and copying from it on the replacement would only add a validation error
-     * (or, on a driver that faults on dead handles, worse). The probe stays armed: it is a
-     * once-per-session diagnostic, not one per device generation.
+     * Drops an armed-but-not-yet-taken sample after a device rebuild, and lets the replacement
+     * device have its own attempts: the sample describes the session's live device, and the one
+     * it was armed against is gone.
      */
     fun discardTextureSample() {
         pendingTexture = null
         pendingX = 0
         pendingY = 0
+        textureSampleArmed = false
+        textureSampleAttempts = 0
     }
 
-    fun noteTextureSample(value: String) {
-        textureSample = value
+    /**
+     * The sample resolved (or failed), stamped with the time since [beginSession].
+     *
+     * A failure re-arms, bounded by [MAX_TEXTURE_SAMPLE_ATTEMPTS]: the first page draw can land
+     * in the same frame a device dies, and one failed map must not leave the session report
+     * without the texture-vs-composite answer a field report needs. A successful sample stays
+     * consumed - it is one readback per session, after the present, and repeating it every frame
+     * would be a per-frame map on the render thread.
+     */
+    fun noteTextureSample(value: String, success: Boolean = true) {
+        val elapsedMs = if (sessionStartedNanos == 0L) {
+            0L
+        } else {
+            (System.nanoTime() - sessionStartedNanos) / 1_000_000L
+        }
+        textureSample = "$value t=${elapsedMs}ms"
+        if (success) {
+            textureSampleArmed = true
+        } else {
+            textureSampleAttempts++
+            textureSampleArmed = false
+        }
     }
     // KMK <--
 

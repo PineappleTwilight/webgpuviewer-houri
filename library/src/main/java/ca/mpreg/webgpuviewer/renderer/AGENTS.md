@@ -298,6 +298,53 @@ GPU pipeline for the WebGPU image viewer: device/dispatcher singleton, tiled fil
   therefore sets `deviceGone` on either signal (the flag or a `[Device] is lost` exception) and
   skips *all* buffer teardown; the buffer is reclaimed with the device. Never "clean up" a
   device-bound resource after a loss to be tidy — that is the crash.
+- **A native answer that names a lost device is the loss, not a frame failure.** The loss
+  callback is the designed signal, and the 2026-11-27 PowerVR report (Multilaser M8_4G, Android 11,
+  TINY) is a session where it never arrived: the once-per-session page-texture readback failed with
+  `4: [Device] is lost.`, the session closed with `deviceLosses=0`, `recoveries=0`, `gen=0`, and
+  350 frames had been presented into a black screen. Treating that answer as "this frame failed"
+  is what let the render loop keep drawing into the dead device for the rest of the session.
+  `DeviceLossSignal.isLostDeviceMessage` recognises the answer and
+  `noteObservedDeviceLoss` promotes it to the real event (idempotent, sets `deviceLost`, notifies
+  the host's recovery ladder exactly as the callback does, reason `LOSS_REASON_OBSERVED`). It
+  **pumps `instance.processEvents()` first**, because Dawn dispatches a queued loss callback only
+  while the instance processes events — the reason the 2026-11-27 callback never ran. Call sites:
+  the readback's catch, the frame's own `catch (e: Exception)`, and the host's decode upload. Keep
+  the discriminator narrow: `Buffer was destroyed before mapping was resolved` is a buffer
+  lifetime bug and a lost *surface* belongs to the swapchain ladder — promoting either would reset
+  every decoded page for nothing.
+- **A PowerVR device fault recovers onto the GLES backend.** `recordLostDevice` sets
+  `preferBackend = OpenGLES` when the adapter is PowerVR (`TileCachePolicy.isPowerVr`), the session
+  is not already on GLES, and the loss is Vulkan-shaped (`LOSS_REASON_OBSERVED`,
+  `OUT_OF_DEVICE_MEMORY`, `DEVICE_LOST`). The field failures are Vulkan-specific (transfer-engine
+  OOM, device-lost with no callback); the swapchain ladder already proved Dawn's GLES backend
+  presents on the same devices, and GLES does not share the Vulkan driver's transfer/memory paths.
+  A callback loss that names no fault (backgrounding, surface teardown) keeps the default backend —
+  a backend switch is not free.
+- **The one-shot readback copies from `(0, 0)` on PowerVR.** The probe wants the centre texel, but
+  PowerVR's transfer engine is documented to answer `VK_ERROR_OUT_OF_DEVICE_MEMORY` for copies at
+  non-zero offsets (and the caller sees a lost device). Origin 0 still separates a black/empty
+  texture from one with page data, and it is the offset the driver accepts. Keep the centre
+  elsewhere.
+
+### PowerVR driver evidence (field work, 2026-11)
+
+- The Rogue GE8320/GE8322 Vulkan driver returns `VK_ERROR_OUT_OF_DEVICE_MEMORY` for apparently
+  valid transfer work: a buffer copy whose destination offset is non-zero (r/vulkan field report),
+  and on the M8_4G a `vkQueueSubmit` during page upload. That error is the driver's generic
+  "hardware setup failed" answer, not a measured heap shortfall — **do not shrink the memory
+  budget to "fix" it**, the working set in the 2026-11-27 dump was two pages of ~20MB total.
+- The same driver family miscomputes mip sizes for NPOT depth/stencil textures (CVE-2026-76036;
+  Dawn added `vulkan_disallow_npot_depth_stencil_mipmaps` scoped to ImgTec). Colour mip chains are
+  not that path, but it is the same class of driver arithmetic bug — check Dawn's ImgTec toggles
+  before blaming app-side pipelines.
+- Dawn dispatches a device-lost callback only while the instance processes events. A loss that
+  lands during `mapAsync` can reject the map with `[Device] is lost.` while the Kotlin callback
+  never runs; that is the 2026-11-27 shape (`deviceLosses=0` + a dead device). `noteObservedDeviceLoss`
+  pumps `instance.processEvents()` before recording the observed reason.
+- The escape that exists today is the backend switch: Dawn's GLES backend does not share the
+  Vulkan driver's transfer/memory paths, and the swapchain ladder already field-proved it on this
+  device. That is why a PowerVR Vulkan fault recovers onto GLES instead of rebuilding Vulkan.
 - **`::device.isInitialized` is prohibited from the instance class.** The companion's lateinit
   vars cannot be checked with a `::`-reference from outside the companion ("backing field is
   not accessible at this point" — the field belongs to the companion instance). Use the

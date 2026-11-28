@@ -111,6 +111,18 @@ Gesture handling + page model for the WebGPU viewer: composables turn touch into
   `WebGpuRenderer.render` reports it as `tex=rgba=…` in the session report. It was dropped once for
   cost; the 2026-11-24 dumps then had `tex=none`, and the two possible causes could not be told
   apart. Keep the one-shot copy (one 256-byte readback per session, after the present).
+  **On PowerVR the texel comes from `(0, 0)`, not the centre**: that driver's transfer engine is
+  documented to answer `VK_ERROR_OUT_OF_DEVICE_MEMORY` for copies at non-zero offsets, and the
+  error surfaces as a lost device. The origin texel still tells a black/empty texture from one
+  with page data.
+  **A failed sample must not be the session's only answer.** The first page draw can land on a
+  frame the device dies in — the 2026-11-27 PowerVR session spent its whole `tex=` on
+  `map failed 4: [Device] is lost.` — so a failure re-arms up to `MAX_TEXTURE_SAMPLE_ATTEMPTS`
+  (3) and `discardTextureSample()` on a device rebuild re-arms for the replacement device. The
+  sample is once per *session*, not once per process: the probe is a singleton like the renderer,
+  so the host calls `RenderProbe.beginSession()` when a reader opens (`WebGpuViewer` does). Each
+  result carries `t=<ms>` since that call — the stamp is what tells a device that was already dead
+  when the first page drew from one that died later.
 - **The surface's alpha path is not the black-page cause, and making the TextureView opaque does
   not fix it.** The page footprint already carries an opaque `backgroundColor` rect drawn before
   the page, so the black seen there is an opaque black fill, not a transparent frame. Both

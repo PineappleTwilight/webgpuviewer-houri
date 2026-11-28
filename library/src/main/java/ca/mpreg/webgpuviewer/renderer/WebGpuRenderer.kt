@@ -376,6 +376,96 @@ class WebGpuRenderer {
             }
         }
 
+        /**
+         * KMK --> Reason code for a loss observed from a native answer rather than the driver's
+         * callback - see [DeviceLossSignal]. Public so a host recording why a session degraded
+         * can say which path noticed the loss.
+         * KMK <--
+         */
+        const val LOSS_REASON_OBSERVED: Int = DeviceLossSignal.REASON_OBSERVED
+
+        /**
+         * KMK --> Record a device loss, from whichever signal saw it first.
+         *
+         * The driver's callback is the primary signal, but it is not the only one that can be
+         * right: the 2026-11-27 PowerVR report has a session where the device was dead (the
+         * readback mapped a buffer and Dawn answered `[Device] is lost.`) while no callback ever
+         * reached the process - `deviceLosses=0`, `gen=0`, and 350 frames presented into a black
+         * screen. A device that answers like that is gone whether or not the callback fires, so
+         * the host's recovery ladder has to hear about it or the reader keeps drawing black.
+         *
+         * [source] names the signal in logcat; [reason] is the driver's code, or
+         * [LOSS_REASON_OBSERVED] for an observed answer.
+         * KMK <--
+         */
+        private fun recordLostDevice(reason: Int, message: String, source: String) {
+            // One notification per loss. A driver can flush a queued loss record on a later tick
+            // after the same loss was already observed (the readback path pumps events), and the
+            // app's session counters must not read one dead device as three.
+            if (deviceLost) return
+            deviceLostDetail = " (reason=$reason: $message" +
+                    (lastUncapturedError?.let { "; last error: $it" } ?: "") + ")"
+            deviceLost = true
+            Log.e(
+                "WebGpuRenderer",
+                "WebGPU device lost from $source reason=$reason: $message"
+            )
+            // KMK --> A PowerVR device that died from a Vulkan fault is not a device that should be
+            // rebuilt on the same backend. The field reports are Vulkan-shaped
+            // (`VK_ERROR_OUT_OF_DEVICE_MEMORY` from `vkQueueSubmit`, and the 2026-11-27 loss whose
+            // only trace was `[Device] is lost.`), while the same device reads through Dawn's GLES
+            // backend - the swapchain ladder already proved that (`swapchain recovered after
+            // switching to the OpenGLES backend`). Asking for GLES on the recovery moves the
+            // session off the driver path that just died instead of rebuilding it to die again.
+            //
+            // A callback loss that does not name a fault (backgrounding, surface teardown) keeps
+            // the default backend: switching a healthy session's backend is not free.
+            // KMK <--
+            if (DeviceLossSignal.shouldSwitchToGles(
+                    powerVr = TileCachePolicy.isPowerVr(adapterDescription),
+                    alreadyOnGles = activeBackend == BackendType.OpenGLES,
+                    reason = reason,
+                    message = message,
+                )
+            ) {
+                preferBackend = BackendType.OpenGLES
+                Log.i(
+                    "WebGpuRenderer",
+                    "PowerVR device fault on ${BackendType.toString(activeBackend)}; " +
+                        "the recovery will ask for the OpenGLES backend"
+                )
+            }
+            notifyDeviceLost(reason, message)
+        }
+
+        /**
+         * KMK --> Promote a "the device is gone" answer from a native call into the real loss
+         * event. Idempotent: the first observation owns the detail and the notification, later
+         * ones are no-ops because [isAvailable] is already false by then.
+         *
+         * **Pump the instance first.** Dawn queues a device loss and dispatches its callback only
+         * while the instance processes events, and nothing on the frame path calls that after a
+         * native call has already answered "lost" (the 2026-11-27 report is exactly this: the
+         * callback never ran, so `deviceLost` stayed false). `processEvents()` lets the driver's
+         * own record arrive with its real reason before this call falls back to the observed one.
+         *
+         * Public because the host's decode path performs GPU uploads of its own: a native upload
+         * that answers "[Device] is lost." is the same event, and swallowing it as one page's
+         * decode failure is how a session keeps presenting black frames with no recovery.
+         *
+         * Returns true when this call is the one that recorded the loss.
+         * KMK <--
+         */
+        fun noteObservedDeviceLoss(source: String, message: String): Boolean {
+            if (!isAvailable) return false
+            if (::instance.isInitialized) {
+                runCatching { instance.processEvents() }
+            }
+            if (deviceLost) return false
+            recordLostDevice(LOSS_REASON_OBSERVED, message, source)
+            return true
+        }
+
         fun isOnRenderThread() = Thread.currentThread().name == "WebGPU-Render-Thread"
 
         /** The companion's device object, or null before first init - teardown paths use this. */
@@ -503,17 +593,7 @@ class WebGpuRenderer {
                     )
                     return@DeviceLostCallback
                 }
-                val first = !deviceLost
-                if (first) {
-                    deviceLostDetail = " (reason=$reason: $message" +
-                            (lastUncapturedError?.let { "; last error: $it" } ?: "") + ")"
-                }
-                deviceLost = true
-                Log.e(
-                    "WebGpuRenderer",
-                    "WebGPU device lost reason=$reason: $message device=$lost"
-                )
-                notifyDeviceLost(reason, message)
+                recordLostDevice(reason, message, "driver callback device=$lost")
             },
             deviceLostCallbackExecutor = Executor(Runnable::run),
             uncapturedErrorCallback = UncapturedErrorCallback { _, type, message ->
@@ -1649,6 +1729,18 @@ class WebGpuRenderer {
                 // could not tell apart.
                 ca.mpreg.webgpuviewer.viewer.RenderProbe.takeTextureSample()?.let { sample ->
                     try {
+                        // KMK --> PowerVR's transfer engine is documented to answer
+                        // VK_ERROR_OUT_OF_DEVICE_MEMORY for copies at non-zero offsets (GE8320/8322
+                        // field reports) - and that error is delivered as a *lost device*. The
+                        // readback is diagnostic only, so on that adapter it reads the texture's
+                        // origin instead of its centre: the top-left texel still separates "the
+                        // texture is black/empty" from "the texture has page data", and the copy
+                        // stays at the one offset the driver is known to accept. The centre is kept
+                        // everywhere else because it is the representative texel.
+                        // KMK <--
+                        val powerVr = TileCachePolicy.isPowerVr(adapterDescription)
+                        val sampleX = if (powerVr) 0 else sample.x
+                        val sampleY = if (powerVr) 0 else sample.y
                         val buffer = device.createBuffer(
                             GPUBufferDescriptor(
                                 usage = BufferUsage.MapRead or BufferUsage.CopyDst,
@@ -1659,7 +1751,7 @@ class WebGpuRenderer {
                         encoder.copyTextureToBuffer(
                             GPUTexelCopyTextureInfo(
                                 sample.texture, 0,
-                                GPUOrigin3D(sample.x, sample.y, 0),
+                                GPUOrigin3D(sampleX, sampleY, 0),
                                 TextureAspect.All,
                             ),
                             GPUTexelCopyBufferInfo(
@@ -1670,7 +1762,8 @@ class WebGpuRenderer {
                         sampleBuffer = buffer
                     } catch (e: Throwable) {
                         ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
-                            "copy failed ${e.message}"
+                            "copy failed ${e.message}",
+                            success = false,
                         )
                     }
                 }
@@ -1768,14 +1861,24 @@ class WebGpuRenderer {
                             )
                         } catch (e: Throwable) {
                             ca.mpreg.webgpuviewer.viewer.RenderProbe.noteTextureSample(
-                                "map failed ${e.message}"
+                                "map failed ${e.message}",
+                                success = false,
                             )
                             // Any failed map leaves the buffer in an unknown native state, so
                             // none of the teardown calls below are safe either. Only a loss
                             // fails the frame; the rest is the diagnostic saying so.
                             deviceGone = true
-                            if (e.message?.contains("[Device]") == true || e.message?.contains("is lost") == true) {
-                                Log.w("WebGpuRenderer", "Device lost detected during texture readback: $e.message")
+                            if (DeviceLossSignal.isLostDeviceMessage(e.message)) {
+                                Log.w(
+                                    "WebGpuRenderer",
+                                    "Device lost detected during texture readback: ${e.message}"
+                                )
+                                // KMK --> The callback is not guaranteed to reach us (2026-11-27
+                                // PowerVR: `deviceLosses=0` while this exact map failed with
+                                // "[Device] is lost."). Without this the render loop keeps
+                                // presenting black frames on a dead device and no recovery runs.
+                                // KMK <--
+                                noteObservedDeviceLoss("texture readback", e.message.orEmpty())
                                 drawFailureStreak++
                                 return FrameResult.Unavailable
                             }
@@ -1800,6 +1903,13 @@ class WebGpuRenderer {
                 // invisible forever. Count it and let the bounded draw-failure ladder answer.
                 // KMK <--
                 Log.e("WebGpuRenderer", "Render error", e)
+                // KMK --> A frame that throws "device is lost" is a dead device, not a draw
+                // failure: the draw-failure ladder parks and gives up, while the loss path
+                // rebuilds. Promote it so the host hears the one that can be fixed.
+                // KMK <--
+                if (DeviceLossSignal.isLostDeviceMessage(e.message)) {
+                    noteObservedDeviceLoss("frame", e.message.orEmpty())
+                }
                 return onDrawError()
             } catch (e: OutOfMemoryError) {
                 Log.e("WebGpuRenderer", "Out of memory rendering", e)
